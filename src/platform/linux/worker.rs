@@ -1,9 +1,10 @@
-// use std::net::UdpSocket;
+use std::net::UdpSocket;
 
-// use socket::PacketSource;
+use crate::platform::socket::{PacketSource};
+use crate::platform::event::{Poller, EventArray, Event};
 
-// struct Worker {
-//     source: PacketSource,
-//     dest: UdpSocket,
-//     poll: Poller,
-// }
+struct Worker {
+    source: dyn PacketSource,
+    dest: UdpSocket,
+    poller: Poller,
+}

@@ -1,14 +1,27 @@
-use std::ffi::CString;
+use std::{ffi::CString, net::UdpSocket};
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use crate::Error::{self, OS};
 
 const TUN_PATH: &str = "/dev/net/tun";
 
-pub trait PacketSource {
-    fn fd(&self) -> RawFd;
+pub enum SocketType {
+    TUN(TunSocket),
+    //UDP(UdpSocket)
+}
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Error>;
+impl SocketType {
+    fn fd(&self) -> RawFd {
+        match self {
+            SocketType::TUN(s) => s.fd(),
+            //SocketType::UDP(s) => s.as_raw_fd(),
+        }
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            SocketType::TUN(s) => s.read(buf),
+        }
+    }
 }
 
 pub struct TunSocket {
@@ -55,14 +68,31 @@ impl TunSocket {
 
         Ok(Self { name: name.to_owned(), fd })
     }
-}
 
-impl PacketSource for TunSocket {
     fn fd(&self) -> RawFd {
         self.fd
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        Ok(0)
+        loop {
+            let bytes_read = unsafe {libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len())};
+            if bytes_read >= 0 {
+                return Ok(bytes_read as usize);
+            }
+            
+            let err = io::Error::last_os_error();                                   
+            match err.raw_os_error() {                                                         
+                Some(libc::EINTR) => continue,                                      
+
+                Some(libc::EAGAIN) => {
+                    return Err(Error::WouldBlock);
+                }
+                _ => return Err(OS(err)),                                               
+            }   
+        }
     }
 }
+
+
+    
+

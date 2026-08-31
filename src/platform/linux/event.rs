@@ -1,4 +1,4 @@
-use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLL_CTL_ADD};
+use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLL_CTL_ADD, EINTR};
 use std::{os::fd::RawFd};
 use crate::Error::{self, OS};
 
@@ -6,6 +6,7 @@ const MAX_EVENTS: usize = 128;
 
 type EpollFlags = u32;                 
 
+// Event type, passed to epoll u64 data
 #[repr(u64)]
 #[derive(Clone, Copy)] 
 pub enum EventToken {
@@ -14,6 +15,7 @@ pub enum EventToken {
     TUN = 2,
 }
 
+// Same thing as epoll_event
 #[derive(Clone, Copy)]  
 pub struct Event {
     pub epoll_flags: EpollFlags,
@@ -60,17 +62,21 @@ impl Poller {
         
         let status = unsafe { epoll_ctl(self.fd, EPOLL_CTL_ADD, trigger.fd, &mut epoll_event) };
         if status < 0 {
-            let os_error = std::io::Error::last_os_error().raw_os_error();
-            return Err(OS());
+            return Err(OS(std::io::Error::last_os_error()));
         }
         Ok(())
     }
 
-    pub fn poll(&mut self, timeout_ms: i32) -> Result<(), Error> {
+    // Does one event poll, return number of fetched events
+    pub fn poll(&mut self, timeout_ms: i32) -> Result<usize, Error> {
         let mut events = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
         let event_count = unsafe { epoll_wait(self.fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
 
         if event_count < 0 {
+            // EINTR is not an error, we can continue next time
+            if std::io::Error::last_os_error().raw_os_error() == Some(EINTR) {
+                return Ok(0)
+            }
             return Err(OS(std::io::Error::last_os_error()));
         }
 
@@ -89,7 +95,7 @@ impl Poller {
             self.events.count += 1;
         }
 
-        Ok(())
+        Ok((self.events.count))
     }
 
     pub fn get_events(&self) -> &EventArray {
