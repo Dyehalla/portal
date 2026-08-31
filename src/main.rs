@@ -20,5 +20,5 @@ impl Device {
 
 fn main() {
 
-    
+
 }
