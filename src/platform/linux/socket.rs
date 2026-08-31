@@ -4,8 +4,14 @@ use std::os::fd::RawFd;
 
 const TUN_PATH: &str = "/dev/net/tun";
 
+pub trait PacketSource {
+    fn fd(&self) -> RawFd;
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
 pub struct TunSocket {
-    _name: String,
+    name: String,
     fd: RawFd,
 }
 
@@ -31,7 +37,7 @@ impl TunSocket {
 
         let mut ifreq: libc::ifreq = unsafe { std::mem::zeroed() };
 
-        for (dst, src) in ifreq.ifr_name.iter_mut().zip(name.as_bytes()) {
+        for (dst, src) in ifreq.ifrname.iter_mut().zip(name.as_bytes()) {
             *dst = *src as libc::c_char;
         }
 
@@ -47,6 +53,14 @@ impl TunSocket {
         }
 
         // Один worker должен владеть одним независимым queue fd.
-        Ok(Self { _name: name.to_owned(), fd })
+        Ok(Self { name: name.to_owned(), fd })
     }
+}
+
+impl PacketSource for TunSocket {
+    fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    fn read(&self)
 }
