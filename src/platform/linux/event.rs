@@ -1,22 +1,39 @@
 use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLL_CTL_ADD};
-use std::os::fd::RawFd;
+use std::{os::fd::RawFd};
 use crate::Error::{self, OS};
 
-type EpollFlags = u32;
+const MAX_EVENTS: usize = 128;  
 
-const MAX_EVENTS: usize = 128;                        
+type EpollFlags = u32;                 
 
-pub trait EventHandler {
-    fn fd(&self) -> RawFd;
-    fn interest(&self) -> EpollFlags;
-    fn ready(&mut self, events: EpollFlags);
+#[repr(u64)]
+#[derive(Clone, Copy)] 
+pub enum EventToken {
+    Zero = 0, // only for initialization, never registered
+    UDP = 1,
+    TUN = 2,
 }
 
+#[derive(Clone, Copy)]  
+pub struct Event {
+    pub epoll_flags: EpollFlags,
+    pub token: EventToken
+}
 
+pub struct EventArray {
+    pub data: [Event; MAX_EVENTS],
+    pub count: usize,
+}     
+
+pub struct EventTrigger {
+    token: EventToken,
+    epoll_flags: EpollFlags,
+    fd: RawFd
+}
 
 pub struct Poller {
     fd: RawFd,
-    ev_handlers: Vec<Box<dyn EventHandler>>
+    events: EventArray
 }
 
 impl Poller {
@@ -28,49 +45,61 @@ impl Poller {
 
         Ok(Poller {
             fd: epoll_fd,
-            ev_handlers: Vec::new()
+            events: EventArray {
+                data: [Event {epoll_flags: 0, token: EventToken::Zero}; MAX_EVENTS],
+                count: 0
+            }
         })
     }
 
-    pub fn register_event_handler(&mut self, ev_handler: impl EventHandler + 'static) -> Result<(), Error> {
-        let new_ev_handler_idx = self.ev_handlers.len();
-        self.register_fd(ev_handler.fd(), ev_handler.interest(), new_ev_handler_idx as u64)?;
-        self.ev_handlers.push(Box::new(ev_handler));
-        Ok(())
-    }
-
-    // Waits for the events and calls EventHandler::ready()
-    pub fn poll(&mut self, timeout_ms: i32) -> Result<(), Error> {
-        let mut events = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
-        let wait_res = unsafe { epoll_wait(self.fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
-
-        if wait_res < 0 {
-            return Err(OS(std::io::Error::last_os_error()));
-        }
-
-        for i in 0..wait_res {
-            let event = events[i as usize];
-            let (flags, handler_idx) = (event.events, event.u64);
-            
-            let Some(handler) = self.ev_handlers.get_mut(handler_idx as usize) else { continue }; 
-            
-            handler.ready(flags);
-        }
-
-        Ok(())
-    }
-
-    fn register_fd(&self, fd: RawFd, interest: EpollFlags, data: u64) -> Result<(), Error> {
+    pub fn register_event_trigger(&mut self, trigger: EventTrigger) -> Result<(), Error> {
         let mut epoll_event = epoll_event {
-            events: interest,
-            u64: data
+            events: trigger.epoll_flags,
+            u64: trigger.token as u64
         };
         
-        let status = unsafe { epoll_ctl(self.fd, EPOLL_CTL_ADD, fd, &mut epoll_event) };
+        let status = unsafe { epoll_ctl(self.fd, EPOLL_CTL_ADD, trigger.fd, &mut epoll_event) };
         if status < 0 {
-            return Err(OS(std::io::Error::last_os_error()));
+            let os_error = std::io::Error::last_os_error().raw_os_error();
+            return Err(OS());
         }
         Ok(())
+    }
+
+    pub fn poll(&mut self, timeout_ms: i32) -> Result<(), Error> {
+        let mut events = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
+        let event_count = unsafe { epoll_wait(self.fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
+
+        if event_count < 0 {
+            return Err(OS(std::io::Error::last_os_error()));
+        }
+
+        let n = event_count as usize;
+        for event in &events[..n] {
+            let token = match event.u64 {
+                1 => EventToken::UDP,
+                2 => EventToken::TUN,
+                _ => continue,
+            };
+
+            self.events.data[self.events.count] = Event {
+                epoll_flags: event.events,
+                token,
+            };
+            self.events.count += 1;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_events(&self) -> &EventArray {
+        &self.events
     }
 
 }
+
+impl Drop for Poller {                                                                                                                                 
+    fn drop(&mut self) {                                                                                                                               
+        unsafe { libc::close(self.fd) };                                                                                                               
+    }                                                                                                                                                  
+}   
