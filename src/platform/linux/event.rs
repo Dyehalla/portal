@@ -1,16 +1,22 @@
-type EventToken = u64;
-use libc::{epoll_create1, epoll_ctl, epoll_event};
+use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLL_CTL_ADD};
+use std::os::fd::RawFd;
 use crate::Error::{self, OS};
 
-const MAX_EVENTS: i32 = 64;
+type EpollFlags = u32;
 
-pub trait Event {
+const MAX_EVENTS: usize = 128;                        
+
+pub trait EventHandler {
     fn fd(&self) -> RawFd;
-
+    fn interest(&self) -> EpollFlags;
+    fn ready(&mut self, events: EpollFlags);
 }
 
-struct Poller {
+
+
+pub struct Poller {
     fd: RawFd,
+    ev_handlers: Vec<Box<dyn EventHandler>>
 }
 
 impl Poller {
@@ -20,25 +26,51 @@ impl Poller {
             return Err(OS(std::io::Error::last_os_error()))
         }
 
-        Ok(Poller {fd: epoll_fd})
+        Ok(Poller {
+            fd: epoll_fd,
+            ev_handlers: Vec::new()
+        })
     }
 
-    fn register_fd(&self, fd: RawFd, data: u64) -> Result<(), Error> {
+    pub fn register_event_handler(&mut self, ev_handler: impl EventHandler + 'static) -> Result<(), Error> {
+        let new_ev_handler_idx = self.ev_handlers.len();
+        self.register_fd(ev_handler.fd(), ev_handler.interest(), new_ev_handler_idx as u64)?;
+        self.ev_handlers.push(Box::new(ev_handler));
+        Ok(())
+    }
+
+    // Waits for the events and calls EventHandler::ready()
+    pub fn poll(&mut self, timeout_ms: i32) -> Result<(), Error> {
+        let mut events = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
+        let wait_res = unsafe { epoll_wait(self.fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
+
+        if wait_res < 0 {
+            return Err(OS(std::io::Error::last_os_error()));
+        }
+
+        for i in 0..wait_res {
+            let event = events[i as usize];
+            let (flags, handler_idx) = (event.events, event.u64);
+            
+            let Some(handler) = self.ev_handlers.get_mut(handler_idx as usize) else { continue }; 
+            
+            handler.ready(flags);
+        }
+
+        Ok(())
+    }
+
+    fn register_fd(&self, fd: RawFd, interest: EpollFlags, data: u64) -> Result<(), Error> {
         let mut epoll_event = epoll_event {
-            events: EPOLLIN as u32,
+            events: interest,
             u64: data
         };
         
-        let status = unsafe { epoll_ctl(self.epoll_fd, EPOLL_CTL_ADD, fd, &mut epoll_event) };
+        let status = unsafe { epoll_ctl(self.fd, EPOLL_CTL_ADD, fd, &mut epoll_event) };
         if status < 0 {
             return Err(OS(std::io::Error::last_os_error()));
         }
         Ok(())
-    }
-
-    pub fn wait(&self, timeout_ms: i32) -> Result<(), Error> {
-        let mut events = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
-         
     }
 
 }

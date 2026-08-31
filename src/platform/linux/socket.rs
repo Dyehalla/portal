@@ -1,13 +1,14 @@
 use std::ffi::CString;
 use std::io;
 use std::os::fd::RawFd;
+use crate::Error::{self, OS};
 
 const TUN_PATH: &str = "/dev/net/tun";
 
 pub trait PacketSource {
     fn fd(&self) -> RawFd;
 
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Error>;
 }
 
 pub struct TunSocket {
@@ -22,7 +23,7 @@ impl Drop for TunSocket {
 }
 
 impl TunSocket {
-    pub fn new(name: &str) -> io::Result<Self> {
+    pub fn new(name: &str) -> Result<Self, Error> {
         let path = CString::new(TUN_PATH)
             .expect("TUN device path must not contain a NUL byte");
         let fd = unsafe {
@@ -32,12 +33,12 @@ impl TunSocket {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(OS(io::Error::last_os_error()));
         }
 
         let mut ifreq: libc::ifreq = unsafe { std::mem::zeroed() };
 
-        for (dst, src) in ifreq.ifrname.iter_mut().zip(name.as_bytes()) {
+        for (dst, src) in ifreq.ifr_name.iter_mut().zip(name.as_bytes()) {
             *dst = *src as libc::c_char;
         }
 
@@ -48,11 +49,10 @@ impl TunSocket {
             if libc::ioctl(fd, libc::TUNSETIFF, &ifreq) < 0 {
                 let error = io::Error::last_os_error();
                 libc::close(fd);
-                return Err(error);
+                return Err(OS(error));
             }
         }
 
-        // Один worker должен владеть одним независимым queue fd.
         Ok(Self { name: name.to_owned(), fd })
     }
 }
@@ -62,5 +62,7 @@ impl PacketSource for TunSocket {
         self.fd
     }
 
-    fn read(&self)
+    fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        Ok(0)
+    }
 }

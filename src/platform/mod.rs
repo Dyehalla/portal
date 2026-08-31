@@ -7,7 +7,7 @@ pub mod event;
 pub mod worker;
 
 #[cfg(target_os = "linux")]
-#[path = "linux/tun.rs"]
+#[path = "linux/socket.rs"]
 pub mod socket;
 
 #[cfg(target_os = "macos")]
