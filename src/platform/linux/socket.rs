@@ -1,25 +1,25 @@
 use std::{ffi::CString, net::UdpSocket};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use crate::Error::{self, OS};
 
+use crate::Error::{self, OS};
 const TUN_PATH: &str = "/dev/net/tun";
 
-pub enum SocketType {
+pub enum PacketSource {
     TUN(TunSocket),
     //UDP(UdpSocket)
 }
 
-impl SocketType {
-    fn fd(&self) -> RawFd {
+impl PacketSource {
+    pub fn fd(&self) -> RawFd {
         match self {
-            SocketType::TUN(s) => s.fd(),
-            //SocketType::UDP(s) => s.as_raw_fd(),
+            PacketSource::TUN(s) => s.fd(),
+            //PacketSource::UDP(s) => s.as_raw_fd(),
         }
     }
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
         match self {
-            SocketType::TUN(s) => s.read(buf),
+            PacketSource::TUN(s) => s.read(buf),
         }
     }
 }
