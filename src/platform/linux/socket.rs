@@ -17,7 +17,7 @@ impl PacketSource {
             //PacketSource::UDP(s) => s.as_raw_fd(),
         }
     }
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match self {
             PacketSource::TUN(s) => s.read(buf),
         }
@@ -73,7 +73,8 @@ impl TunSocket {
         self.fd
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+    // Calls read once, repeats if EINTR was received.
+    fn read(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
         loop {
             let bytes_read = unsafe {libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len())};
             if bytes_read >= 0 {
@@ -84,10 +85,7 @@ impl TunSocket {
             match err.raw_os_error() {                                                         
                 Some(libc::EINTR) => continue,                                      
 
-                Some(libc::EAGAIN) => {
-                    return Err(Error::WouldBlock);
-                }
-                _ => return Err(OS(err)),                                               
+                _ => return Err(err),                                               
             }   
         }
     }

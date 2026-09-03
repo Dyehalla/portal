@@ -1,7 +1,6 @@
+mod device;
+mod noise;
 mod platform;
-
-use crate::platform::socket::TunSocket;
-use std::net::SocketAddr;
 
 const THREADS: usize = 4;
 const TUN_NAME: &str = "tun0";
@@ -9,15 +8,9 @@ const TUN_NAME: &str = "tun0";
 enum Error {
     OS(std::io::Error),
     WouldBlock,
+    DeadPacketSource
 }
 
-struct Device {
-
-}
-
-impl Device {
-
-}
 
 fn main() {
 
