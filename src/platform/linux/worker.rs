@@ -18,7 +18,7 @@ struct Worker {
 }
 
 impl Worker {
-    // Creates and registers worker. New worker is ready to run 
+    // Creates and registers worker.
     pub fn new(source: PacketSource, wg_socket: UdpSocket) -> Result<Worker, Error> {
         let mut poller = Poller::new()?;
 
