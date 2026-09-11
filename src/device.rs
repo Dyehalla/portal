@@ -5,12 +5,11 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aws_lc_rs::error::Unspecified;
-
 use crate::noise::{Key, PrivateKey};
-use crate::noise::noise_primitives::{DH_PUBKEY, KEY_LEN, RAND, TIMESTAMP_LEN};
+use crate::noise::noise_primitives::{DH_PUBKEY, RAND, TIMESTAMP_LEN};
 
 // Timers
 
@@ -34,9 +33,13 @@ pub enum SessionSlot {
     Pending,
 }
 
+pub struct Identity {
+    pub private_key: PrivateKey,
+    pub public_key: Key
+}
+
 pub struct Device {
-    private_key: PrivateKey,
-    pub public_key: Key,
+    pub identity: Arc<Identity>,
 
     cookie_secret: Key,
 
@@ -56,8 +59,10 @@ impl Device {
         RAND(&mut cookie_secret);
 
         Self {
-            private_key,
-            public_key,
+            identity: Arc::new(Identity {
+                private_key,
+                public_key,
+            }),
             cookie_secret,
             peers: HashMap::new(),
             index_table: HashMap::new(),
@@ -67,10 +72,10 @@ impl Device {
 
 pub struct Peer {
     /// Static public key — the peer's identity.
-    public_key: Key,
+    pub(crate) public_key: Key,
 
     /// None means "not set", which on the wire is the all-zero key
-    preshared_key: Option<Key>,
+    pub(crate) preshared_key: Option<Key>,
 
     /// Cryptokey routing: subnets this peer is allowed to source packets from
     /// (inbound check) and that we route to it (outbound).
@@ -91,7 +96,7 @@ pub struct Peer {
     /// The cookie WE received from the peer (whitepaper's
     /// last_received_cookie), used to fill MAC2 when we send under load.
     /// (cookie, received_at) — cookies expire with the secret that made them.
-    last_received_cookie: Option<(Key, Instant)>,
+    pub(crate) last_received_cookie: Option<(Key, Instant)>,
 
     /// Current, previous and pending sessions, indexed by SessionSlot.
     sessions: [Option<Session>; 3],
@@ -115,9 +120,11 @@ impl Peer {
 }
 
 pub struct Session {
-    local_index: u32,
-    ephemeral_priv: Option<PrivateKey>,
-    ephemeral_pub: Option<Key>,
+    pub(crate) local_index: u32,
+    pub(crate) ephemeral_priv: Option<PrivateKey>,
+    pub(crate) ephemeral_pub: Option<Key>,
+    pub(crate) chaining_key: Key,
+    pub(crate) hash: Key,
 }
 
 #[derive(Clone, Copy, Debug)]

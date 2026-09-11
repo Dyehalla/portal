@@ -179,6 +179,14 @@ pub fn DH_GENERATE() -> (PrivateKey, Key) {
     (priv_key, pub_out)
 }
 
+/// DH-PUBKEY(private key): derive the Curve25519 public key.
+pub fn DH_PUBKEY(priv_key: &PrivateKey) -> Key {
+    let pub_key = priv_key.compute_public_key().expect("valid X25519 private key");
+    let mut out = [0u8; KEY_LEN];
+    out.copy_from_slice(pub_key.as_ref());
+    out
+}
+
 /// RAND(len): fill buffer with random bytes
 pub fn RAND<const N: usize>(buf: &mut [u8; N]){
     rand::fill(buf).expect("Unexpected RNG generator failure"); 
@@ -196,43 +204,39 @@ pub fn TAI64N() -> [u8; TIMESTAMP_LEN] {
     out
 }
 
-// Cascade of HMACs: "chews" a secret into n output keys + a new chaining key.
+// Cascade of HMACs: "chews" a secret into n output keys. No allocation.
 
-/// KDFn(key, input) -> (tau1..taun, new_ch): helper that keeps the cascade honest.
-/// ch_i = HMAC(ch_{i-1} || tau_i, input) per whitepaper.
-fn kdf_cascade<const N: usize>(key: &Key, input: &[u8]) -> ([Key; N], Key) {
-    let mut taus: [Key; N] = [[0u8; KEY_LEN]; N];
+/// KDFn(key, input): tau_0 = HMAC(key, input), tau_1 = HMAC(tau_0, 0x1),
+/// tau_i = HMAC(tau_0, tau_{i-1} || i) for i >= 2. Returns (tau_1, ..., tau_n)
+/// per whitepaper §5.4; tau_1 is the new chaining key.
+fn kdf<const N: usize>(key: &Key, input: &[u8]) -> [Key; N] {
+    let tau0 = HMAC(key, input);
+    let mut taus = [[0u8; KEY_LEN]; N];
 
-    for i in 0..N {
-        // tau_i = HMAC(tau0 || tau1 || ... || tau_{i-1}, input)
-        // (every tau is derived from the ORIGINAL key, whitepaper §5.2)
-        let mut chained = Vec::with_capacity(KEY_LEN * (i + 1));
-        chained.extend_from_slice(key);
-        for tau in &taus[..i] {
-            chained.extend_from_slice(tau);
-        }
-        taus[i] = HMAC(&chained, input);
+    taus[0] = HMAC(&tau0, &[1]);
+    for i in 1..N {
+        let mut material = [0u8; KEY_LEN + 1];
+        material[..KEY_LEN].copy_from_slice(&taus[i - 1]);
+        material[KEY_LEN] = (i + 1) as u8;
+        taus[i] = HMAC(&tau0, &material);
     }
 
-    // new chaining key = HMAC(tau0 || tau1 || ... || taun, input)
-    let mut chained = Vec::with_capacity(KEY_LEN * (N + 1));
-    chained.extend_from_slice(key);
-    for tau in &taus {
-        chained.extend_from_slice(tau);
-    }
-    let new_ch = HMAC(&chained, input);
-
-    (taus, new_ch)
+    taus
 }
 
-pub fn KDF1(key: &Key, input: &[u8]) -> ([Key; 1], Key) {
-    kdf_cascade(key, input)
+/// Kdf1(key, input) -> new chaining key (tau_1).
+pub fn KDF1(key: &Key, input: &[u8]) -> Key {
+    kdf::<1>(key, input)[0]
 }
 
-pub fn KDF2(key: &Key, input: &[u8]) -> ([Key; 2], Key) {
-    kdf_cascade(key, input)
+/// Kdf2(key, input) -> (new chaining key, output key) = (tau_1, tau_2).
+pub fn KDF2(key: &Key, input: &[u8]) -> (Key, Key) {
+    let taus = kdf::<2>(key, input);
+    (taus[0], taus[1])
 }
 
-pub fn KDF3(key: &Key, input: &[u8]) -> ([Key; 3], Key) {
-    kdf_cascade(key, input)
+/// Kdf3(key, input) -> (tau_1, tau_2, tau_3); used for message 2 with the PSK.
+pub fn KDF3(key: &Key, input: &[u8]) -> (Key, Key, Key) {
+    let taus = kdf::<3>(key, input);
+    (taus[0], taus[1], taus[2])
 }
