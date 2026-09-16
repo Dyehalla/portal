@@ -131,6 +131,71 @@ pub const fn AEAD_LEN(plain_len: usize) -> usize {
     plain_len + TAG_LEN
 }
 
+// ===== Prepared AEAD key =====
+
+/// Failure of an AEAD operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AeadError {
+    /// The key length does not match the algorithm.
+    InvalidKey,
+    /// The tag did not verify: forgery, corruption or the wrong key.
+    InvalidTag,
+}
+
+impl From<Unspecified> for AeadError {
+    fn from(_: Unspecified) -> Self {
+        // On the data path a failure is always a failed tag check.
+        Self::InvalidTag
+    }
+}
+
+/// A ready-to-use ChaCha20-Poly1305 key.
+///
+/// `UnboundKey::new` creates a BoringSSL context (an allocation), so this is
+/// built once when a session is created rather than on every packet. Keeping it
+/// here is also what stops aws-lc-rs types from leaking into the rest of the
+/// protocol module.
+pub struct AeadKey {
+    inner: aead::LessSafeKey,
+}
+
+impl AeadKey {
+    pub fn new(key: &Key) -> Result<Self, AeadError> {
+        let unbound =
+            UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|_| AeadError::InvalidKey)?;
+        Ok(Self {
+            inner: aead::LessSafeKey::new(unbound),
+        })
+    }
+
+    /// Encrypts in place. `buf` holds the plaintext followed by exactly
+    /// `TAG_LEN` spare bytes; the tag is written right after the ciphertext.
+    pub fn seal_in_place(&self, counter: u64, buf: &mut [u8]) -> Result<(), AeadError> {
+        let plain_len = buf
+            .len()
+            .checked_sub(TAG_LEN)
+            .ok_or(AeadError::InvalidTag)?;
+        let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?;
+        let (plaintext, tag_out) = buf.split_at_mut(plain_len);
+        let tag = self
+            .inner
+            .seal_in_place_separate_tag(nonce, aead::Aad::empty(), plaintext)?;
+        tag_out.copy_from_slice(tag.as_ref());
+        Ok(())
+    }
+
+    /// Decrypts in place. `buf` holds the ciphertext followed by the tag;
+    /// returns the plaintext slice.
+    pub fn open_in_place<'a>(
+        &self,
+        counter: u64,
+        buf: &'a mut [u8],
+    ) -> Result<&'a mut [u8], AeadError> {
+        let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?;
+        Ok(self.inner.open_in_place(nonce, aead::Aad::empty(), buf)?)
+    }
+}
+
 /// XAEAD(key, nonce, plain text, auth text): XChaCha20Poly1305 with a random
 /// 24-byte nonce. Used only for cookie encryption in CookieReply (§5.4.7, M4).
 /// aws-lc-rs 1.18 has no XChaCha20Poly1305 — decide at M4: RustCrypto

@@ -1,5 +1,5 @@
 mod device;
-mod noise;
+mod protocol;
 mod platform;
 
 const THREADS: usize = 4;
