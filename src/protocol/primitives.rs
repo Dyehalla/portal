@@ -79,7 +79,7 @@ pub fn HMAC(key: &[u8], input: &[u8]) -> Key {
     out
 }
 
-/// WG nonce: 32 zero bits followed by counter LE64 (whitepaper §5.1)
+/// WG nonce: 32 zero bits followed by counter LE64
 fn nonce_from_counter(counter: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
@@ -88,41 +88,43 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
 
 /// AEAD(key, counter, plain text, auth text) — encryption half:
 /// returns ciphertext || tag. `auth text` is authenticated, not encrypted.
-///
-/// For handshake-sized buffers a copy is fine; the transport data path will
-/// switch to in-place buffers later.
-pub fn AEAD_ENCRYPT(key: &Key, counter: u64, auth: &[u8], plaintext: &[u8]) 
--> Result<Vec<u8>, Unspecified> {
-    let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)?;
+pub fn AEAD_ENCRYPT(key: &Key, counter: u64, auth: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let unbound =
+        UnboundKey::new(&CHACHA20_POLY1305, key).expect("key is always KEY_LEN bytes");
     let key = aead::LessSafeKey::new(unbound);
 
     let mut in_out = plaintext.to_vec();
     key.seal_in_place_append_tag(
-        aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?,
+        aead::Nonce::assume_unique_for_key(nonce_from_counter(counter)),
         aead::Aad::from(auth),
         &mut in_out,
-    )?;
-    Ok(in_out)
+    )
+    .expect("sealing cannot fail");
+
+    in_out
 }
 
-/// AEAD(key, counter, cipher text, auth text) — decryption half:
-/// verifies tag over `auth` || ciphertext, then decrypts.
-/// Err = forged/corrupted input; this is a NORMAL outcome for network data.
+/// AEAD(key, counter, cipher text, auth text) — decryption half.
+/// `Err` means the tag did not verify: a normal outcome for network data.
 pub fn AEAD_DECRYPT(
     key: &Key,
     counter: u64,
     auth: &[u8],
     ciphertext: &[u8],
-) -> Result<Vec<u8>, Unspecified> {
-    let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)?;
+) -> Result<Vec<u8>, AeadError> {
+    let unbound =
+        UnboundKey::new(&CHACHA20_POLY1305, key).expect("key is always KEY_LEN bytes");
     let key = aead::LessSafeKey::new(unbound);
 
     let mut in_out = ciphertext.to_vec();
-    let plaintext = key.open_in_place(
-        aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?,
-        aead::Aad::from(auth),
-        &mut in_out,
-    )?;
+    let plaintext = key
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce_from_counter(counter)),
+            aead::Aad::from(auth),
+            &mut in_out,
+        )
+        .map_err(|_| AeadError::InvalidTag)?;
+
     Ok(plaintext.to_vec())
 }
 
@@ -131,75 +133,62 @@ pub const fn AEAD_LEN(plain_len: usize) -> usize {
     plain_len + TAG_LEN
 }
 
-// ===== Prepared AEAD key =====
-
-/// Failure of an AEAD operation.
+/// Failure of an AEAD operation: only the tag check can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeadError {
-    /// The key length does not match the algorithm.
-    InvalidKey,
     /// The tag did not verify: forgery, corruption or the wrong key.
     InvalidTag,
 }
 
-impl From<Unspecified> for AeadError {
-    fn from(_: Unspecified) -> Self {
-        // On the data path a failure is always a failed tag check.
-        Self::InvalidTag
-    }
-}
-
-/// A ready-to-use ChaCha20-Poly1305 key.
-///
-/// `UnboundKey::new` creates a BoringSSL context (an allocation), so this is
-/// built once when a session is created rather than on every packet. Keeping it
-/// here is also what stops aws-lc-rs types from leaking into the rest of the
-/// protocol module.
+/// A ready-to-use ChaCha20-Poly1305 key, built once per session since
+/// `UnboundKey::new` allocates a BoringSSL context.
 pub struct AeadKey {
     inner: aead::LessSafeKey,
 }
 
 impl AeadKey {
-    pub fn new(key: &Key) -> Result<Self, AeadError> {
+    /// Infallible: `UnboundKey::new` only rejects a wrong key length, and `Key`
+    /// is always `KEY_LEN` bytes.
+    pub fn new(key: &Key) -> Self {
         let unbound =
-            UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|_| AeadError::InvalidKey)?;
-        Ok(Self {
+            UnboundKey::new(&CHACHA20_POLY1305, key).expect("key is always KEY_LEN bytes");
+        Self {
             inner: aead::LessSafeKey::new(unbound),
-        })
+        }
     }
 
-    /// Encrypts in place. `buf` holds the plaintext followed by exactly
-    /// `TAG_LEN` spare bytes; the tag is written right after the ciphertext.
-    pub fn seal_in_place(&self, counter: u64, buf: &mut [u8]) -> Result<(), AeadError> {
+    /// Encrypts in place. `buf` holds the plaintext followed by `TAG_LEN`
+    /// spare bytes, which receive the tag.
+    pub fn seal_in_place(&self, counter: u64, buf: &mut [u8]) {
         let plain_len = buf
             .len()
             .checked_sub(TAG_LEN)
-            .ok_or(AeadError::InvalidTag)?;
-        let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?;
+            .expect("buf must have room for the tag");
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_from_counter(counter));
         let (plaintext, tag_out) = buf.split_at_mut(plain_len);
         let tag = self
             .inner
-            .seal_in_place_separate_tag(nonce, aead::Aad::empty(), plaintext)?;
+            .seal_in_place_separate_tag(nonce, aead::Aad::empty(), plaintext)
+            .expect("sealing cannot fail");
         tag_out.copy_from_slice(tag.as_ref());
-        Ok(())
     }
 
     /// Decrypts in place. `buf` holds the ciphertext followed by the tag;
-    /// returns the plaintext slice.
+    /// `Err` means the tag did not verify.
     pub fn open_in_place<'a>(
         &self,
         counter: u64,
         buf: &'a mut [u8],
     ) -> Result<&'a mut [u8], AeadError> {
-        let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_from_counter(counter))?;
-        Ok(self.inner.open_in_place(nonce, aead::Aad::empty(), buf)?)
+        let nonce = aead::Nonce::assume_unique_for_key(nonce_from_counter(counter));
+        self.inner
+            .open_in_place(nonce, aead::Aad::empty(), buf)
+            .map_err(|_| AeadError::InvalidTag)
     }
 }
 
-/// XAEAD(key, nonce, plain text, auth text): XChaCha20Poly1305 with a random
-/// 24-byte nonce. Used only for cookie encryption in CookieReply (§5.4.7, M4).
-/// aws-lc-rs 1.18 has no XChaCha20Poly1305 — decide at M4: RustCrypto
-/// chacha20poly1305 crate for this one function, or hand-rolled HChaCha20.
+/// XAEAD(key, nonce, plain text, auth text): XChaCha20Poly1305, needed only
+/// for cookies (§5.4.7). Not in aws-lc-rs; pick a crate or hand-roll HChaCha20.
 pub fn XAEAD_ENCRYPT(
     key: &Key,
     nonce: &[u8; 24],
@@ -220,33 +209,51 @@ pub fn XAEAD_DECRYPT(
     unimplemented!("XChaCha20Poly1305: needed at M4 (cookie), not in aws-lc-rs 1.18")
 }
 
-// ===== DH =====
+
+/// Failure of a Diffie-Hellman operation: the peer key is malformed or a
+/// low-order point, so the shared secret would be all zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhError {
+    /// The peer's public key is unusable: malformed, or a low-order point.
+    InvalidPeerKey,
+}
 
 /// DH(private key, public key): Curve25519 point multiplication, 32 bytes.
-/// peer_pub is attacker-controlled -> Err is a normal outcome (drop the packet).
-pub fn DH(my_priv: &PrivateKey, peer_pub: &[u8; 32]) -> Result<Key, Unspecified> {
+/// `peer_pub` is attacker-controlled, so `Err` is a normal outcome.
+pub fn DH(my_priv: &PrivateKey, peer_pub: &[u8; 32]) -> Result<Key, DhError> {
     let peer = agreement::UnparsedPublicKey::new(&agreement::X25519, peer_pub);
     agreement::agree(my_priv, peer, Unspecified, |secret| {
         let mut out = [0u8; KEY_LEN];
         out.copy_from_slice(secret);
         Ok(out)
     })
+    .map_err(|_| DhError::InvalidPeerKey)
 }
 
-/// DH_GENERATE(): generate a random Curve25519 private key.
-/// Whitepaper says "32 bytes of output", but aws-lc API keeps bytes opaque —
-/// we hold the PrivateKey object (can't do otherwise: its bytes are private).
+/// Rebuilds a `PrivateKey` from the raw 32 secret bytes WireGuard stores
+/// (e.g. `Handshake.static_private`). X25519 private keys are exactly 32
+/// bytes, so an invalid encoding here is a programming error, not input.
+pub fn DH_PRIVATE(bytes: &[u8; KEY_LEN]) -> PrivateKey {
+    PrivateKey::from_private_key(&agreement::X25519, bytes)
+        .expect("32-byte X25519 private key")
+}
+
+/// DH_GENERATE(): generate a random Curve25519 private key and derive its
+/// public key. We draw the raw bytes ourselves so the caller keeps the same
+/// byte-oriented representation the rest of WireGuard uses.
 pub fn DH_GENERATE() -> (PrivateKey, Key) {
-    let priv_key = agreement::PrivateKey::generate(&agreement::X25519).expect("Unexpected X25519 key generator failure");
-    let pub_key = priv_key.compute_public_key().unwrap(); // PrivateKey is always valid
-    let mut pub_out = [0u8; KEY_LEN];
-    pub_out.copy_from_slice(pub_key.as_ref());
-    (priv_key, pub_out)
+    let mut bytes = [0u8; KEY_LEN];
+    RAND(&mut bytes);
+    let priv_key = DH_PRIVATE(&bytes);
+    let pub_key = DH_PUBKEY(&priv_key);
+    (priv_key, pub_key)
 }
 
 /// DH-PUBKEY(private key): derive the Curve25519 public key.
 pub fn DH_PUBKEY(priv_key: &PrivateKey) -> Key {
-    let pub_key = priv_key.compute_public_key().expect("valid X25519 private key");
+    let pub_key = priv_key
+        .compute_public_key()
+        .unwrap(); // Realistically never panics
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(pub_key.as_ref());
     out

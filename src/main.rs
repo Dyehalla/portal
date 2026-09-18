@@ -12,7 +12,6 @@ enum Error {
     DeadPacketSource,
     InvalidPeerPubKey,
     /// AEAD failed while building a handshake message. Not attacker-reachable
-    /// for our own outgoing messages, but we do not panic on it.
     Crypto,
     /// Could not find an unused sender index; practically unreachable.
     NoFreeIndex,
