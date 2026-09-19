@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use super::index::SessionIndex;
 use super::packet::{HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInitiation, HandshakeResponse};
 use super::primitives::{
     AEAD_DECRYPT, AEAD_ENCRYPT, DH, DH_GENERATE, DH_PRIVATE, DH_PUBKEY, DhError, HASH, KDF1, KDF2,
@@ -92,7 +93,17 @@ pub struct Handshake {
     pub static_private: [u8; 32],
     pub peer_static_public: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
-    pub local_index: u32,
+    /// Hands out a fresh receiver index for every handshake message we build.
+    ///
+    /// A constant index here would make a rehandshake reuse the index of the
+    /// session it replaces, so every handshake would land in one ring slot and
+    /// the session being replaced would be lost mid-flight.
+    pub index: SessionIndex,
+    /// The index claimed by the initiation we are awaiting a response for.
+    ///
+    /// This is what the handshake's own traffic will be addressed to, so the
+    /// session built by `consume_response` must be filed under it.
+    pending_index: Option<u32>,
     ephemeral_private: Option<PrivateKey>,
     chaining_key: Option<[u8; 32]>,
     hash: Option<[u8; 32]>,
@@ -104,13 +115,14 @@ impl Handshake {
         static_private: [u8; 32],
         peer_static_public: [u8; 32],
         preshared_key: Option<[u8; 32]>,
-        local_index: u32,
+        index: SessionIndex,
     ) -> Self {
         Self {
             static_private,
             peer_static_public,
             preshared_key,
-            local_index,
+            index,
+            pending_index: None,
             ephemeral_private: None,
             chaining_key: None,
             hash: None,
@@ -128,6 +140,10 @@ impl Handshake {
         // (Eipriv, Eipub) := DH-Generate()
         // Ci := Kdf1(Ci, Eipub)
         // Hi := Hash(Hi || Eipub)
+        //
+        // The index is drawn first so that a DH failure below leaves the
+        // counter untouched: a failed build must not burn an index.
+        let local_index = self.index.next_index();
         let (ephemeral_private, ephemeral_public) = DH_GENERATE();
         chaining_key = KDF1(&chaining_key, &ephemeral_public);
         hash = HASH(&[&hash, &ephemeral_public]);
@@ -152,7 +168,7 @@ impl Handshake {
         let msg = &mut buf[..HANDSHAKE_INIT_LEN];
         msg[0] = MSG_HANDSHAKE_INITIATION;
         msg[1..OFF_SENDER].fill(0); // reserved
-        msg[OFF_SENDER..OFF_EPHEMERAL].copy_from_slice(&self.local_index.to_le_bytes());
+        msg[OFF_SENDER..OFF_EPHEMERAL].copy_from_slice(&local_index.to_le_bytes());
         msg[OFF_EPHEMERAL..OFF_STATIC].copy_from_slice(&ephemeral_public);
         msg[OFF_STATIC..OFF_TIMESTAMP].copy_from_slice(&encrypted_static);
         msg[OFF_TIMESTAMP..OFF_MAC1].copy_from_slice(&encrypted_timestamp);
@@ -168,20 +184,29 @@ impl Handshake {
         self.chaining_key = Some(chaining_key);
         self.hash = Some(hash);
         self.last_started = Some(Instant::now());
+        // Remember which index this initiation claimed: the response must come
+        // back addressed to exactly this one.
+        self.pending_index = Some(local_index);
 
         Ok(HANDSHAKE_INIT_LEN)
     }
 
 
     /// Builds handshake response into `buf` and returns the
-    /// session that reads the initiator's traffic.
+    /// session that reads the initiator's traffic, together with the receiver
+    /// index that session answers to.
     pub fn format_handshake_response(
         &mut self,
         buf: &mut [u8],
         initiation: &HandshakeInitiation<'_>,
-    ) -> Result<Session, HandshakeError> {
+    ) -> Result<(Session, u32), HandshakeError> {
         let static_private = DH_PRIVATE(&self.static_private);
         let static_public = DH_PUBKEY(&static_private);
+
+        // Our own receiver index for the session this response creates. Drawn
+        // before any step that can fail, so a rejected initiation does not
+        // consume an index.
+        let local_index = self.index.next_index();
 
         // Replay the initiator's state; "responder's static public" is our own
         // key. Ci := Hash(Construction); Hi := Hash(Ci || Identifier)
@@ -239,7 +264,7 @@ impl Handshake {
         let msg = &mut buf[..HANDSHAKE_RESPONSE_LEN];
         msg[0] = MSG_HANDSHAKE_RESPONSE;
         msg[1..R_OFF_SENDER].fill(0); // reserved
-        msg[R_OFF_SENDER..R_OFF_RECEIVER].copy_from_slice(&self.local_index.to_le_bytes());
+        msg[R_OFF_SENDER..R_OFF_RECEIVER].copy_from_slice(&local_index.to_le_bytes());
         msg[R_OFF_RECEIVER..R_OFF_EPHEMERAL].copy_from_slice(&initiation.sender_index.to_le_bytes());
         msg[R_OFF_EPHEMERAL..R_OFF_EMPTY].copy_from_slice(&ephemeral_public);
         msg[R_OFF_EMPTY..R_OFF_MAC1].copy_from_slice(&encrypted_nothing);
@@ -258,11 +283,9 @@ impl Handshake {
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as responder, tau_2 sends.
         let (recv, send) = KDF2(&chaining_key, &[]);
-        Ok(Session::new(
-            self.local_index,
-            initiation.sender_index,
-            &send,
-            &recv,
+        Ok((
+            Session::new(local_index, initiation.sender_index, &send, &recv),
+            local_index,
         ))
     }
 
@@ -277,9 +300,14 @@ impl Handshake {
     pub fn consume_response(
         &mut self,
         response: &HandshakeResponse<'_>,
-    ) -> Result<Session, HandshakeError> {
+    ) -> Result<(Session, u32), HandshakeError> {
         let ephemeral_private = self
             .ephemeral_private
+            .take()
+            .ok_or(HandshakeError::NoInitiationInFlight)?;
+        // Consumed on failure too: the initiation in flight is spent either way.
+        let local_index = self
+            .pending_index
             .take()
             .ok_or(HandshakeError::NoInitiationInFlight)?;
 
@@ -311,24 +339,22 @@ impl Handshake {
             .map_err(|_| HandshakeError::ResponseNotAuthentic)?;
 
         // The response must be addressed to the initiation we sent.
-        if response.receiver_index != self.local_index {
+        if response.receiver_index != local_index {
             return Err(HandshakeError::WrongPeer);
         }
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as initiator, tau_1 sends.
         let (send, recv) = KDF2(&chaining_key, &[]);
-        Ok(Session::new(
-            self.local_index,
-            response.sender_index,
-            &send,
-            &recv,
+        Ok((
+            Session::new(local_index, response.sender_index, &send, &recv),
+            local_index,
         ))
     }
 }
 
 impl Default for Handshake {
     fn default() -> Self {
-        Self::new([0; 32], [0; 32], None, 0)
+        Self::new([0; 32], [0; 32], None, SessionIndex::new(0))
     }
 }
 
@@ -338,7 +364,7 @@ mod tests {
     use crate::protocol::packet::Packet;
 
     fn handshake(peer_static_public: [u8; 32]) -> Handshake {
-        Handshake::new([7u8; 32], peer_static_public, None, 1)
+        Handshake::new([7u8; 32], peer_static_public, None, SessionIndex::new(1))
     }
 
     #[test]
@@ -351,8 +377,8 @@ mod tests {
         assert_eq!(buf[0], MSG_HANDSHAKE_INITIATION);
         // Reserved bytes must be zero.
         assert_eq!(&buf[1..4], &[0, 0, 0]);
-        // Sender index is ours.
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 1);
+        // Sender index is ours: peer 1 in the high 24 bits, session 1 in the low.
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), (1 << 8) | 1);
         // mac2 is zero without a cookie.
         assert_eq!(&buf[OFF_MAC2..], &[0u8; 16]);
         assert!(hs.has_pending_response());
@@ -408,8 +434,8 @@ mod tests {
         let initiator_public = DH_PUBKEY(&DH_PRIVATE(&initiator_private));
         let responder_public = DH_PUBKEY(&DH_PRIVATE(&responder_private));
 
-        let initiator = Handshake::new(initiator_private, responder_public, None, 1);
-        let responder = Handshake::new(responder_private, initiator_public, None, 2);
+        let initiator = Handshake::new(initiator_private, responder_public, None, SessionIndex::new(1));
+        let responder = Handshake::new(responder_private, initiator_public, None, SessionIndex::new(2));
         (initiator, responder)
     }
 
@@ -433,13 +459,16 @@ mod tests {
             .unwrap();
 
         // The responder's session reads the initiator's index and writes to ours.
-        assert_eq!(session.remote_index, 1);
+        assert_eq!(session.0.remote_index, (1 << 8) | 1);
+        assert_eq!(session.1, session.0.local_id, "index must match the session");
         assert_eq!(response[0], MSG_HANDSHAKE_RESPONSE);
         assert_eq!(&response[1..4], &[0, 0, 0]);
-        // Sender is the responder, receiver is the initiator's index.
+        // Sender is the responder, receiver is the initiator's index. Both are
+        // packed words: the peer number is shifted up, the session byte is 1
+        // because each side's first handshake claims its first index.
         assert_eq!(
             u32::from_le_bytes(response[R_OFF_SENDER..R_OFF_RECEIVER].try_into().unwrap()),
-            2
+            (2 << 8) | 1
         );
         assert_eq!(
             u32::from_le_bytes(
@@ -447,7 +476,7 @@ mod tests {
                     .try_into()
                     .unwrap()
             ),
-            1
+            (1 << 8) | 1
         );
         assert_eq!(&response[R_OFF_MAC2..], &[0u8; 16]);
     }
@@ -480,7 +509,7 @@ mod tests {
         // A responder configured for a *different* initiator static key: the
         // ciphertext authenticates, but the claimed static is not ours.
         let stranger = DH_PUBKEY(&DH_PRIVATE(&[0x33u8; 32]));
-        let mut other = Handshake::new([0x22u8; 32], stranger, None, 2);
+        let mut other = Handshake::new([0x22u8; 32], stranger, None, SessionIndex::new(2));
 
         let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
         let error = other
