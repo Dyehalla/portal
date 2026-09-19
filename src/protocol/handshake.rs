@@ -173,7 +173,7 @@ impl Handshake {
     }
 
 
-    /// Builds handshake response (message 2, §5.4.3) into `buf` and returns the
+    /// Builds handshake response into `buf` and returns the
     /// session that reads the initiator's traffic.
     pub fn format_handshake_response(
         &mut self,
@@ -251,9 +251,9 @@ impl Handshake {
         // msg.mac2 := 0^16 without a fresh cookie (§5.4.4).
         msg[R_OFF_MAC2..].fill(0);
 
-        self.ephemeral_private = Some(ephemeral_private);
-        self.chaining_key = Some(chaining_key);
-        self.hash = Some(hash);
+        // The responder's ephemeral key is only needed to build this message and
+        // is not retained: `ephemeral_private` tracks *our* initiation awaiting
+        // a response, and we await nothing here.
         self.last_started = Some(Instant::now());
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as responder, tau_2 sends.
@@ -383,6 +383,22 @@ mod tests {
         assert!(!hs.has_pending_response());
     }
 
+    #[test]
+    fn answering_an_initiation_does_not_leave_a_pending_response() {
+        // The responder awaits nothing, so it must stay free to initiate its
+        // own handshake later; otherwise it can never rekey.
+        let (mut initiator, mut responder) = peer_pair();
+        let mut init = [0u8; HANDSHAKE_INIT_LEN];
+        initiator.format_handshake_init(&mut init).unwrap();
+
+        let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
+        responder
+            .format_handshake_response(&mut response, &parse_initiation(&init))
+            .unwrap();
+
+        assert!(!responder.has_pending_response());
+    }
+
     /// A real initiator/responder pair with matching static keys. Returns
     /// (initiator, responder) sharing one derivation of each other's pubkey.
     fn peer_pair() -> (Handshake, Handshake) {
@@ -493,3 +509,4 @@ mod tests {
         assert_eq!(error, HandshakeError::TimestampNotAuthentic);
     }
 }
+

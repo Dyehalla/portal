@@ -176,6 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_sending_counter_requires_a_rekey() {
+        let (sender, _receiver) = peer_pair();
+
+        // Jump the counter to the limit so the next send must refuse.
+        sender
+            .sending_counter
+            .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
+
+        let mut datagram = [0u8; 4 + DATA_OVERHEAD];
+        assert_eq!(
+            sender.format_packet_data(b"ping", &mut datagram),
+            Err(SessionError::RekeyRequired)
+        );
+    }
+
+    #[test]
     fn round_trip_decrypts_in_place_in_the_receive_buffer() {
         let (sender, receiver) = peer_pair();
         let payload = b"an IP packet from the tunnel interface";

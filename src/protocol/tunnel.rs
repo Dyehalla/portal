@@ -20,13 +20,21 @@ const N_SESSIONS: usize = 8;
 const MAX_QUEUE_DEPTH: usize = 256;
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
-/// Buffer size that always suffices for any packet `Tunnel` can produce: the
-/// largest datagram plus the data-path overhead. Callers should size a reusable
-/// `dst` with this, since the buffer contract is not checked.
+/// How long to wait for a handshake response before retransmitting (§6.1).
+const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `update_timers` decided to do.
+enum TimerAction {
+    Nothing,
+    /// Start or retransmit a handshake.
+    Initiate,
+    /// Send an empty packet to keep the session alive.
+    Keepalive,
+}
+
 pub const MAX_PACKET_SIZE: usize = MAX_TRANSPORT_PAYLOAD + DATA_OVERHEAD;
 
 /// Result of one protocol operation.
-///
 /// `'d` is the received datagram, `'o` the output buffer; only one is ever
 /// borrowed by a given value.
 #[derive(Debug)]
@@ -43,9 +51,16 @@ pub enum TunnelResult<'d, 'o> {
     /// The peer input was malformed, forged, or unusable. Carries the specific
     /// reason. Not a local failure: the caller normally just drops the datagram.
     InvalidPacket(WireGuardError),
-    /// The sending counter is exhausted or the session is too old: the tunnel
-    /// needs a new handshake before it can carry more data.
+    /// The sending counter is exhausted or the session is too old. The caller
+    /// should start a fresh handshake.
     RekeyRequired,
+    /// A handshake we sent is still awaiting its response, so this call did
+    /// nothing. The caller should wait: resending would discard the initiation
+    /// already in flight.
+    HandshakeInProgress,
+    /// No session is established yet, so the tunnel cannot carry this packet.
+    /// The caller should wait for the handshake to finish.
+    NoSession,
 }
 
 impl<'d, 'o> From<SessionError> for TunnelResult<'d, 'o> {
@@ -141,7 +156,7 @@ impl Tunnel {
 
     /// Encrypts one IP packet into `dst` (`MAX_PACKET_SIZE` bytes); without a
     /// session this writes an initiation and queues the packet instead.
-    pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
+    pub fn encapsulate<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
         if let Some(session) = self.current_session() {
             let written = match session.format_packet_data(src, dst) {
                 Ok(written) => written,
@@ -163,14 +178,14 @@ impl Tunnel {
     /// Builds handshake initiation into `dst`.
     /// One handshake is in flight at a time; `force_resend` retransmits it.
     pub fn format_handshake_initiation<'a>(
-        &mut self,
+        &self,
         dst: &'a mut [u8],
         force_resend: bool,
     ) -> TunnelResult<'_, 'a> {
         let mut control = self.control();
 
         if control.handshake.has_pending_response() && !force_resend {
-            return TunnelResult::RekeyRequired;
+            return TunnelResult::HandshakeInProgress;
         }
 
         let message = &mut dst[..packet::HANDSHAKE_INIT_LEN];
@@ -187,7 +202,7 @@ impl Tunnel {
     }
 
     /// Stores a packet until a session can carry it.
-    fn queue_packet(&mut self, src: &[u8]) {
+    fn queue_packet(&self, src: &[u8]) {
         let mut control = self.control();
         if control.packet_queue.len() < MAX_QUEUE_DEPTH {
             control.packet_queue.push_back(src.to_vec());
@@ -195,7 +210,7 @@ impl Tunnel {
     }
 
     /// Sends the oldest queued packet. Called with an empty input until it
-    fn send_queued_packet<'d, 'a>(&mut self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
+    fn send_queued_packet<'d, 'a>(&self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
         let mut control = self.control();
         let Some(src) = control.packet_queue.pop_front() else {
             return TunnelResult::Done;
@@ -216,7 +231,7 @@ impl Tunnel {
         if control.packet_queue.len() < MAX_QUEUE_DEPTH {
             control.packet_queue.push_front(src);
         }
-        TunnelResult::RekeyRequired
+        TunnelResult::NoSession
     }
 
     /// Locks the control state.
@@ -232,7 +247,7 @@ impl Tunnel {
     /// Parses one incoming datagram. `datagram` is `&mut` because a data packet
     /// is decrypted in place there; an empty one drains the queued backlog.
     pub fn decapsulate<'a, 'o>(
-        &mut self,
+        &self,
         datagram: &'a mut [u8],
         dst: &'o mut [u8],
     ) -> TunnelResult<'a, 'o> {
@@ -254,9 +269,9 @@ impl Tunnel {
 
     /// Decrypts a transport-data packet in place
     /// The returned plaintext borrows the datagram buffer, not `dst`.
-    fn handle_data<'a, 'o>(&mut self, packet: DataPacket<'a>) -> TunnelResult<'a, 'o> {
+    fn handle_data<'a, 'o>(&self, packet: DataPacket<'a>) -> TunnelResult<'a, 'o> {
         let Some(session) = self.current_session() else {
-            return TunnelResult::RekeyRequired;
+            return TunnelResult::NoSession;
         };
 
         // The payload is decrypted in place inside the received datagram
@@ -274,7 +289,7 @@ impl Tunnel {
 
     /// Answers a handshake initiation.
     fn handle_handshake_init<'d, 'a>(
-        &mut self,
+        &self,
         initiation: HandshakeInitiation<'_>,
         dst: &'a mut [u8],
     ) -> TunnelResult<'d, 'a> {
@@ -304,7 +319,7 @@ impl Tunnel {
     /// Consumes a handshake response, activates the session and confirms it
     /// with a keepalive.
     fn handle_handshake_response<'d, 'a>(
-        &mut self,
+        &self,
         response: HandshakeResponse<'_>,
         dst: &'a mut [u8],
     ) -> TunnelResult<'d, 'a> {
@@ -335,7 +350,7 @@ impl Tunnel {
 
     /// Stores the cookie from a cookie reply for use in `mac2` (§5.4.4/§5.4.7).
     fn handle_cookie_reply<'d, 'a>(
-        &mut self,
+        &self,
         _reply: CookieReply<'_>,
         _dst: &'a mut [u8],
     ) -> TunnelResult<'d, 'a> {
@@ -343,39 +358,74 @@ impl Tunnel {
         TunnelResult::InvalidPacket(WireGuardError::InvalidPacket)
     }
 
-    /// Advances timers and emits a keepalive packet when it is due.
+    /// Advances timers and acts on whatever came due: retransmitting a stalled
+    /// handshake, starting a new one, or sending a keepalive.
     ///
-    /// `dst` must satisfy the same contract as `encapsulate`.
-    pub fn update_timers<'a>(&mut self, now: Instant, dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
-        let Some(session) = self.current_session() else {
-            return TunnelResult::RekeyRequired;
-        };
-        if now
-            .checked_duration_since(session.created_at)
-            .is_some_and(|age| age >= REJECT_AFTER_TIME)
-        {
-            return TunnelResult::RekeyRequired;
-        }
-
-        let due = {
+    /// `dst` must satisfy the same contract as `encapsulate`. The tunnel starts
+    /// its own handshake here, so the caller never calls
+    /// `format_handshake_initiation` to recover; it only sends what it is given.
+    pub fn update_timers<'a>(&self, now: Instant, dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
+        let decision = {
             let control = self.control();
-            let Some(interval) = control.timers.persistent_keepalive else {
-                return TunnelResult::Done;
-            };
-            let last_activity = control
-                .timers
-                .last_packet_sent
-                .max(control.timers.last_packet_received);
-            !last_activity.is_some_and(|last| {
-                now.checked_duration_since(last)
-                    .is_none_or(|age| age < interval)
-            })
+
+            // An initiation is in flight: retransmit once the timeout passes.
+            if control.handshake.has_pending_response() {
+                let elapsed = control
+                    .timers
+                    .last_handshake
+                    .and_then(|started| now.checked_duration_since(started));
+                if elapsed.is_some_and(|age| age >= REKEY_TIMEOUT) {
+                    TimerAction::Initiate
+                } else {
+                    TimerAction::Nothing
+                }
+            } else {
+                self.session_timer_action(&control, now)
+            }
         };
-        if !due {
-            return TunnelResult::Done;
+
+        match decision {
+            TimerAction::Nothing => TunnelResult::Done,
+            TimerAction::Initiate => self.format_handshake_initiation(dst, true),
+            TimerAction::Keepalive => self.encapsulate(&[], dst),
+        }
+    }
+
+    /// Decides what an established (or absent) session requires.
+    ///
+    /// Split out because both the "no initiation in flight" timer path and the
+    /// tests want the same reasoning.
+    fn session_timer_action(&self, control: &ControlState, now: Instant) -> TimerAction {
+        let Some(session) = self.current_session() else {
+            // Nothing to keep alive, and no session to replace: `encapsulate`
+            // will start a handshake when there is actually a packet to send.
+            return TimerAction::Nothing;
+        };
+
+        let age = now.checked_duration_since(session.created_at);
+
+        // Past the hard limit the session must not carry more traffic.
+        if age.is_some_and(|age| age >= REJECT_AFTER_TIME) {
+            return TimerAction::Initiate;
         }
 
-        self.encapsulate(&[], dst)
+        let Some(interval) = control.timers.persistent_keepalive else {
+            return TimerAction::Nothing;
+        };
+        let last_activity = control
+            .timers
+            .last_packet_sent
+            .max(control.timers.last_packet_received);
+        let idle = !last_activity.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_none_or(|age| age < interval)
+        });
+
+        if idle {
+            TimerAction::Keepalive
+        } else {
+            TimerAction::Nothing
+        }
     }
 
     /// Registers a new session in the ring and makes it current.
@@ -399,3 +449,371 @@ impl Tunnel {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
+
+    /// Two peers with matching static keys and mirrored indexes.
+    pub(super) fn pair() -> (Tunnel, Tunnel) {
+        let a_private = [0x11u8; 32];
+        let b_private = [0x22u8; 32];
+        let a_public = DH_PUBKEY(&DH_PRIVATE(&a_private));
+        let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
+
+        let a = Tunnel::new(a_private, b_public, None, None, 11);
+        let b = Tunnel::new(b_private, a_public, None, None, 22);
+        (a, b)
+    }
+
+    fn dst() -> Vec<u8> {
+        vec![0u8; MAX_PACKET_SIZE]
+    }
+
+    /// Runs a full handshake between two peers.
+    pub(super) fn handshake(a: &mut Tunnel, b: &mut Tunnel) {
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+
+        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected initiation, got {other:?}"),
+        };
+
+        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected response, got {other:?}"),
+        };
+
+        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected keepalive, got {other:?}"),
+        };
+
+        match b.decapsulate(&mut keepalive, &mut b_buf) {
+            TunnelResult::WriteToTunnelInPlace(payload) => assert!(payload.is_empty()),
+            other => panic!("expected empty keepalive payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_establishes_a_working_session() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+        let mut packet = match a.encapsulate(b"an IP packet", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a data packet, got {other:?}"),
+        };
+
+        match b.decapsulate(&mut packet, &mut b_buf) {
+            TunnelResult::WriteToTunnelInPlace(payload) => {
+                assert_eq!(payload, b"an IP packet");
+            }
+            other => panic!("expected plaintext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_carries_traffic_in_both_directions() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+
+        let mut from_a = match a.encapsulate(b"ping", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a data packet, got {other:?}"),
+        };
+        assert!(matches!(
+            b.decapsulate(&mut from_a, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+
+        let mut from_b = match b.encapsulate(b"pong", &mut b_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a data packet, got {other:?}"),
+        };
+        match a.decapsulate(&mut from_b, &mut a_buf) {
+            TunnelResult::WriteToTunnelInPlace(payload) => assert_eq!(payload, b"pong"),
+            other => panic!("expected plaintext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forged_response_is_rejected() {
+        let (mut a, mut b) = pair();
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+
+        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected initiation, got {other:?}"),
+        };
+        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected response, got {other:?}"),
+        };
+
+        response[44] ^= 0x01;
+        assert!(matches!(
+            a.decapsulate(&mut response, &mut a_buf),
+            TunnelResult::InvalidPacket(WireGuardError::HandshakeNotAuthentic)
+        ));
+    }
+
+    #[test]
+    fn a_response_without_a_pending_initiation_is_rejected() {
+        let (mut a, mut b) = pair();
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+
+        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected initiation, got {other:?}"),
+        };
+        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected response, got {other:?}"),
+        };
+
+        assert!(matches!(
+            a.decapsulate(&mut response, &mut a_buf),
+            TunnelResult::WriteToNetwork(_)
+        ));
+        assert!(matches!(
+            a.decapsulate(&mut response, &mut a_buf),
+            TunnelResult::InvalidPacket(_)
+        ));
+    }
+
+    #[test]
+    fn encapsulate_writes_a_handshake_initiation() {
+        let mut buf = dst();
+        let (mut a, _b) = pair();
+
+        match a.encapsulate(b"hello", &mut buf) {
+            TunnelResult::WriteToNetwork(packet) => {
+                assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(a.tx_bytes(), 0);
+    }
+
+    #[test]
+    fn a_second_encapsulate_while_a_handshake_is_in_flight_is_not_a_rekey() {
+        // Nothing to do: the initiation we already sent is still in flight, and
+        // resending would discard it.
+        let mut buf = dst();
+        let (mut a, _b) = pair();
+
+        assert!(matches!(
+            a.encapsulate(b"hello", &mut buf),
+            TunnelResult::WriteToNetwork(_)
+        ));
+        assert!(matches!(
+            a.encapsulate(b"second", &mut buf),
+            TunnelResult::HandshakeInProgress
+        ));
+    }
+
+    #[test]
+    fn empty_datagram_drains_the_queue() {
+        let mut buf = dst();
+        let (mut a, _b) = pair();
+
+        assert!(matches!(
+            a.encapsulate(b"hello", &mut buf),
+            TunnelResult::WriteToNetwork(_)
+        ));
+        let mut empty: [u8; 0] = [];
+        assert!(matches!(
+            a.decapsulate(&mut empty, &mut buf),
+            TunnelResult::NoSession
+        ));
+    }
+
+    #[test]
+    fn garbage_datagram_is_invalid() {
+        let mut buf = dst();
+        let (mut b, _a) = pair();
+        let mut garbage = *b"not-a-packet";
+        assert!(matches!(
+            b.decapsulate(&mut garbage, &mut buf),
+            TunnelResult::InvalidPacket(WireGuardError::UnknownMessageType)
+        ));
+    }
+
+    #[test]
+    #[should_panic]
+    fn undersized_dst_panics_inside_the_caller() {
+        let mut small = [0u8; 8];
+        let (mut a, _b) = pair();
+        let _ = a.encapsulate(b"hello", &mut small);
+    }
+
+    #[test]
+    fn timers_without_a_session_do_nothing() {
+        // With nothing to keep alive and no session to replace, there is no
+        // reason to spend a handshake; `encapsulate` starts one when a real
+        // packet needs to go out.
+        let mut buf = dst();
+        let mut tunnel = Tunnel::new(
+            [7u8; KEY_LEN],
+            [9u8; KEY_LEN],
+            None,
+            Some(Duration::from_secs(1)),
+            11,
+        );
+        let now = Instant::now() + Duration::from_secs(2);
+        assert!(matches!(
+            tunnel.update_timers(now, &mut buf),
+            TunnelResult::Done
+        ));
+    }
+
+    #[test]
+    fn an_expired_session_makes_the_tunnel_rehandshake_by_itself() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        // Jump past REJECT_AFTER_TIME: the session may no longer carry traffic.
+        let mut buf = dst();
+        let now = Instant::now() + REJECT_AFTER_TIME;
+        match a.update_timers(now, &mut buf) {
+            TunnelResult::WriteToNetwork(packet) => {
+                assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
+            }
+            other => panic!("expected a fresh initiation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stalled_handshake_is_retransmitted() {
+        let (mut a, _b) = pair();
+        let mut buf = dst();
+
+        // Start a handshake and leave it unanswered.
+        assert!(matches!(
+            a.encapsulate(b"hello", &mut buf),
+            TunnelResult::WriteToNetwork(_)
+        ));
+
+        // Before the timeout nothing happens; the initiation is still in flight.
+        let early = Instant::now() + Duration::from_millis(1);
+        assert!(matches!(
+            a.update_timers(early, &mut buf),
+            TunnelResult::Done
+        ));
+
+        // Past REKEY_TIMEOUT it is retransmitted, without the caller asking.
+        let late = Instant::now() + REKEY_TIMEOUT + Duration::from_secs(1);
+        match a.update_timers(late, &mut buf) {
+            TunnelResult::WriteToNetwork(packet) => {
+                assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
+            }
+            other => panic!("expected a retransmission, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_established_idle_session_sends_a_persistent_keepalive() {
+        let a_private = [0x11u8; 32];
+        let b_private = [0x22u8; 32];
+        let a_public = DH_PUBKEY(&DH_PRIVATE(&a_private));
+        let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
+
+        let keepalive = Duration::from_secs(1);
+        let mut a = Tunnel::new(a_private, b_public, None, Some(keepalive), 11);
+        let mut b = Tunnel::new(b_private, a_public, None, None, 22);
+        handshake(&mut a, &mut b);
+
+        let mut buf = dst();
+        let now = Instant::now() + keepalive * 2;
+        match a.update_timers(now, &mut buf) {
+            TunnelResult::WriteToNetwork(packet) => {
+                // A keepalive is an empty transport-data packet.
+                assert_eq!(packet.len(), DATA_OVERHEAD);
+            }
+            other => panic!("expected a keepalive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_without_a_session_reports_no_session() {
+        let mut buf = dst();
+        let (mut b, _a) = pair();
+
+        // A well-formed data packet for a session we do not have yet.
+        let mut datagram = [0u8; 16 + 16];
+        datagram[0..4].copy_from_slice(&packet::MSG_DATA.to_le_bytes());
+        datagram[4..8].copy_from_slice(&11u32.to_le_bytes());
+
+        assert!(matches!(
+            b.decapsulate(&mut datagram, &mut buf),
+            TunnelResult::NoSession
+        ));
+    }
+}
+
+#[cfg(test)]
+mod concurrency {
+    use super::*;
+
+    /// Compile-time proof that a `Tunnel` can be shared across worker threads:
+    /// all workers decrypt in parallel, only the control lock serialises.
+    #[test]
+    fn tunnel_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Tunnel>();
+        assert_send_sync::<Arc<Tunnel>>();
+    }
+
+    #[test]
+    fn workers_decrypt_one_peers_packets_in_parallel() {
+        use std::thread;
+
+        let (mut a, mut b) = super::tests::pair();
+        super::tests::handshake(&mut a, &mut b);
+
+        let b = Arc::new(b);
+
+        // Build one datagram per worker, each with its own counter.
+        let mut datagrams: Vec<Vec<u8>> = Vec::new();
+        for i in 0..8 {
+            let mut buf = vec![0u8; MAX_PACKET_SIZE];
+            let payload = format!("packet {i}");
+            match a.encapsulate(payload.as_bytes(), &mut buf) {
+                TunnelResult::WriteToNetwork(p) => datagrams.push(p.to_vec()),
+                other => panic!("expected a data packet, got {other:?}"),
+            }
+        }
+
+        let handles: Vec<_> = datagrams
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut datagram)| {
+                let b = Arc::clone(&b);
+                thread::spawn(move || {
+                    let mut dst = vec![0u8; MAX_PACKET_SIZE];
+                    // The borrow cannot cross the thread boundary, so decide here.
+                    let ok = matches!(
+                        b.decapsulate(&mut datagram, &mut dst),
+                        TunnelResult::WriteToTunnelInPlace(_)
+                    );
+                    (i, ok)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (i, ok) = handle.join().expect("decrypt must not panic");
+            assert!(ok, "packet {i} failed to decrypt");
+        }
+    }
+}
