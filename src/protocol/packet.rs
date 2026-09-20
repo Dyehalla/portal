@@ -37,9 +37,13 @@ impl From<crate::protocol::handshake::HandshakeError> for WireGuardError {
         use crate::protocol::handshake::HandshakeError;
         match error {
             HandshakeError::Dh(_) => Self::HandshakeKeyAgreementFailed,
-            HandshakeError::NoInitiationInFlight => Self::HandshakeKeyAgreementFailed,
+            // Not an attack: we sent no initiation, or the peer answered a
+            // different one. Reported plainly rather than as a forgery.
+            HandshakeError::NoInitiationInFlight | HandshakeError::ResponseNotForUs => {
+                Self::InvalidPacket
+            }
             HandshakeError::InitiationNotAuthentic
-            | HandshakeError::WrongPeer
+            | HandshakeError::InitiationForAnotherPeer
             | HandshakeError::TimestampNotAuthentic
             | HandshakeError::ResponseNotAuthentic => Self::HandshakeNotAuthentic,
         }

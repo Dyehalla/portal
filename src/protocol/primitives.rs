@@ -40,12 +40,17 @@ pub fn HASH(inputs: &[&[u8]]) -> Hash {
 
 /// MAC(key, input): Keyed-Blake2s(key, input, 16), returning 16 bytes of output
 pub fn MAC(key: &Key, input: &[u8]) -> Tag {
-    let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(key).expect("key len is const");
+    MAC_KEYED(key, input)
+}
+
+/// Like [`MAC`], but for a key of any length: `mac2` is keyed with a 16-byte
+/// cookie rather than a 32-byte hash (§5.4.4).
+pub fn MAC_KEYED(key: &[u8], input: &[u8]) -> Tag {
+    let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(key).expect("blake2s key is <= 32");
     MacTrait::update(&mut mac, input);
     let tag = MacTrait::finalize(mac);
     let mut out = [0u8; MAC_LEN];
-    let tag = tag.into_bytes();
-    out.copy_from_slice(&tag);
+    out.copy_from_slice(&tag.into_bytes());
     out
 }
 
@@ -185,18 +190,98 @@ impl AeadKey {
             .open_in_place(nonce, aead::Aad::empty(), buf)
             .map_err(|_| AeadError::InvalidTag)
     }
+
+    /// Encrypts into a fresh buffer, returning ciphertext || tag. Unlike
+    /// `seal_in_place` this takes an explicit nonce and AAD, as XAEAD needs.
+    pub fn seal(&self, nonce: [u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Unspecified> {
+        let mut out = plaintext.to_vec();
+        let nonce = aead::Nonce::assume_unique_for_key(nonce);
+        self.inner
+            .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut out)?;
+        Ok(out)
+    }
+
+    /// Decrypts ciphertext || tag into a fresh buffer; `Err` on a bad tag.
+    pub fn open(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Unspecified> {
+        let mut out = ciphertext.to_vec();
+        let nonce = aead::Nonce::assume_unique_for_key(nonce);
+        let plaintext = self
+            .inner
+            .open_in_place(nonce, aead::Aad::from(aad), &mut out)?;
+        let len = plaintext.len();
+        out.truncate(len);
+        Ok(out)
+    }
 }
 
-/// XAEAD(key, nonce, plain text, auth text): XChaCha20Poly1305, needed only
-/// for cookies (§5.4.7). Not in aws-lc-rs; pick a crate or hand-roll HChaCha20.
+/// `QUARTERROUND(a, b, c, d)` from RFC 8439 §2.1, in place.
+fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
+}
+
+/// HChaCha20(key, nonce): the XChaCha20 subkey derivation (§2.2). Counterless,
+/// and returns words 0..4 and 12..16 with no final feed-forward.
+fn hchacha20(key: &Key, nonce: &[u8; 16]) -> Key {
+    let mut state = [0u32; 16];
+    state[0] = 0x6170_7865;
+    state[1] = 0x3320_646e;
+    state[2] = 0x7962_2d32;
+    state[3] = 0x6b20_6574;
+    for (i, chunk) in key.chunks_exact(4).enumerate() {
+        state[4 + i] = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+    }
+    for (i, chunk) in nonce.chunks_exact(4).enumerate() {
+        state[12 + i] = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+    }
+
+    for _ in 0..10 {
+        quarter_round(&mut state, 0, 4, 8, 12);
+        quarter_round(&mut state, 1, 5, 9, 13);
+        quarter_round(&mut state, 2, 6, 10, 14);
+        quarter_round(&mut state, 3, 7, 11, 15);
+        quarter_round(&mut state, 0, 5, 10, 15);
+        quarter_round(&mut state, 1, 6, 11, 12);
+        quarter_round(&mut state, 2, 7, 8, 13);
+        quarter_round(&mut state, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; KEY_LEN];
+    for i in 0..4 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&state[i].to_le_bytes());
+        out[16 + i * 4..16 + i * 4 + 4].copy_from_slice(&state[12 + i].to_le_bytes());
+    }
+    out
+}
+
+/// The 12-byte ChaCha20 nonce XChaCha20 derives from a 24-byte one: four NUL
+/// bytes followed by `nonce[16..24]` (§2.3).
+fn xchacha_nonce(nonce: &[u8; 24]) -> [u8; 12] {
+    let mut derived = [0u8; 12];
+    derived[4..].copy_from_slice(&nonce[16..24]);
+    derived
+}
+
+/// XAEAD(key, nonce, plaintext, auth): XChaCha20Poly1305, used by cookies
+/// (§5.4.7). HChaCha20 produces the subkey; the rest is ordinary ChaCha20.
 pub fn XAEAD_ENCRYPT(
     key: &Key,
     nonce: &[u8; 24],
     auth: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Unspecified> {
-    let _ = (key, nonce, auth, plaintext);
-    unimplemented!("XChaCha20Poly1305: needed at M4 (cookie), not in aws-lc-rs 1.18")
+    let subkey = hchacha20(key, nonce[..16].try_into().expect("16-byte prefix"));
+    AeadKey::new(&subkey).seal(xchacha_nonce(nonce), auth, plaintext)
 }
 
 pub fn XAEAD_DECRYPT(
@@ -205,8 +290,8 @@ pub fn XAEAD_DECRYPT(
     auth: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, Unspecified> {
-    let _ = (key, nonce, auth, ciphertext);
-    unimplemented!("XChaCha20Poly1305: needed at M4 (cookie), not in aws-lc-rs 1.18")
+    let subkey = hchacha20(key, nonce[..16].try_into().expect("16-byte prefix"));
+    AeadKey::new(&subkey).open(xchacha_nonce(nonce), auth, ciphertext)
 }
 
 
@@ -311,4 +396,168 @@ pub fn KDF2(key: &Key, input: &[u8]) -> (Key, Key) {
 pub fn KDF3(key: &Key, input: &[u8]) -> (Key, Key, Key) {
     let taus = kdf::<3>(key, input);
     (taus[0], taus[1], taus[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC vectors use `00:01:02:...` notation; decode hex for readability.
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// draft-irtf-cfrg-xchacha §2.2.1: the HChaCha20 test vector, including
+    /// the intermediate state before the final row selection.
+    #[test]
+    fn hchacha20_matches_the_draft_vector() {
+        let key: [u8; 32] = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .try_into()
+            .unwrap();
+        let nonce: [u8; 16] = hex("000000090000004a0000000031415927")
+            .try_into()
+            .unwrap();
+
+        let subkey = hchacha20(&key, &nonce);
+        assert_eq!(
+            subkey.as_slice(),
+            hex("82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc"),
+            "HChaCha20 subkey"
+        );
+    }
+
+    /// The ChaCha20 quarter round, RFC 8439 §2.1.1. Pinned separately so a
+    /// bug in the round is not masked by a wrong state layout.
+    #[test]
+    fn quarter_round_matches_the_rfc_vector() {
+        let mut state = [0u32; 16];
+        state[0] = 0x11111111;
+        state[1] = 0x01020304;
+        state[2] = 0x9b8d6f43;
+        state[3] = 0x01234567;
+
+        quarter_round(&mut state, 0, 1, 2, 3);
+        assert_eq!(
+            [state[0], state[1], state[2], state[3]],
+            [0xea2a92f4, 0xcb1cf8ce, 0x4581472e, 0x5881c4bb]
+        );
+    }
+
+    /// draft-irtf-cfrg-xchacha A.3.1: the full AEAD_XChaCha20_Poly1305 vector.
+    #[test]
+    fn xaead_matches_the_draft_vector() {
+        let key: [u8; 32] = hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+            .try_into()
+            .unwrap();
+        let nonce: [u8; 24] = hex("404142434445464748494a4b4c4d4e4f5051525354555657")
+            .try_into()
+            .unwrap();
+        let aad = hex("50515253c0c1c2c3c4c5c6c7");
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you \
+only one tip for the future, sunscreen would be it.";
+
+        let sealed = XAEAD_ENCRYPT(&key, &nonce, &aad, plaintext).unwrap();
+
+        let (ciphertext, tag) = sealed.split_at(sealed.len() - TAG_LEN);
+        assert_eq!(
+            ciphertext,
+            hex(
+                "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb\
+                 731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452\
+                 2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9\
+                 21f9664c97637da9768812f615c68b13b52e"
+            )
+            .as_slice()
+        );
+        assert_eq!(tag, hex("c0875924c1c7987947deafd8780acf49").as_slice());
+
+        // And it round-trips.
+        let opened = XAEAD_DECRYPT(&key, &nonce, &aad, &sealed).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn xaead_rejects_a_forged_tag_or_wrong_aad() {
+        let key = [7u8; 32];
+        let nonce = [9u8; 24];
+        let sealed = XAEAD_ENCRYPT(&key, &nonce, b"aad", b"cookie").unwrap();
+
+        let mut forged = sealed.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert!(XAEAD_DECRYPT(&key, &nonce, b"aad", &forged).is_err());
+
+        // The AAD is authenticated too, so changing it must fail.
+        assert!(XAEAD_DECRYPT(&key, &nonce, b"other", &sealed).is_err());
+    }
+
+    /// A different key or nonce must not decrypt: this is what stops a cookie
+    /// minted for another session from being accepted.
+    #[test]
+    fn xaead_binds_the_key_and_the_whole_nonce() {
+        let key = [7u8; 32];
+        let nonce = [9u8; 24];
+        let sealed = XAEAD_ENCRYPT(&key, &nonce, b"", b"cookie").unwrap();
+
+        assert!(XAEAD_DECRYPT(&[8u8; 32], &nonce, b"", &sealed).is_err());
+
+        // The last nonce byte only affects the ChaCha20 part, the first ones
+        // only affect HChaCha20; both must be bound.
+        let mut later = nonce;
+        later[23] ^= 0x01;
+        assert!(XAEAD_DECRYPT(&key, &later, b"", &sealed).is_err());
+
+        let mut earlier = nonce;
+        earlier[0] ^= 0x01;
+        assert!(XAEAD_DECRYPT(&key, &earlier, b"", &sealed).is_err());
+    }
+
+    /// Cross-check against RustCrypto's independent implementation, so a
+    /// matching-but-wrong vector transcription cannot pass unnoticed.
+    #[test]
+    fn xaead_agrees_with_the_rustcrypto_implementation() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+        let mut seed = [0u8; 64];
+        RAND(&mut seed);
+
+        for (key, nonce, aad, plaintext) in [
+            ([0u8; 32], [0u8; 24], &b""[..], &b""[..]),
+            (
+                seed[..32].try_into().unwrap(),
+                seed[32..56].try_into().unwrap(),
+                &b"associated data"[..],
+                &b"a cookie worth 32 bytes exactly!!"[..],
+            ),
+            (
+                [0xffu8; 32],
+                [0xffu8; 24],
+                &b"aad"[..],
+                &[0xabu8; 200][..],
+            ),
+        ] {
+            let cipher = XChaCha20Poly1305::new(&key.into());
+            let expected = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
+                .unwrap();
+
+            let ours = XAEAD_ENCRYPT(&key, &nonce, aad, plaintext).unwrap();
+            assert_eq!(ours, expected, "ciphertext mismatch against RustCrypto");
+            assert_eq!(
+                XAEAD_DECRYPT(&key, &nonce, aad, &expected).unwrap(),
+                plaintext,
+                "we must decrypt their ciphertext"
+            );
+        }
+    }
 }

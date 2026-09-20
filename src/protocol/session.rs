@@ -43,7 +43,6 @@ impl From<WireGuardError> for SessionError {
 pub struct Session {
     pub(super) local_id: u32,
     pub(super) remote_index: u32,
-    pub(super) peer_index: u32,
     pub(super) sender: AeadKey,
     pub(super) receiver: AeadKey,
     pub(super) sending_counter: AtomicU64,
@@ -64,7 +63,6 @@ impl Session {
         Self {
             local_id,
             remote_index,
-            peer_index: remote_index,
             sender: AeadKey::new(sending),
             receiver: AeadKey::new(receiving),
             sending_counter: AtomicU64::new(0),
@@ -153,7 +151,6 @@ mod tests {
         let a = Session {
             local_id: 1,
             remote_index: 2,
-            peer_index: 2,
             sender: AeadKey::new(&key_a),
             receiver: AeadKey::new(&key_b),
             sending_counter: AtomicU64::new(0),
@@ -164,7 +161,6 @@ mod tests {
         let b = Session {
             local_id: 2,
             remote_index: 1,
-            peer_index: 1,
             sender: AeadKey::new(&key_b),
             receiver: AeadKey::new(&key_a),
             sending_counter: AtomicU64::new(0),

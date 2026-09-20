@@ -1,10 +1,11 @@
 use std::time::Instant;
 
+use super::cookie::{self, StoredCookie};
 use super::index::SessionIndex;
 use super::packet::{HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInitiation, HandshakeResponse};
 use super::primitives::{
     AEAD_DECRYPT, AEAD_ENCRYPT, DH, DH_GENERATE, DH_PRIVATE, DH_PUBKEY, DhError, HASH, KDF1, KDF2,
-    KDF3, LABEL_MAC1, MAC, PrivateKey, TAI64N,
+    KDF3, LABEL_MAC1, MAC, MAC_KEYED, MAC_LEN, PrivateKey, TAI64N,
 };
 use super::session::Session;
 
@@ -54,25 +55,25 @@ const R_OFF_EMPTY: usize = 44;
 const R_OFF_MAC1: usize = 60;
 const R_OFF_MAC2: usize = 76;
 
-/// Failure while building or consuming a handshake message.
-///
-/// `Dh` and `NoInitiationInFlight` are local; the rest mean the peer's message
-/// did not authenticate and the packet should be dropped.
+/// Failure while building or consuming a handshake message. `Dh`,
+/// `NoInitiationInFlight` and `ResponseNotForUs` are local, not peer attacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeError {
     /// A Diffie-Hellman step was refused, so no message can be built. Not
     /// caused by anything the peer sent in this message.
     Dh(DhError),
-    /// The initiation did not decrypt: its `encrypted_static` failed to
-    /// authenticate, so it is forged, corrupt, or was not built for us.
+    /// `encrypted_static` failed to authenticate: forged, corrupt, or not ours.
     InitiationNotAuthentic,
-    /// The initiation authenticated, but it claims a static public key other
-    /// than the peer this tunnel is configured for.
-    WrongPeer,
+    /// The initiation authenticated, but claims a static key other than our
+    /// peer's, so this tunnel is not the one it was built for.
+    InitiationForAnotherPeer,
     /// The initiation's `encrypted_timestamp` failed to authenticate.
     TimestampNotAuthentic,
     /// The response's `encrypted_nothing` failed to authenticate.
     ResponseNotAuthentic,
+    /// The response authenticated, but answers an initiation that is not the
+    /// one in flight: a stale or duplicate response, not a forgery.
+    ResponseNotForUs,
     /// No initiation is awaiting a response, so there is nothing to consume.
     NoInitiationInFlight,
 }
@@ -95,15 +96,17 @@ pub struct Handshake {
     pub preshared_key: Option<[u8; 32]>,
     /// Hands out a fresh receiver index for every handshake message we build.
     ///
-    /// A constant index here would make a rehandshake reuse the index of the
-    /// session it replaces, so every handshake would land in one ring slot and
-    /// the session being replaced would be lost mid-flight.
+    /// A constant index would make a rehandshake reuse the index it replaces.
     pub index: SessionIndex,
-    /// The index claimed by the initiation we are awaiting a response for.
+    /// The index claimed by the initiation we await a response for.
     ///
-    /// This is what the handshake's own traffic will be addressed to, so the
-    /// session built by `consume_response` must be filed under it.
+    /// The session built by `consume_response` must be filed under it.
     pending_index: Option<u32>,
+    /// The `mac1` of the initiation we last sent, needed to unwrap a cookie
+    /// reply: the reply's AAD is exactly this value.
+    last_sent_mac1: Option<[u8; MAC_LEN]>,
+    /// A cookie received from the peer, put into `mac2` of later messages.
+    cookie: Option<StoredCookie>,
     ephemeral_private: Option<PrivateKey>,
     chaining_key: Option<[u8; 32]>,
     hash: Option<[u8; 32]>,
@@ -123,6 +126,8 @@ impl Handshake {
             preshared_key,
             index,
             pending_index: None,
+            last_sent_mac1: None,
+            cookie: None,
             ephemeral_private: None,
             chaining_key: None,
             hash: None,
@@ -137,12 +142,9 @@ impl Handshake {
         let mut chaining_key = INITIAL_CHAIN_KEY;
         let mut hash = HASH(&[&INITIAL_CHAIN_HASH, &self.peer_static_public]);
 
+        // Index first: a DH failure below must not burn an index.
         // (Eipriv, Eipub) := DH-Generate()
-        // Ci := Kdf1(Ci, Eipub)
-        // Hi := Hash(Hi || Eipub)
-        //
-        // The index is drawn first so that a DH failure below leaves the
-        // counter untouched: a failed build must not burn an index.
+        // Ci := Kdf1(Ci, Eipub); Hi := Hash(Hi || Eipub)
         let local_index = self.index.next_index();
         let (ephemeral_private, ephemeral_public) = DH_GENERATE();
         chaining_key = KDF1(&chaining_key, &ephemeral_public);
@@ -177,15 +179,19 @@ impl Handshake {
         let mac1 = MAC(&mac1_key(&self.peer_static_public), &msg[..OFF_MAC1]);
         msg[OFF_MAC1..OFF_MAC2].copy_from_slice(&mac1);
 
-        // msg.mac2 := 0^16 without a fresh cookie (§5.4.4).
-        msg[OFF_MAC2..].fill(0);
+        // msg.mac2 := Mac(cookie, msg[..mac2]) with a cookie, else 0^16.
+        let now = Instant::now();
+        let mac2 = self.mac2(now, &msg[..OFF_MAC2]);
+        msg[OFF_MAC2..].copy_from_slice(&mac2);
+
+        // A cookie reply is unwrapped with the mac1 it answers, so keep it.
+        self.last_sent_mac1 = Some(mac1);
 
         self.ephemeral_private = Some(ephemeral_private);
         self.chaining_key = Some(chaining_key);
         self.hash = Some(hash);
-        self.last_started = Some(Instant::now());
-        // Remember which index this initiation claimed: the response must come
-        // back addressed to exactly this one.
+        self.last_started = Some(now);
+        // The response must come back addressed to exactly this index.
         self.pending_index = Some(local_index);
 
         Ok(HANDSHAKE_INIT_LEN)
@@ -204,8 +210,7 @@ impl Handshake {
         let static_public = DH_PUBKEY(&static_private);
 
         // Our own receiver index for the session this response creates. Drawn
-        // before any step that can fail, so a rejected initiation does not
-        // consume an index.
+        // before any failing step, so a rejected initiation burns no index.
         let local_index = self.index.next_index();
 
         // Replay the initiator's state; "responder's static public" is our own
@@ -224,7 +229,7 @@ impl Handshake {
         let initiator_static = AEAD_DECRYPT(&key, 0, &hash, initiation.encrypted_static)
             .map_err(|_| HandshakeError::InitiationNotAuthentic)?;
         if initiator_static.as_slice() != self.peer_static_public.as_slice() {
-            return Err(HandshakeError::WrongPeer);
+            return Err(HandshakeError::InitiationForAnotherPeer);
         }
         hash = HASH(&[&hash, initiation.encrypted_static]);
 
@@ -273,13 +278,15 @@ impl Handshake {
         let mac1 = MAC(&mac1_key(&self.peer_static_public), &msg[..R_OFF_MAC1]);
         msg[R_OFF_MAC1..R_OFF_MAC2].copy_from_slice(&mac1);
 
-        // msg.mac2 := 0^16 without a fresh cookie (§5.4.4).
-        msg[R_OFF_MAC2..].fill(0);
+        // msg.mac2 := Mac(cookie, msg[..mac2]) with a cookie, else 0^16.
+        let now = Instant::now();
+        let mac2 = self.mac2(now, &msg[..R_OFF_MAC2]);
+        msg[R_OFF_MAC2..].copy_from_slice(&mac2);
+        self.last_sent_mac1 = Some(mac1);
 
-        // The responder's ephemeral key is only needed to build this message and
-        // is not retained: `ephemeral_private` tracks *our* initiation awaiting
-        // a response, and we await nothing here.
-        self.last_started = Some(Instant::now());
+        // The responder's ephemeral key is not retained: `ephemeral_private`
+        // tracks *our* initiation awaiting a response, and we await nothing.
+        self.last_started = Some(now);
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as responder, tau_2 sends.
         let (recv, send) = KDF2(&chaining_key, &[]);
@@ -287,6 +294,39 @@ impl Handshake {
             Session::new(local_index, initiation.sender_index, &send, &recv),
             local_index,
         ))
+    }
+
+    /// `msg.mac2`: `MAC(cookie, message)` when a fresh cookie is held, else
+    /// zero. Sending zero is correct, it simply invites a cookie reply (§5.4.4).
+    fn mac2(&self, now: Instant, message: &[u8]) -> [u8; MAC_LEN] {
+        match self.cookie {
+            Some(stored) if !stored.is_expired(now) => MAC_KEYED(&stored.cookie, message),
+            _ => [0u8; MAC_LEN],
+        }
+    }
+
+    /// Stores a cookie received from the peer, replacing any older one.
+    pub fn store_cookie(&mut self, cookie: cookie::Cookie, now: Instant) {
+        self.cookie = Some(StoredCookie {
+            cookie,
+            received_at: now,
+        });
+    }
+
+    /// True when we hold a cookie the peer will still accept.
+    pub fn has_fresh_cookie(&self, now: Instant) -> bool {
+        self.cookie.is_some_and(|stored| !stored.is_expired(now))
+    }
+
+    /// The `mac1` of the last message we built, needed to unwrap a cookie
+    /// reply. `None` before we have sent anything.
+    pub fn last_sent_mac1(&self) -> Option<&[u8; MAC_LEN]> {
+        self.last_sent_mac1.as_ref()
+    }
+
+    /// The index we claimed in the initiation awaiting a response.
+    pub fn pending_index(&self) -> Option<u32> {
+        self.pending_index
     }
 
     /// True while an initiation we sent is still awaiting a response.
@@ -338,9 +378,10 @@ impl Handshake {
         AEAD_DECRYPT(&key, 0, &hash, response.encrypted_nothing)
             .map_err(|_| HandshakeError::ResponseNotAuthentic)?;
 
-        // The response must be addressed to the initiation we sent.
+        // The response must be addressed to the initiation we sent. It already
+        // authenticated, so a mismatch is a stale response, not a forgery.
         if response.receiver_index != local_index {
-            return Err(HandshakeError::WrongPeer);
+            return Err(HandshakeError::ResponseNotForUs);
         }
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as initiator, tau_1 sends.
@@ -500,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn an_initiation_for_another_peer_is_reported_as_wrong_peer() {
+    fn an_initiation_for_another_peer_names_the_peer_it_was_built_for() {
         let (mut initiator, _responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
@@ -516,7 +557,37 @@ mod tests {
             .format_handshake_response(&mut response, &parse_initiation(&init))
             .err()
             .expect("an initiation for another peer must not be answered");
-        assert_eq!(error, HandshakeError::WrongPeer);
+        assert_eq!(error, HandshakeError::InitiationForAnotherPeer);
+    }
+
+    /// A response that authenticates but answers another initiation is a stale
+    /// reply, not a forgery, and must be reported as such rather than as an
+    /// unauthentic packet.
+    #[test]
+    fn a_response_for_another_initiation_is_not_a_forgery() {
+        let (mut initiator, mut responder) = peer_pair();
+
+        let mut init = [0u8; HANDSHAKE_INIT_LEN];
+        initiator.format_handshake_init(&mut init).unwrap();
+
+        let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
+        responder
+            .format_handshake_response(&mut response, &parse_initiation(&init))
+            .unwrap();
+
+        // Retarget the receiver index; `encrypted_nothing` still verifies.
+        let genuine = u32::from_le_bytes(response[R_OFF_RECEIVER..R_OFF_EPHEMERAL].try_into().unwrap());
+        response[R_OFF_RECEIVER..R_OFF_EPHEMERAL]
+            .copy_from_slice(&(genuine + 1).to_le_bytes());
+
+        let parsed = match Packet::parse(&response).unwrap() {
+            Packet::HandshakeResponse(response) => response,
+            other => panic!("expected a response, got {other:?}"),
+        };
+        match initiator.consume_response(&parsed) {
+            Ok(_) => panic!("a response for another initiation must not be consumed"),
+            Err(error) => assert_eq!(error, HandshakeError::ResponseNotForUs),
+        }
     }
 
     #[test]

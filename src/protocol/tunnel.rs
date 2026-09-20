@@ -2,32 +2,31 @@
 //! `handshake` and `session`, writing into caller-owned buffers.
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 
+use super::cookie;
 use super::handshake;
 use super::index::SessionIndex;
 use super::packet::{
     self, CookieReply, DataPacket, HandshakeInitiation, HandshakeResponse, Packet, PacketMut,
     WireGuardError,
 };
-use super::primitives::KEY_LEN;
+use super::primitives::{self, DH_PRIVATE, DH_PUBKEY, MAC_LEN, KEY_LEN};
 use super::session::{DATA_OVERHEAD, MAX_TRANSPORT_PAYLOAD, Session, SessionError};
 
 pub(crate) const N_SESSIONS: usize = 8;
 /// The ring maps an index to a slot with `% N_SESSIONS`, which is only a
-/// bitmask over the low index bits while this stays a power of two — the same
-/// property the session byte in `index.rs` relies on.
+/// bitmask over the low index bits while this stays a power of two.
 const _: () = assert!(N_SESSIONS.is_power_of_two(), "N_SESSIONS must be a power of two");
 const MAX_QUEUE_DEPTH: usize = 256;
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-/// A single data packet is never allowed to sit in the ring longer than this.
-/// The hard session limit applies to whole sessions, but a packet that is
-/// already in flight when the session turns 180s old must not be dropped by
-/// the time check below.
+/// A data packet is never allowed to sit in the ring longer than this: one
+/// already in flight when the session turns 180s old must not be dropped.
 const REJECT_AFTER_TIME_SLACK: Duration = Duration::from_secs(5);
 
 /// How long to wait for a handshake response before retransmitting (§6.1).
@@ -44,9 +43,8 @@ enum TimerAction {
 
 pub const MAX_PACKET_SIZE: usize = MAX_TRANSPORT_PAYLOAD + DATA_OVERHEAD;
 
-/// Result of one protocol operation.
-/// `'d` is the received datagram, `'o` the output buffer; only one is ever
-/// borrowed by a given value.
+/// Result of one protocol operation. `'d` is the received datagram, `'o` the
+/// output buffer; only one is ever borrowed by a given value.
 #[derive(Debug)]
 pub enum TunnelResult<'d, 'o> {
     /// The call consumed the input and produced no outgoing packet. For
@@ -64,9 +62,8 @@ pub enum TunnelResult<'d, 'o> {
     /// The sending counter is exhausted or the session is too old. The caller
     /// should start a fresh handshake.
     RekeyRequired,
-    /// A handshake we sent is still awaiting its response, so this call did
-    /// nothing. The caller should wait: resending would discard the initiation
-    /// already in flight.
+    /// A handshake we sent awaits its response, so this call did nothing:
+    /// resending would discard the initiation already in flight.
     HandshakeInProgress,
     /// No session is established yet, so the tunnel cannot carry this packet.
     /// The caller should wait for the handshake to finish.
@@ -96,9 +93,7 @@ struct SessionTable {
     slots: [ArcSwapOption<Session>; N_SESSIONS],
     /// The session outbound traffic uses: the most recent one installed.
     ///
-    /// This is *only* a send-side hint. Inbound packets are routed by their
-    /// receiver index, never through this field: a packet can legitimately
-    /// arrive for the previous session while this one is already current.
+    /// A send-side hint only: inbound packets are routed by receiver index.
     current: ArcSwapOption<Session>,
 }
 
@@ -131,10 +126,8 @@ impl Default for SessionTable {
     }
 }
 
-/// True when a session may no longer carry traffic at all.
-///
-/// A slot holding a dead session can be recycled: nothing that is still on the
-/// wire can be legitimately addressed to it.
+/// True when a session may no longer carry traffic at all. A dead slot can be
+/// recycled: nothing still on the wire can be addressed to it.
 fn is_dead(session: &Session) -> bool {
     session.created_at.elapsed() >= REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK
 }
@@ -188,7 +181,9 @@ impl Tunnel {
 
             self.control().timers.last_packet_sent = Some(Instant::now());
 
-            self.tx_bytes.fetch_add(src.len() as u64, Ordering::Relaxed);
+            // `written` is the whole datagram, header and tag included: the
+            // counter reports bytes on the wire, not payload (§6.6).
+            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
             return TunnelResult::WriteToNetwork(&mut dst[..written]);
         }
 
@@ -245,7 +240,7 @@ impl Tunnel {
                 Ok(written) => written,
                 Err(error) => return error.into(),
             };
-            self.tx_bytes.fetch_add(src.len() as u64, Ordering::Relaxed);
+            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
             return TunnelResult::WriteToNetwork(&mut dst[..written]);
         }
 
@@ -257,11 +252,8 @@ impl Tunnel {
         TunnelResult::NoSession
     }
 
-    /// Locks the control state.
-    ///
-    /// A poisoned lock means a thread panicked mid-update, leaving state we
-    /// cannot repair here. Panicking lets the worker unwind and be replaced
-    /// rather than serving a corrupt tunnel.
+    /// Locks the control state. A poisoned lock means a thread panicked
+    /// mid-update, leaving state we cannot repair: panicking is the honest exit.
     fn control(&self) -> std::sync::MutexGuard<'_, ControlState> {
         self.control.lock().expect("control lock poisoned")
     }
@@ -279,38 +271,40 @@ impl Tunnel {
             return self.send_queued_packet(dst);
         }
 
+        // mac1/mac2 are verified by the device before it looks the peer up,
+        // so a cookie reply never reaches this far.
         match Packet::parse_mut(datagram) {
             Ok(PacketMut::Data(packet)) => self.handle_data(packet),
             Ok(PacketMut::HandshakeInitiation(packet)) => self.handle_handshake_init(packet, dst),
             Ok(PacketMut::HandshakeResponse(packet)) => {
                 self.handle_handshake_response(packet, dst)
             }
-            Ok(PacketMut::CookieReply(packet)) => self.handle_cookie_reply(packet, dst),
+            Ok(PacketMut::CookieReply(packet)) => self.handle_cookie_reply(packet),
             Err(error) => TunnelResult::InvalidPacket(error),
         }
     }
 
-    /// Decrypts a transport-data packet in place
-    /// The returned plaintext borrows the datagram buffer, not `dst`.
-    ///
-    /// The session is chosen by the packet's own receiver index, so a packet
-    /// encrypted under the previous session still decrypts after a rehandshake
-    /// has installed a new one.
+    /// Decrypts a transport-data packet in place; the plaintext borrows the
+    /// datagram buffer, not `dst`. The session is chosen by the packet's own
+    /// receiver index, so a packet from the previous session still decrypts.
     fn handle_data<'a, 'o>(&self, packet: DataPacket<'a>) -> TunnelResult<'a, 'o> {
         let Some(session) = self.session_for(packet.receiver_index) else {
             return TunnelResult::NoSession;
         };
+
+        // Capture the on-wire size before decrypting: `open_in_place` leaves
+        // only the plaintext, and the header is carved off by `parse_mut`.
+        let wire_len = packet.encrypted_payload.len() + packet::DATA_HEADER_LEN;
 
         // The payload is decrypted in place inside the received datagram
         let plaintext = match session.receive_packet_data(packet) {
             Ok(plaintext) => plaintext,
             Err(error) => return error.into(),
         };
-        let written = plaintext.len();
 
         self.control().timers.last_packet_received = Some(Instant::now());
 
-        self.rx_bytes.fetch_add(written as u64, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(wire_len as u64, Ordering::Relaxed);
         TunnelResult::WriteToTunnelInPlace(plaintext)
     }
 
@@ -386,21 +380,35 @@ impl Tunnel {
     }
 
     /// Stores the cookie from a cookie reply for use in `mac2` (§5.4.4/§5.4.7).
-    fn handle_cookie_reply<'d, 'a>(
-        &self,
-        _reply: CookieReply<'_>,
-        _dst: &'a mut [u8],
-    ) -> TunnelResult<'d, 'a> {
-        // TODO(M4): store the cookie together with its receive time.
-        TunnelResult::InvalidPacket(WireGuardError::InvalidPacket)
+    /// Unwrapping with the answered initiation's `mac1` binds it to that handshake.
+    fn handle_cookie_reply<'d, 'o>(&self, reply: CookieReply<'_>) -> TunnelResult<'d, 'o> {
+        let now = Instant::now();
+        let mut control = self.control();
+        // Read the peer key before any further `control()` call: the mutex is
+        // not reentrant, so calling the accessor while holding it would hang.
+        let peer_static_public = control.handshake.peer_static_public;
+
+        let (Some(our_index), Some(our_mac1)) = (
+            control.handshake.pending_index(),
+            control.handshake.last_sent_mac1().copied(),
+        ) else {
+            // Nothing in flight, so this reply answers a handshake we have
+            // already abandoned.
+            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+        };
+
+        match cookie::open_cookie_reply(&peer_static_public, &reply, our_index, &our_mac1) {
+            Ok(cookie) => {
+                control.handshake.store_cookie(cookie, now);
+                TunnelResult::Done
+            }
+            Err(error) => TunnelResult::InvalidPacket(error),
+        }
     }
 
     /// Advances timers and acts on whatever came due: retransmitting a stalled
-    /// handshake, starting a new one, or sending a keepalive.
-    ///
-    /// `dst` must satisfy the same contract as `encapsulate`. The tunnel starts
-    /// its own handshake here, so the caller never calls
-    /// `format_handshake_initiation` to recover; it only sends what it is given.
+    /// handshake, starting a new one, or sending a keepalive. `dst` must satisfy
+    /// the same contract as `encapsulate`; the tunnel starts its own handshake.
     pub fn update_timers<'a>(&self, now: Instant, dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
         let decision = {
             let control = self.control();
@@ -428,10 +436,8 @@ impl Tunnel {
         }
     }
 
-    /// Decides what an established (or absent) session requires.
-    ///
-    /// Split out because both the "no initiation in flight" timer path and the
-    /// tests want the same reasoning.
+    /// Decides what an established (or absent) session requires. Split out
+    /// because the timer path and the tests want the same reasoning.
     fn session_timer_action(&self, control: &ControlState, now: Instant) -> TimerAction {
         let Some(session) = self.current_session() else {
             // Nothing to keep alive, and no session to replace: `encapsulate`
@@ -465,18 +471,9 @@ impl Tunnel {
         }
     }
 
-    /// Registers a new session in the ring and makes it current.
-    ///
-    /// Returns `false` when installing it would evict a session that another
-    /// worker may still be decrypting against: the caller must drop the
-    /// handshake rather than destroy a live session's replay window.
-    ///
-    /// The guard is what makes the ring safe with parallel workers. A worker
-    /// holds an `Arc<Session>` for the whole decrypt, so evicting the slot it
-    /// is using does not corrupt anything — but it does silently lose every
-    /// packet still addressed to that session, and it destroys the replay
-    /// window that protects it. Reusing a slot is only proper once its session
-    /// is genuinely dead.
+    /// Registers a new session in the ring and makes it current. Returns
+    /// `false` when that would evict a session another worker may still be
+    /// decrypting against; a slot may only be reused once its session is dead.
     fn install_session(&self, session: Session) -> bool {
         let slot = session.local_id as usize % N_SESSIONS;
 
@@ -494,19 +491,16 @@ impl Tunnel {
         true
     }
 
-    /// Finds the session a received packet is addressed to.
-    ///
-    /// Routing is by the full 32-bit receiver index, not just the ring slot:
-    /// the slot is a cache position, and a packet for a retired session can
-    /// land in a slot that has since been reused by a different one.
+    /// Finds the session a received packet is addressed to. Routing is by the
+    /// full 32-bit receiver index, not the slot: the slot is only a cache
+    /// position and may since have been reused by a different session.
     fn session_for(&self, receiver_index: u32) -> Option<Arc<Session>> {
         let slot = receiver_index as usize % N_SESSIONS;
         let session = self.sessions.slots[slot].load_full()?;
 
         if session.local_id != receiver_index {
-            // Either a forged index or a packet for a session whose slot was
-            // reused. Refusing here is what stops it from being decrypted
-            // under a stranger's keys.
+            // A forged index, or a session whose slot was reused. Refusing
+            // stops it being decrypted under a stranger's keys.
             return None;
         }
         Some(session)
@@ -515,6 +509,7 @@ impl Tunnel {
     fn current_session(&self) -> Option<Arc<Session>> {
         self.sessions.current.load_full()
     }
+
 
     pub fn tx_bytes(&self) -> u64 {
         self.tx_bytes.load(Ordering::Relaxed)
@@ -530,6 +525,7 @@ impl Tunnel {
 mod tests {
     use super::*;
     use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
+
 
     /// Two peers with matching static keys and mirrored indexes.
     pub(super) fn pair() -> (Tunnel, Tunnel) {
@@ -752,13 +748,97 @@ mod tests {
             TunnelResult::InvalidPacket(WireGuardError::UnknownMessageType)
         ));
     }
-
     #[test]
-    #[should_panic]
-    fn undersized_dst_panics_inside_the_caller() {
-        let mut small = [0u8; 8];
-        let (mut a, _b) = pair();
-        let _ = a.encapsulate(b"hello", &mut small);
+    fn short_datagrams_do_not_panic() {
+        let mut buf = dst();
+        let (b, _a) = pair();
+
+        for len in 0..40usize {
+            let mut datagram = vec![0u8; len];
+            // Claim to be an initiation so the mac path is attempted too.
+            if len >= 4 {
+                datagram[..4].copy_from_slice(&packet::MSG_HANDSHAKE_INIT.to_le_bytes());
+            }
+            let result = b.decapsulate(&mut datagram, &mut buf);
+            let _ = format!("{result:?}");
+        }
+
+        // A well-formed header with a truncated body is likewise refused.
+        let mut datagram = vec![0u8; packet::HANDSHAKE_INIT_LEN - 1];
+        datagram[..4].copy_from_slice(&packet::MSG_HANDSHAKE_INIT.to_le_bytes());
+        assert!(matches!(
+            b.decapsulate(&mut datagram, &mut buf),
+            TunnelResult::InvalidPacket(_)
+        ));
+    }
+
+    /// Transfer counters report bytes on the wire, overhead included. The
+    /// clearest case is a keepalive: no payload at all, yet it costs exactly
+    /// `DATA_OVERHEAD` bytes in each direction.
+    #[test]
+    fn counters_include_the_wire_overhead() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+        let tx_before = a.tx_bytes();
+        let rx_before = b.rx_bytes();
+
+        // An empty payload is a keepalive: the datagram is pure overhead.
+        let mut keepalive = match a.encapsulate(&[], &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a keepalive, got {other:?}"),
+        };
+        assert_eq!(keepalive.len(), DATA_OVERHEAD);
+        assert_eq!(
+            a.tx_bytes() - tx_before,
+            DATA_OVERHEAD as u64,
+            "a keepalive must count as {DATA_OVERHEAD} bytes, not zero"
+        );
+
+        assert!(matches!(
+            b.decapsulate(&mut keepalive, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+        assert_eq!(
+            b.rx_bytes() - rx_before,
+            DATA_OVERHEAD as u64,
+            "received overhead must be counted too"
+        );
+    }
+
+    /// A payload of `n` bytes must count as `n + DATA_OVERHEAD` on both sides.
+    #[test]
+    fn counters_add_the_overhead_to_the_payload() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        let payload = [0x42u8; 100];
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+
+        // The handshake itself already moved bytes, so compare deltas.
+        let tx_before = a.tx_bytes();
+        let rx_before = b.rx_bytes();
+
+        let mut packet = match a.encapsulate(&payload, &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(
+            a.tx_bytes() - tx_before,
+            (payload.len() + DATA_OVERHEAD) as u64
+        );
+
+        assert!(matches!(
+            b.decapsulate(&mut packet, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+        assert_eq!(
+            b.rx_bytes() - rx_before,
+            (payload.len() + DATA_OVERHEAD) as u64
+        );
     }
 
     #[test]
@@ -922,11 +1002,9 @@ mod concurrency {
         }
     }
 
-    /// The regression this whole index scheme exists for.
-    ///
-    /// A packet is encrypted under session S1. Before it is decrypted, the
-    /// peers rehandshake and S2 becomes current. The packet is still valid for
-    /// S1, so it must decrypt against S1 rather than be dropped or handed to S2.
+    /// The regression this whole index scheme exists for: a packet encrypted
+    /// under S1 must still decrypt against S1 after a rehandshake makes S2
+    /// current, rather than being dropped or handed to S2.
     #[test]
     fn a_packet_straddling_a_rehandshake_still_decrypts() {
         let (mut a, mut b) = pair();
@@ -944,12 +1022,8 @@ mod concurrency {
         assert_eq!(s1.local_id, s1_index);
 
         // The rehandshake completes while that packet is still in flight and
-        // installs S2 under a fresh index.
-        //
-        // It is driven through `format_handshake_initiation` rather than
-        // `encapsulate`: once a session exists, `encapsulate` always writes
-        // data, so a rekey is only reachable through the explicit entry point
-        // (or `update_timers`).
+        // installs S2 under a fresh index. It goes through
+        // `format_handshake_initiation`: `encapsulate` would just write data.
         super::tests::exchange_handshake(&mut a, &mut b);
         let s2 = b.current_session().expect("S2 is installed");
         assert_ne!(

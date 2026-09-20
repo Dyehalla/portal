@@ -8,3 +8,6 @@ libc = "0.2"
 aws-lc-rs = "1"
 blake2 = "0.10"
 arc-swap = "1.9.2"
+
+[dev-dependencies]
+chacha20poly1305 = "0.10.1"
