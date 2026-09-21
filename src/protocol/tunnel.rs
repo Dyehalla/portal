@@ -227,8 +227,10 @@ impl Tunnel {
         }
     }
 
-    /// Sends the oldest queued packet. Called with an empty input until it
-    fn send_queued_packet<'d, 'a>(&self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
+    /// Sends the oldest packet held while no session existed. Call repeatedly
+    /// until it stops returning `WriteToNetwork`: `Done` means the queue is
+    /// empty, `NoSession` that the packet went back to the front.
+    pub fn send_queued_packet<'d, 'a>(&self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
         let mut control = self.control();
         let Some(src) = control.packet_queue.pop_front() else {
             return TunnelResult::Done;
@@ -244,12 +246,24 @@ impl Tunnel {
             return TunnelResult::WriteToNetwork(&mut dst[..written]);
         }
 
-        // Session disappeared meanwhile: put the packet back at the front.
+        // The session vanished between the pop and here: put the packet back
+        // at the front so it keeps its place. No depth check is needed, as
+        // this packet just vacated a slot; a bound could only drop it.
         let mut control = self.control();
-        if control.packet_queue.len() < MAX_QUEUE_DEPTH {
-            control.packet_queue.push_front(src);
-        }
+        control.packet_queue.push_front(src);
         TunnelResult::NoSession
+    }
+
+    /// Test hook: queues a packet as if `encapsulate` had held it.
+    #[cfg(test)]
+    pub(super) fn queue_for_tests(&self, src: &[u8]) {
+        self.queue_packet(src);
+    }
+
+    /// Test hook: the payloads the queue currently holds, oldest first.
+    #[cfg(test)]
+    pub(super) fn queued_for_tests(&self) -> Vec<Vec<u8>> {
+        self.control().packet_queue.iter().cloned().collect()
     }
 
     /// Locks the control state. A poisoned lock means a thread panicked
@@ -266,9 +280,10 @@ impl Tunnel {
         datagram: &'a mut [u8],
         dst: &'o mut [u8],
     ) -> TunnelResult<'a, 'o> {
+        // An empty datagram is inert input, not a command: draining the queue
+        // is `send_queued_packet`, which the caller drives in its own loop.
         if datagram.is_empty() {
-            // Nothing to decrypt; the queued packets are written to `dst`.
-            return self.send_queued_packet(dst);
+            return TunnelResult::Done;
         }
 
         // mac1/mac2 are verified by the device before it looks the peer up,
@@ -731,10 +746,68 @@ mod tests {
             a.encapsulate(b"hello", &mut buf),
             TunnelResult::WriteToNetwork(_)
         ));
-        let mut empty: [u8; 0] = [];
+        // Without a session the held packet cannot go out, and draining is a
+        // call of its own rather than a side effect of an empty datagram.
         assert!(matches!(
-            a.decapsulate(&mut empty, &mut buf),
+            a.send_queued_packet(&mut buf),
             TunnelResult::NoSession
+        ));
+
+        let mut empty: [u8; 0] = [];
+        assert!(
+            matches!(a.decapsulate(&mut empty, &mut buf), TunnelResult::Done),
+            "an empty datagram must not be read as a drain request"
+        );
+    }
+
+    /// Draining releases what was held, in the order it was queued, and then
+    /// reports the queue empty.
+    #[test]
+    fn draining_sends_the_held_packets_in_order() {
+        let (mut a, mut b) = pair();
+
+        // Two packets with no session: both are held, and the first call
+        // starts a handshake. The second is refused while one is in flight.
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+        let mut init = match a.encapsulate(b"first", &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected an initiation, got {other:?}"),
+        };
+        assert!(matches!(
+            a.encapsulate(b"second", &mut a_buf),
+            TunnelResult::HandshakeInProgress
+        ));
+
+        // Complete the handshake before draining.
+        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a response, got {other:?}"),
+        };
+        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a keepalive, got {other:?}"),
+        };
+        assert!(matches!(
+            b.decapsulate(&mut keepalive, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+
+        for expected in [&b"first"[..], &b"second"[..]] {
+            let mut sent = match a.send_queued_packet(&mut a_buf) {
+                TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected a queued packet, got {other:?}"),
+            };
+            match b.decapsulate(&mut sent, &mut b_buf) {
+                TunnelResult::WriteToTunnelInPlace(plaintext) => {
+                    assert_eq!(plaintext, expected);
+                }
+                other => panic!("expected plaintext, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            a.send_queued_packet(&mut a_buf),
+            TunnelResult::Done
         ));
     }
 
@@ -748,6 +821,47 @@ mod tests {
             TunnelResult::InvalidPacket(WireGuardError::UnknownMessageType)
         ));
     }
+    /// A packet that cannot be sent because the session vanished goes back to
+    /// the *front*: it keeps the place it had, so ordering survives the retry.
+    #[test]
+    fn a_packet_that_cannot_be_sent_keeps_its_place_in_the_queue() {
+        let mut buf = dst();
+        let (a, _b) = pair();
+
+        // Queue three packets with no session at all.
+        a.queue_for_tests(b"first");
+        a.queue_for_tests(b"second");
+        a.queue_for_tests(b"third");
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+
+        // No session: the send is refused, and the packet must return to the
+        // front rather than being dropped or appended.
+        assert!(matches!(
+            a.send_queued_packet(&mut buf),
+            TunnelResult::NoSession
+        ));
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+            "the refused packet must keep its place at the front"
+        );
+
+        // Repeated refusals stay idempotent: nothing is consumed or reordered.
+        for _ in 0..3 {
+            assert!(matches!(
+                a.send_queued_packet(&mut buf),
+                TunnelResult::NoSession
+            ));
+        }
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
     #[test]
     fn short_datagrams_do_not_panic() {
         let mut buf = dst();

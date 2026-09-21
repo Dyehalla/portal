@@ -7,9 +7,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::protocol::cookie::{self, CookieChallenge, CookieChecker};
-use crate::protocol::packet::{self, Packet, WireGuardError};
-use crate::protocol::primitives::{self, KEY_LEN};
+use crate::protocol::{CookieChallenge, CookieChecker};
+use crate::protocol::{
+    verify_handshake_macs, Packet, WireGuardError, COOKIE_REPLY_LEN, DH_PRIVATE, DH_PUBKEY, HASH,
+    HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, MSG_COOKIE_REPLY, MSG_HANDSHAKE_RESPONSE,
+    TAG_LEN,
+};
+use crate::protocol::KEY_LEN;
 use crate::protocol::{Tunnel, TunnelResult};
 
 /// Peers are keyed by their static public key: an initiation names its sender
@@ -28,7 +32,7 @@ pub struct Device {
 
 impl Device {
     pub fn new(static_private: [u8; KEY_LEN]) -> Self {
-        let static_public = primitives::DH_PUBKEY(&primitives::DH_PRIVATE(&static_private));
+        let static_public = DH_PUBKEY(&DH_PRIVATE(&static_private));
         Self {
             static_private,
             static_public,
@@ -47,7 +51,7 @@ impl Device {
 
     /// The `mac1` key every peer of this device is expected to use.
     pub fn mac1_key(&self) -> [u8; KEY_LEN] {
-        primitives::HASH(&[primitives::LABEL_MAC1, &self.static_public])
+        HASH(&[crate::protocol::LABEL_MAC1, &self.static_public])
     }
 
     /// Adds a peer and hands it the given receiver index.
@@ -93,7 +97,7 @@ impl Device {
             return TunnelResult::Done;
         }
 
-        let mut cookie_reply = [0u8; packet::COOKIE_REPLY_LEN];
+        let mut cookie_reply = [0u8; COOKIE_REPLY_LEN];
         if let Some(outcome) = self.verify_macs(src_addr.ip(), datagram, &mut cookie_reply) {
             return match outcome {
                 Some(len) => {
@@ -111,9 +115,15 @@ impl Device {
         tunnel.decapsulate(datagram, dst)
     }
 
+    /// Hands out whatever `tunnel` held while it had no session. An outbound
+    /// action, deliberately separate from `handle_datagram`.
+    pub fn drain_queue<'a>(&self, tunnel: &Tunnel, dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
+        tunnel.send_queued_packet(dst)
+    }
+
     /// Verifies a handshake message's MACs, writing any due reply into
-    /// `cookie_reply`. `None` means it may be processed; otherwise the inner
-    /// value is `Some(len)` for a reply to send, or `None` to drop silently.
+    /// `cookie_reply`. `None` means it may be processed; `Some(Some(len))` a
+    /// reply to send, `Some(None)` a message to drop silently.
     fn verify_macs(
         &self,
         src: IpAddr,
@@ -122,9 +132,9 @@ impl Device {
     ) -> Option<Option<usize>> {
         // Only handshake messages carry MACs; every other type passes through.
         let mac1_off = match Packet::parse(datagram) {
-            Ok(Packet::HandshakeInitiation(_)) => packet::HANDSHAKE_INIT_LEN - 2 * packet::TAG_LEN,
+            Ok(Packet::HandshakeInitiation(_)) => HANDSHAKE_INIT_LEN - 2 * TAG_LEN,
             Ok(Packet::HandshakeResponse(_)) => {
-                packet::HANDSHAKE_RESPONSE_LEN - 2 * packet::TAG_LEN
+                HANDSHAKE_RESPONSE_LEN - 2 * TAG_LEN
             }
             _ => return None,
         };
@@ -134,15 +144,15 @@ impl Device {
         let under_load = cookies.note_handshake();
         let secret = cookies.secret();
 
-        match cookie::verify_macs(&self.static_public, Some(src), &secret, under_load, datagram) {
+        match verify_handshake_macs(&self.static_public, Some(src), &secret, under_load, datagram) {
             Ok(()) => None,
             Err(CookieChallenge::NotForUs | CookieChallenge::NeedSourceAddress) => Some(None),
             Err(CookieChallenge::WrongMac2 { cookie }) => {
                 // The packet parsed, so its header and trailer are in bounds.
                 let sender_index =
                     u32::from_le_bytes(datagram[4..8].try_into().expect("header parsed"));
-                let mac1: [u8; packet::TAG_LEN] = datagram
-                    [mac1_off..mac1_off + packet::TAG_LEN]
+                let mac1: [u8; TAG_LEN] = datagram
+                    [mac1_off..mac1_off + TAG_LEN]
                     .try_into()
                     .expect("lengths come from the parsed packet");
                 Some(
@@ -169,7 +179,7 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::cookie::COOKIE_MAX_AGE;
+    use crate::protocol::COOKIE_MAX_AGE;
     use crate::protocol::StoredCookie;
     use crate::protocol::MAX_PACKET_SIZE;
 
@@ -218,6 +228,49 @@ mod tests {
         assert!(matches!(
             b.handle_datagram(src(1), &mut keepalive, &mut b_buf),
             TunnelResult::WriteToTunnelInPlace(_)
+        ));
+    }
+
+    /// A packet queued before the handshake comes out through the device's
+    /// own drain call — not by feeding `decapsulate` an empty datagram.
+    #[test]
+    fn the_device_drains_what_was_queued_before_the_handshake() {
+        let (a, b) = paired();
+        let a_tunnel = a.peer(&b.static_public().to_owned()).unwrap().clone();
+
+        let mut a_buf = buf();
+        let mut b_buf = buf();
+
+        // No session yet: the packet is held and an initiation goes out.
+        let mut init = match a_tunnel.encapsulate(b"held", &mut a_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected an initiation, got {other:?}"),
+        };
+        let mut response = match b.handle_datagram(src(1), &mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected a response, got {other:?}"),
+        };
+        let mut keepalive = match a.handle_datagram(src(2), &mut response, &mut a_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected a keepalive, got {other:?}"),
+        };
+        assert!(matches!(
+            b.handle_datagram(src(1), &mut keepalive, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+
+        // Now the held packet can go out, and the queue reports empty.
+        let mut held = match a.drain_queue(&a_tunnel, &mut a_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected the held packet, got {other:?}"),
+        };
+        match b.handle_datagram(src(1), &mut held, &mut b_buf) {
+            TunnelResult::WriteToTunnelInPlace(plaintext) => assert_eq!(plaintext, b"held"),
+            other => panic!("expected plaintext, got {other:?}"),
+        }
+        assert!(matches!(
+            a.drain_queue(&a_tunnel, &mut a_buf),
+            TunnelResult::Done
         ));
     }
 
@@ -308,7 +361,7 @@ mod tests {
         };
         assert_eq!(
             u32::from_le_bytes(cookie_reply[..4].try_into().unwrap()),
-            packet::MSG_COOKIE_REPLY
+            MSG_COOKIE_REPLY
         );
 
         // 2. A stores it and retries.
@@ -330,7 +383,7 @@ mod tests {
         };
         assert_eq!(
             u32::from_le_bytes(response[..4].try_into().unwrap()),
-            packet::MSG_HANDSHAKE_RESPONSE
+            MSG_HANDSHAKE_RESPONSE
         );
 
         let mut keepalive = match a.handle_datagram(src(2), &mut response, &mut a_buf) {
@@ -393,7 +446,7 @@ mod tests {
         };
         assert_eq!(
             u32::from_le_bytes(reply[..4].try_into().unwrap()),
-            packet::MSG_COOKIE_REPLY,
+            MSG_COOKIE_REPLY,
             "a cookie must not transfer between addresses"
         );
     }
