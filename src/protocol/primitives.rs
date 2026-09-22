@@ -315,17 +315,15 @@ pub fn DH(my_priv: &PrivateKey, peer_pub: &[u8; 32]) -> Result<Key, DhError> {
     .map_err(|_| DhError::InvalidPeerKey)
 }
 
-/// Rebuilds a `PrivateKey` from the raw 32 secret bytes WireGuard stores
-/// (e.g. `Handshake.static_private`). X25519 private keys are exactly 32
-/// bytes, so an invalid encoding here is a programming error, not input.
+/// Rebuilds a `PrivateKey` from the raw 32 secret bytes WireGuard stores. An
+/// invalid encoding here is a programming error, not attacker input.
 pub fn DH_PRIVATE(bytes: &[u8; KEY_LEN]) -> PrivateKey {
     PrivateKey::from_private_key(&agreement::X25519, bytes)
         .expect("32-byte X25519 private key")
 }
 
-/// DH_GENERATE(): generate a random Curve25519 private key and derive its
-/// public key. We draw the raw bytes ourselves so the caller keeps the same
-/// byte-oriented representation the rest of WireGuard uses.
+/// DH_GENERATE(): a random Curve25519 private key and its public key, kept in
+/// the byte representation the rest of WireGuard uses.
 pub fn DH_GENERATE() -> (PrivateKey, Key) {
     let mut bytes = [0u8; KEY_LEN];
     RAND(&mut bytes);
@@ -363,9 +361,8 @@ pub fn TAI64N() -> [u8; TIMESTAMP_LEN] {
 
 // Cascade of HMACs: "chews" a secret into n output keys. No allocation.
 
-/// KDFn(key, input): tau_0 = HMAC(key, input), tau_1 = HMAC(tau_0, 0x1),
-/// tau_i = HMAC(tau_0, tau_{i-1} || i) for i >= 2. Returns (tau_1, ..., tau_n)
-/// per whitepaper §5.4; tau_1 is the new chaining key.
+/// KDFn(key, input) per whitepaper §5.4: tau_0 = HMAC(key, input), then
+/// tau_i = HMAC(tau_0, tau_{i-1} || i), returning (tau_1, ..., tau_n).
 fn kdf<const N: usize>(key: &Key, input: &[u8]) -> [Key; N] {
     let tau0 = HMAC(key, input);
     let mut taus = [[0u8; KEY_LEN]; N];

@@ -1,8 +1,6 @@
 //! One established transport session: a pair of direction keys plus the
 //! replay window for the receive direction.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::packet::{self, DataPacket, WireGuardError};
@@ -20,9 +18,8 @@ pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13) - 1;
 /// (type+reserved, receiver index, counter) plus the Poly1305 tag.
 pub const DATA_OVERHEAD: usize = packet::DATA_HEADER_LEN + TAG_LEN;
 
-/// Failure of a single session operation. Kept separate from `TunnelResult` so
-/// `Session` does not depend on the public result type; it is converted at the
-/// `Tunnel` boundary.
+/// Failure of one session operation, kept separate so `Session` does not
+/// depend on `TunnelResult`; converted at the `Tunnel` boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionError {
     /// Sending counter exhausted (`REJECT_AFTER_MESSAGES`): rekey.
@@ -45,9 +42,9 @@ pub struct Session {
     pub(super) remote_index: u32,
     pub(super) sender: AeadKey,
     pub(super) receiver: AeadKey,
-    pub(super) sending_counter: AtomicU64,
-    pub(super) replay: Mutex<ReplayWindow>,
-    pub(super) confirmed: AtomicBool,
+    pub(super) sending_counter: u64,
+    pub(super) replay: ReplayWindow,
+    pub(super) confirmed: bool,
     pub(super) created_at: Instant,
 }
 
@@ -65,9 +62,9 @@ impl Session {
             remote_index,
             sender: AeadKey::new(sending),
             receiver: AeadKey::new(receiving),
-            sending_counter: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::new()),
-            confirmed: AtomicBool::new(false),
+            sending_counter: 0,
+            replay: ReplayWindow::new(),
+            confirmed: false,
             created_at: Instant::now(),
         }
     }
@@ -75,13 +72,14 @@ impl Session {
     /// Encrypts `src` into a transport-data packet, writing it to `dst`, which
     /// must hold at least `src.len() + DATA_OVERHEAD` bytes.
     pub fn format_packet_data(
-        &self,
+        &mut self,
         src: &[u8],
         dst: &mut [u8],
     ) -> Result<usize, SessionError> {
         let total = src.len() + DATA_OVERHEAD;
 
-        let counter = self.sending_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.sending_counter;
+        self.sending_counter += 1;
         if counter >= REJECT_AFTER_MESSAGES {
             return Err(SessionError::RekeyRequired);
         }
@@ -102,7 +100,7 @@ impl Session {
     /// Authenticates and decrypts a transport-data packet in place, returning
     /// the plaintext borrowed from the packet's own buffer.
     pub fn receive_packet_data<'a>(
-        &self,
+        &mut self,
         packet: DataPacket<'a>,
     ) -> Result<&'a mut [u8], SessionError> {
         let ciphertext_len = packet.encrypted_payload.len();
@@ -115,9 +113,8 @@ impl Session {
             return Err(SessionError::Malformed);
         }
 
-        let mut replay = self.replay.lock().expect("replay lock poisoned");
         // Cheap replay check before the expensive AEAD open (DoS defence).
-        replay.will_accept(packet.counter)?;
+        self.replay.will_accept(packet.counter)?;
 
         let DataPacket {
             receiver_index: _,
@@ -130,8 +127,9 @@ impl Session {
             .open_in_place(counter, encrypted_payload)
             .map_err(|_| SessionError::Rejected(WireGuardError::InvalidPacket))?;
 
-        // Commit the counter only after the tag verified.
-        replay.mark_received(counter)?;
+        // Commit the counter only after the tag verified. Exclusive ownership
+        // makes check-then-mark atomic without a lock.
+        self.replay.mark_received(counter)?;
 
         Ok(plaintext)
     }
@@ -153,9 +151,9 @@ mod tests {
             remote_index: 2,
             sender: AeadKey::new(&key_a),
             receiver: AeadKey::new(&key_b),
-            sending_counter: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::new()),
-            confirmed: AtomicBool::new(false),
+            sending_counter: 0,
+            replay: ReplayWindow::new(),
+            confirmed: false,
             created_at: Instant::now(),
         };
         let b = Session {
@@ -163,9 +161,9 @@ mod tests {
             remote_index: 1,
             sender: AeadKey::new(&key_b),
             receiver: AeadKey::new(&key_a),
-            sending_counter: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::new()),
-            confirmed: AtomicBool::new(false),
+            sending_counter: 0,
+            replay: ReplayWindow::new(),
+            confirmed: false,
             created_at: Instant::now(),
         };
         (a, b)
@@ -173,12 +171,10 @@ mod tests {
 
     #[test]
     fn an_exhausted_sending_counter_requires_a_rekey() {
-        let (sender, _receiver) = peer_pair();
+        let (mut sender, _receiver) = peer_pair();
 
         // Jump the counter to the limit so the next send must refuse.
-        sender
-            .sending_counter
-            .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
+        sender.sending_counter = REJECT_AFTER_MESSAGES;
 
         let mut datagram = [0u8; 4 + DATA_OVERHEAD];
         assert_eq!(
@@ -189,7 +185,7 @@ mod tests {
 
     #[test]
     fn round_trip_decrypts_in_place_in_the_receive_buffer() {
-        let (sender, receiver) = peer_pair();
+        let (mut sender, mut receiver) = peer_pair();
         let payload = b"an IP packet from the tunnel interface";
 
         let mut datagram = vec![0u8; payload.len() + DATA_OVERHEAD];
@@ -197,9 +193,8 @@ mod tests {
         assert_eq!(n, payload.len() + DATA_OVERHEAD);
         let datagram_len = datagram.len();
 
-        // Decrypt, then check the plaintext is a window into `datagram` itself:
-        // its length tells us where in the buffer it starts, and the header is
-        // exactly that many bytes.
+        // Decrypt, then check the plaintext is a window into `datagram`: the
+        // header is exactly the bytes the plaintext does not cover.
         let (plaintext_len, plaintext_offset, header_type) = {
             let packet = match Packet::parse_mut(&mut datagram[..n]).unwrap() {
                 PacketMut::Data(packet) => packet,
@@ -223,7 +218,7 @@ mod tests {
 
     #[test]
     fn replay_of_the_same_counter_is_rejected() {
-        let (sender, receiver) = peer_pair();
+        let (mut sender, mut receiver) = peer_pair();
 
         let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
         let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
@@ -251,7 +246,7 @@ mod tests {
 
     #[test]
     fn packet_for_another_session_is_rejected() {
-        let (sender, receiver) = peer_pair();
+        let (mut sender, mut receiver) = peer_pair();
         let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
         let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
 
@@ -270,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_forged_tag_is_rejected() {
-        let (sender, receiver) = peer_pair();
+        let (mut sender, mut receiver) = peer_pair();
         let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
         let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
 
@@ -289,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_counter_below_the_window_is_too_old() {
-        let (sender, receiver) = peer_pair();
+        let (mut sender, mut receiver) = peer_pair();
 
         // Send and deliver a packet, then one far ahead to move the window past
         // the first counter, then replay the first.

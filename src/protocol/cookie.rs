@@ -1,6 +1,5 @@
-//! Cookie-based DoS mitigation (§5.4.4/§5.4.7): under load a responder answers
-//! an initiation whose `mac2` does not prove ownership of the source address
-//! with a `cookie_reply`, and the initiator retries with the cookie in `mac2`.
+//! Cookie-based DoS mitigation (§5.4.4/§5.4.7): a `mac2` that does not prove
+//! the source address earns a `cookie_reply`; the initiator retries with it.
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -120,9 +119,8 @@ impl StoredCookie {
     }
 }
 
-/// The device-wide half of the cookie mechanism: the secret, the rate counter
-/// and the reply codec. Shared by every peer, since a cookie proves a source
-/// address rather than a peer identity.
+/// The device-wide half: secret, rate counter and reply codec. Shared by every
+/// peer, since a cookie proves a source address, not a peer identity.
 pub struct CookieChecker {
     /// The key our `mac1` and cookie keys are derived from.
     public_key: Key,
@@ -247,9 +245,8 @@ impl CookieChecker {
         out
     }
 
-    /// Builds a `cookie_reply` into `dst`, returning its length. `sender_index`
-    /// echoes the initiator's; `mac1` is the reply's AAD. Wrapped with our own
-    /// key, since the initiator unwraps with it (§5.4.7).
+    /// Builds a `cookie_reply` into `dst`, returning its length. Wrapped with
+    /// our own key, since the initiator unwraps with it (§5.4.7).
     pub fn format_cookie_reply(
         &mut self,
         dst: &mut [u8],
@@ -275,9 +272,8 @@ impl CookieChecker {
 
 }
 
-/// Recovers the cookie from a reply, given the `mac1` of the initiation it
-/// answers; the index must match ours. We are the initiator, so
-/// `peer_public_key` is the responder's key, which wrapped it.
+/// Recovers the cookie from a reply given the `mac1` it answers. As the
+/// initiator we unwrap with the responder's key, which wrapped it.
 pub fn open_cookie_reply(
     peer_public_key: &Key,
     reply: &CookieReply<'_>,

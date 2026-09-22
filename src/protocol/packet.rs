@@ -24,8 +24,7 @@ pub enum WireGuardError {
     CounterTooOld,
     /// The sending counter reached `REJECT_AFTER_MESSAGES`.
     CounterExhausted,
-    /// A handshake message did not authenticate: forged, corrupt, or built for
-    /// a different peer.
+    /// A handshake did not authenticate: forged, corrupt, or for another peer.
     HandshakeNotAuthentic,
     /// The handshake could not be processed: a Diffie-Hellman step was refused,
     /// so no key can be agreed with this peer.
@@ -113,9 +112,8 @@ pub struct DataPacket<'a> {
 }
 
 impl<'a> Packet<'a> {
-    /// Parses a datagram the caller lets us modify in place. Only a data
-    /// packet needs that: its ciphertext is handed out as `&mut [u8]` so it can
-    /// be decrypted in the receive buffer without copying.
+    /// Parses a datagram the caller lets us modify in place: a data packet's
+    /// ciphertext is decrypted in the receive buffer without copying.
     pub fn parse_mut(src: &'a mut [u8]) -> Result<PacketMut<'a>, WireGuardError> {
         let packet_type = packet_type(src)?;
 
