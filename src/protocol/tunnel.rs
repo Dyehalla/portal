@@ -15,10 +15,6 @@ use super::session::{DATA_OVERHEAD, MAX_TRANSPORT_PAYLOAD, Session, SessionError
 
 /// How many handshakes may be answered before the oldest session is dropped.
 const MAX_QUEUE_DEPTH: usize = 256;
-const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-/// A data packet is never allowed to sit in the ring longer than this: one
-/// already in flight when the session turns 180s old must not be dropped.
-const REJECT_AFTER_TIME_SLACK: Duration = Duration::from_secs(5);
 
 /// How long to wait for a handshake response before retransmitting (§6.1).
 const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +59,8 @@ pub enum TunnelResult<'d, 'o> {
     /// No session is established yet, so the tunnel cannot carry this packet.
     /// The caller should wait for the handshake to finish.
     NoSession,
+    /// The output buffer cannot hold the packet that would be produced.
+    BufferTooSmall,
 }
 
 impl<'d, 'o> TunnelResult<'d, 'o> {
@@ -78,6 +76,7 @@ impl<'d, 'o> TunnelResult<'d, 'o> {
             Self::RekeyRequired => TunnelResult::RekeyRequired,
             Self::HandshakeInProgress => TunnelResult::HandshakeInProgress,
             Self::NoSession => TunnelResult::NoSession,
+            Self::BufferTooSmall => TunnelResult::BufferTooSmall,
         }
     }
 }
@@ -89,6 +88,7 @@ impl<'d, 'o> From<SessionError> for TunnelResult<'d, 'o> {
             // The session's own reason is preserved all the way out.
             SessionError::Rejected(reason) => Self::InvalidPacket(reason),
             SessionError::Malformed => Self::InvalidPacket(WireGuardError::InvalidPacket),
+            SessionError::BufferTooSmall => Self::BufferTooSmall,
         }
     }
 }
@@ -191,17 +191,23 @@ impl Tunnel {
         claim: IndexClaim<'_>,
     ) -> TunnelResult<'_, 'a> {
         if let Some(session) = self.current_session_mut() {
-            let written = match session.format_packet_data(src, dst) {
-                Ok(written) => written,
+            match session.format_packet_data(src, dst) {
+                Ok(written) => {
+                    self.timers.last_packet_sent = Some(Instant::now());
+
+                    // `written` is the whole datagram, header and tag included:
+                    // the counter reports bytes on the wire, not payload (§6.6).
+                    self.tx_bytes += written as u64;
+                    return TunnelResult::WriteToNetwork(&mut dst[..written]);
+                }
+                // Expired or exhausted: the packet is held, not lost, and the
+                // caller starts the fresh handshake `RekeyRequired` asks for.
+                Err(SessionError::RekeyRequired) => {
+                    self.queue_packet(src);
+                    return TunnelResult::RekeyRequired;
+                }
                 Err(error) => return error.into(),
-            };
-
-            self.timers.last_packet_sent = Some(Instant::now());
-
-            // `written` is the whole datagram, header and tag included: the
-            // counter reports bytes on the wire, not payload (§6.6).
-            self.tx_bytes += written as u64;
-            return TunnelResult::WriteToNetwork(&mut dst[..written]);
+            }
         }
 
         // No session yet: hold the packet for when the handshake completes,
@@ -233,7 +239,9 @@ impl Tunnel {
             },
         };
 
-        let message = &mut dst[..packet::HANDSHAKE_INIT_LEN];
+        let Some(message) = dst.get_mut(..packet::HANDSHAKE_INIT_LEN) else {
+            return TunnelResult::BufferTooSmall;
+        };
         if let Err(error) = self
             .handshake
             .format_handshake_init(message, local_index)
@@ -263,12 +271,18 @@ impl Tunnel {
         };
 
         if let Some(session) = self.current_session_mut() {
-            let written = match session.format_packet_data(&src, dst) {
-                Ok(written) => written,
-                Err(error) => return error.into(),
-            };
-            self.tx_bytes += written as u64;
-            return TunnelResult::WriteToNetwork(&mut dst[..written]);
+            match session.format_packet_data(&src, dst) {
+                Ok(written) => {
+                    self.tx_bytes += written as u64;
+                    return TunnelResult::WriteToNetwork(&mut dst[..written]);
+                }
+                Err(error) => {
+                    // Like the no-session case, the packet keeps its place at
+                    // the front instead of being dropped.
+                    self.packet_queue.push_front(src);
+                    return error.into();
+                }
+            }
         }
 
         // The session vanished between the pop and here: put the packet back
@@ -353,26 +367,27 @@ impl Tunnel {
         dst: &'a mut [u8],
         claim: IndexClaim<'_>,
     ) -> TunnelResult<'d, 'a> {
-        let response = &mut dst[..packet::HANDSHAKE_RESPONSE_LEN];
+        let Some(response) = dst.get_mut(..packet::HANDSHAKE_RESPONSE_LEN) else {
+            return TunnelResult::BufferTooSmall;
+        };
 
         let Some(local_index) = claim() else {
             return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
         };
 
         // Any failure means the initiation is not authentic, is for another
-        // peer, or its keys cannot be agreed with ours; we stay silent.
-        let (session, _index) = match self
+        // peer, is a replay, or its keys cannot be agreed with ours; we stay
+        // silent. The index just claimed is reclaimed by the device.
+        let session = match self
             .handshake
             .format_handshake_response(response, &initiation, local_index)
         {
-            Ok(pair) => pair,
+            Ok(session) => session,
             Err(error) => return TunnelResult::InvalidPacket(error.into()),
         };
 
         // Filed as pending: the peer's first authenticated packet proves it.
-        if self.install_session(session, false).is_none() {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        }
+        self.install_session(session, false);
 
         let now = Instant::now();
         self.timers.last_packet_received = Some(now);
@@ -387,8 +402,8 @@ impl Tunnel {
         response: HandshakeResponse<'_>,
         dst: &'a mut [u8],
     ) -> TunnelResult<'d, 'a> {
-        let (mut session, _index) = match self.handshake.consume_response(&response) {
-            Ok(pair) => pair,
+        let mut session = match self.handshake.consume_response(&response) {
+            Ok(session) => session,
             Err(error) => return TunnelResult::InvalidPacket(error.into()),
         };
 
@@ -400,9 +415,7 @@ impl Tunnel {
         };
 
         // The keepalive just built proves the session works, so use it now.
-        if self.install_session(session, true).is_none() {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        }
+        self.install_session(session, true);
 
         let now = Instant::now();
         self.timers.last_packet_received = Some(now);
@@ -474,10 +487,8 @@ impl Tunnel {
             return TimerAction::Nothing;
         };
 
-        let age = now.checked_duration_since(session.created_at);
-
         // Past the hard limit the session must not carry more traffic.
-        if age.is_some_and(|age| age >= REJECT_AFTER_TIME) {
+        if session.is_expired(now) {
             return TimerAction::Initiate;
         }
 
@@ -499,24 +510,24 @@ impl Tunnel {
 
     /// Files a session, returning its index. As *responder* it waits in `next`
     /// until traffic proves it; as *initiator* the keepalive already did.
-    fn install_session(&mut self, session: Session, usable: bool) -> Option<u32> {
+    fn install_session(&mut self, session: Session, usable: bool) -> u32 {
         let index = session.local_id;
 
         // A retransmission of a handshake already answered refreshes in place.
         if let Some(existing) = self.sessions.by_index_mut(index) {
             *existing = session;
-            return Some(index);
+            return index;
         }
 
         if usable {
             // The session we supersede becomes `previous`; the one before it
             // is past helping and goes.
             self.sessions.previous = self.sessions.current.replace(session);
-            return Some(index);
+            return index;
         }
 
         self.sessions.next = Some(session);
-        Some(index)
+        index
     }
 
     /// Promotes the negotiated session once the peer sends traffic on it: the
@@ -585,6 +596,7 @@ impl Tunnel {
 pub(crate) mod tests {
     use super::*;
     use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
+    use crate::protocol::session::REJECT_AFTER_TIME;
 
 
     /// Two peers with matching static keys and mirrored indexes.
@@ -919,6 +931,40 @@ pub(crate) mod tests {
         assert_eq!(
             a.queued_for_tests(),
             vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    /// A packet the sending session refuses (expired or exhausted) is held for
+    /// the next session rather than lost: `RekeyRequired` must cost nothing.
+    #[test]
+    fn a_packet_the_session_refuses_is_held_not_dropped() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        // Backdate A's sending session past the reject-after age.
+        let Some(past) = Instant::now().checked_sub(REJECT_AFTER_TIME) else {
+            return; // the clock has not run long enough to backdate with
+        };
+        a.sessions
+            .current
+            .as_mut()
+            .expect("the handshake installed a session")
+            .created_at = past;
+
+        // `handshake()` leaves its own `b"hi"` held behind us.
+        let before = a.queued_for_tests().len();
+
+        let mut buf = dst();
+        assert!(matches!(
+            a.encapsulate(b"held", &mut buf, &mut claimer()),
+            TunnelResult::RekeyRequired
+        ));
+        let queued = a.queued_for_tests();
+        assert_eq!(queued.len(), before + 1);
+        assert_eq!(
+            queued.last(),
+            Some(&b"held".to_vec()),
+            "the refused packet must be held for the next session"
         );
     }
 
@@ -1266,7 +1312,7 @@ mod concurrency {
 
         // A fresh session under a new index, as the responder would file it.
         let second = Session::new(first.wrapping_add(1), 7, &[8u8; 32], &[8u8; 32]);
-        assert_eq!(b.install_session(second, false), Some(first.wrapping_add(1)));
+        assert_eq!(b.install_session(second, false), first.wrapping_add(1));
 
         assert_eq!(
             b.current_session().map(|s| s.local_id),
@@ -1282,7 +1328,7 @@ mod concurrency {
 
         // The same index again is a retransmission: it refreshes, not adds.
         let duplicate = Session::new(first, 7, &[9u8; 32], &[9u8; 32]);
-        assert_eq!(b.install_session(duplicate, false), Some(first));
+        assert_eq!(b.install_session(duplicate, false), first);
         assert!(b.session_count() <= 3);
     }
 

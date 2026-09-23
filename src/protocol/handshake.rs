@@ -4,7 +4,7 @@ use super::cookie::{self, StoredCookie};
 use super::packet::{HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInitiation, HandshakeResponse};
 use super::primitives::{
     AEAD_DECRYPT, AEAD_ENCRYPT, DH, DH_GENERATE, DH_PRIVATE, DH_PUBKEY, DhError, HASH, KDF1, KDF2,
-    KDF3, LABEL_MAC1, MAC, MAC_KEYED, MAC_LEN, PrivateKey, TAI64N,
+    KDF3, LABEL_MAC1, MAC, MAC_KEYED, MAC_LEN, PrivateKey, TAI64N, TIMESTAMP_LEN,
 };
 use super::session::Session;
 
@@ -68,6 +68,9 @@ pub enum HandshakeError {
     InitiationForAnotherPeer,
     /// The initiation's `encrypted_timestamp` failed to authenticate.
     TimestampNotAuthentic,
+    /// The initiation's timestamp is not newer than the greatest accepted from
+    /// this peer: a replay of a message we have already answered.
+    TimestampReplayed,
     /// The response's `encrypted_nothing` failed to authenticate.
     ResponseNotAuthentic,
     /// The response authenticated, but answers an initiation that is not the
@@ -133,6 +136,9 @@ pub struct Handshake {
     last_sent_mac1: Option<[u8; MAC_LEN]>,
     /// A cookie received from the peer, put into `mac2` of later messages.
     cookie: Option<StoredCookie>,
+    /// The greatest authenticated timestamp seen from this peer: an initiation
+    /// must beat it, which is what makes a captured message die on replay.
+    last_timestamp: Option<[u8; TIMESTAMP_LEN]>,
     ephemeral_private: Option<PrivateKey>,
     chaining_key: Option<[u8; 32]>,
     hash: Option<[u8; 32]>,
@@ -152,6 +158,7 @@ impl Handshake {
             pending_index: None,
             last_sent_mac1: None,
             cookie: None,
+            last_timestamp: None,
             ephemeral_private: None,
             chaining_key: None,
             hash: None,
@@ -225,13 +232,13 @@ impl Handshake {
 
 
     /// Builds handshake response into `buf`, returning the session that reads
-    /// the initiator's traffic and the index it answers to.
+    /// the initiator's traffic. The response is written under `local_index`.
     pub fn format_handshake_response(
         &mut self,
         buf: &mut [u8],
         initiation: &HandshakeInitiation<'_>,
         local_index: u32,
-    ) -> Result<(Session, u32), HandshakeError> {
+    ) -> Result<Session, HandshakeError> {
         let static_private = DH_PRIVATE(&self.static_private);
         let static_public = DH_PUBKEY(&static_private);
 
@@ -259,10 +266,19 @@ impl Handshake {
         let dh = DH(&static_private, &self.peer_static_public)?;
         let (ck, key) = KDF2(&chaining_key, &dh);
         chaining_key = ck;
-        // TODO(M4): compare against the per-peer greatest timestamp and drop
-        // replays. For now we only prove it authenticates.
-        let _timestamp = AEAD_DECRYPT(&key, 0, &hash, initiation.encrypted_timestamp)
+        let timestamp = AEAD_DECRYPT(&key, 0, &hash, initiation.encrypted_timestamp)
             .map_err(|_| HandshakeError::TimestampNotAuthentic)?;
+        let timestamp: [u8; TIMESTAMP_LEN] = timestamp
+            .as_slice()
+            .try_into()
+            .map_err(|_| HandshakeError::TimestampNotAuthentic)?;
+
+        // Replay defence (§5.4.4): the timestamp must be strictly greater
+        // than the greatest accepted, so a captured initiation cannot be
+        // presented again to mint fresh sessions.
+        if self.last_timestamp.is_some_and(|last| timestamp <= last) {
+            return Err(HandshakeError::TimestampReplayed);
+        }
         hash = HASH(&[&hash, initiation.encrypted_timestamp]);
 
         // (Erpriv, Erpub) := DH-Generate()
@@ -309,13 +325,13 @@ impl Handshake {
         // The responder's ephemeral key is not retained: `ephemeral_private`
         // tracks *our* initiation awaiting a response, and we await nothing.
         self.last_started = Some(now);
+        // The watermark advances only now: a message we did not fully accept
+        // must not block a genuine retry of the same timestamp.
+        self.last_timestamp = Some(timestamp);
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as responder, tau_2 sends.
         let (recv, send) = KDF2(&chaining_key, &[]);
-        Ok((
-            Session::new(local_index, initiation.sender_index, &send, &recv),
-            local_index,
-        ))
+        Ok(Session::new(local_index, initiation.sender_index, &send, &recv))
     }
 
     /// `msg.mac2`: `MAC(cookie, message)` when a fresh cookie is held, else
@@ -361,7 +377,7 @@ impl Handshake {
     pub fn consume_response(
         &mut self,
         response: &HandshakeResponse<'_>,
-    ) -> Result<(Session, u32), HandshakeError> {
+    ) -> Result<Session, HandshakeError> {
         let ephemeral_private = self
             .ephemeral_private
             .take()
@@ -407,10 +423,20 @@ impl Handshake {
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as initiator, tau_1 sends.
         let (send, recv) = KDF2(&chaining_key, &[]);
-        Ok((
-            Session::new(local_index, response.sender_index, &send, &recv),
-            local_index,
-        ))
+        Ok(Session::new(local_index, response.sender_index, &send, &recv))
+    }
+}
+
+/// Hand-rolled so the raw key material does not outlive the handshake.
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.static_private.fill(0);
+        if let Some(psk) = self.preshared_key.as_mut() {
+            psk.fill(0);
+        }
+        if let Some(key) = self.chaining_key.as_mut() {
+            key.fill(0);
+        }
     }
 }
 
@@ -521,9 +547,8 @@ mod tests {
             .unwrap();
 
         // The responder's session reads the initiator's index and writes to ours.
-        assert_eq!(session.0.remote_index, 0x0a0b_0c0d);
-        assert_eq!(session.1, 0x1122_3344, "the response must claim our index");
-        assert_eq!(session.0.local_id, 0x1122_3344);
+        assert_eq!(session.remote_index, 0x0a0b_0c0d);
+        assert_eq!(session.local_id, 0x1122_3344, "the response must claim our index");
         assert_eq!(response[0], MSG_HANDSHAKE_RESPONSE);
         assert_eq!(&response[1..4], &[0, 0, 0]);
         // Sender is the responder's own index, receiver is the initiator's.
@@ -626,6 +651,44 @@ mod tests {
             .err()
             .expect("a tampered timestamp must not be answered");
         assert_eq!(error, HandshakeError::TimestampNotAuthentic);
+    }
+
+    /// The replay defence: a captured initiation presented again must not mint
+    /// another session, even though every MAC and AEAD tag still verifies.
+    #[test]
+    fn a_replayed_initiation_is_refused() {
+        let (mut initiator, mut responder) = peer_pair();
+
+        let mut init = [0u8; HANDSHAKE_INIT_LEN];
+        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+
+        let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
+        responder
+            .format_handshake_response(&mut response, &parse_initiation(&init), 0x1122_3344)
+            .expect("the genuine initiation is answered");
+
+        // The very same bytes again: authentic, but not newer.
+        let error = responder
+            .format_handshake_response(&mut response, &parse_initiation(&init), 0x5566_7788)
+            .err()
+            .expect("a replayed initiation must not be answered");
+        assert_eq!(error, HandshakeError::TimestampReplayed);
+    }
+
+    /// The watermark must not overreach: a fresh initiation after an accepted
+    /// one is still answered, even if the clock ticks close together.
+    #[test]
+    fn a_fresh_initiation_after_an_accepted_one_is_still_answered() {
+        let (mut initiator, mut responder) = peer_pair();
+
+        for index in [0x0a0b_0c0du32, 0x1122_3344] {
+            let mut init = [0u8; HANDSHAKE_INIT_LEN];
+            initiator.format_handshake_init(&mut init, index).unwrap();
+            let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
+            responder
+                .format_handshake_response(&mut response, &parse_initiation(&init), 0x5566_7788)
+                .expect("a strictly newer initiation must be answered");
+        }
     }
 }
 

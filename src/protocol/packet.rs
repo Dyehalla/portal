@@ -26,9 +26,18 @@ pub enum WireGuardError {
     CounterExhausted,
     /// A handshake did not authenticate: forged, corrupt, or for another peer.
     HandshakeNotAuthentic,
+    /// A handshake message was replayed: its timestamp is not newer than the
+    /// last accepted from that peer.
+    HandshakeReplayed,
     /// The handshake could not be processed: a Diffie-Hellman step was refused,
     /// so no key can be agreed with this peer.
     HandshakeKeyAgreementFailed,
+    /// The transport session is older than `REJECT_AFTER_TIME` and must be
+    /// replaced before it carries traffic again.
+    SessionExpired,
+    /// A transport-data packet was handed to `Packet::parse`, which cannot
+    /// borrow its payload mutably; use `Packet::parse_mut` instead.
+    Unsupported,
 }
 
 impl From<crate::protocol::handshake::HandshakeError> for WireGuardError {
@@ -45,6 +54,7 @@ impl From<crate::protocol::handshake::HandshakeError> for WireGuardError {
             | HandshakeError::InitiationForAnotherPeer
             | HandshakeError::TimestampNotAuthentic
             | HandshakeError::ResponseNotAuthentic => Self::HandshakeNotAuthentic,
+            HandshakeError::TimestampReplayed => Self::HandshakeReplayed,
         }
     }
 }
@@ -197,8 +207,8 @@ impl<'a> Packet<'a> {
     }
 
     /// Data packets need a mutable payload, so this immutable entry point
-    /// rejects them: callers on the receive path use `parse_mut` instead.
+    /// refuses them: callers on the receive path use `parse_mut` instead.
     fn parse_data(_src: &'a [u8]) -> Result<Self, WireGuardError> {
-        Err(WireGuardError::InvalidPacket)
+        Err(WireGuardError::Unsupported)
     }
 }

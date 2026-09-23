@@ -24,8 +24,6 @@ pub type PeerKey = [u8; KEY_LEN];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Route {
     pub peer: PeerKey,
-    /// Which of the peer's tunnels.
-    pub tunnel: usize,
     /// The session slot, once a session exists under this index. `None` while
     /// only an initiation has claimed it: the response has not arrived yet.
     pub session: Option<usize>,
@@ -61,7 +59,6 @@ fn reserve_index(routes: &mut HashMap<u32, Route>, peer: PeerKey, index: u32) ->
         std::collections::hash_map::Entry::Vacant(slot) => {
             slot.insert(Route {
                 peer,
-                tunnel: 0,
                 session: None,
             });
             true
@@ -79,6 +76,10 @@ pub struct Device {
     /// Every live receiver index on this device, mapped to its owner. Indices
     /// are unique device-wide, so a hit here resolves the packet outright.
     routes: HashMap<u32, Route>,
+    /// Every index each peer owns. Reconciling a peer's routes (and reclaiming
+    /// the ones its tunnel dropped) touches only this list, never the whole
+    /// table.
+    peer_indices: HashMap<PeerKey, Vec<u32>>,
     cookies: Arc<Mutex<CookieChecker>>,
 }
 
@@ -90,6 +91,7 @@ impl Device {
             static_public,
             peers: HashMap::new(),
             routes: HashMap::new(),
+            peer_indices: HashMap::new(),
             cookies: Arc::new(Mutex::new(CookieChecker::new(static_public))),
         }
     }
@@ -121,6 +123,9 @@ impl Device {
             preshared_key,
             persistent_keepalive,
         );
+        // Replacing a peer releases whatever its tunnels claimed, or those
+        // indices would leak and stay unroutable for anyone else.
+        self.drop_peer_routes(&peer_static_public);
         self.peers.insert(peer_static_public, tunnel);
         self.peers
             .get_mut(&peer_static_public)
@@ -244,46 +249,60 @@ impl Device {
             return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
         };
 
-        let routes = &mut self.routes;
-        let mut issued = None;
+        let Device {
+            routes,
+            peer_indices,
+            ..
+        } = self;
         let mut claim = || {
             let index = next_free_index(routes, peer)?;
-            issued = Some(index);
+            peer_indices.entry(peer).or_default().push(index);
             Some(index)
         };
 
         let outcome = tunnel.decapsulate(datagram, dst, &mut claim);
 
-        // A session may have appeared under the index just claimed; record
-        // which slot holds it so later packets resolve in one lookup.
-        if let Some(index) = issued {
-            if let Some(slot) = tunnel.slot_of(index) {
-                if let Some(route) = self.routes.get_mut(&index) {
-                    route.session = Some(slot);
-                }
-            }
-        }
-
-        // A handshake may also have installed a session under an index claimed
-        // during an earlier call, so refresh every route this peer owns.
-        self.bind_peer_routes(&peer, &tunnel);
+        // The table is reconciled with what the tunnel now holds: a session
+        // records its slot, and an index whose session is gone — or whose
+        // handshake failed after claiming it — is reclaimed.
+        self.sync_peer_routes(&peer, &tunnel);
         self.peers.insert(peer, tunnel);
         outcome
     }
 
-    /// Fills in the session slot of every route belonging to `peer`.
-    fn bind_peer_routes(&mut self, peer: &PeerKey, tunnel: &Tunnel) {
-        let indices: Vec<u32> = self
-            .routes
-            .iter()
-            .filter(|(_, route)| route.peer == *peer)
-            .map(|(index, _)| *index)
-            .collect();
+    /// Reconciles the table with what `tunnel` still holds: sessions record
+    /// their slot, an initiation in flight keeps its claim, and anything else
+    /// this peer held is reclaimed. Only the peer's own indices are touched.
+    fn sync_peer_routes(&mut self, peer: &PeerKey, tunnel: &Tunnel) {
+        let Some(indices) = self.peer_indices.remove(peer) else {
+            return;
+        };
+        let pending = tunnel.pending_index();
+        let mut live = Vec::with_capacity(indices.len());
 
         for index in indices {
-            let slot = tunnel.slot_of(index);
-            if let Some(route) = self.routes.get_mut(&index) {
-                route.session = slot;
+            if let Some(slot) = tunnel.slot_of(index) {
+                if let Some(route) = self.routes.get_mut(&index) {
+                    route.session = Some(slot);
+                }
+                live.push(index);
+            } else if pending == Some(index) {
+                // The response names this very index before any session
+                // exists, so the claim stands until the handshake resolves.
+                live.push(index);
+            } else {
+                self.routes.remove(&index);
+            }
+        }
+
+        self.peer_indices.insert(*peer, live);
+    }
+
+    /// Releases every index `peer` owns; used when a peer is replaced.
+    fn drop_peer_routes(&mut self, peer: &PeerKey) {
+        if let Some(indices) = self.peer_indices.remove(peer) {
+            for index in indices {
+                self.routes.remove(&index);
             }
         }
     }
@@ -310,11 +329,14 @@ impl Device {
             return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
         };
 
-        let routes = &mut self.routes;
-        let mut claimed = None;
+        let Device {
+            routes,
+            peer_indices,
+            ..
+        } = self;
         let mut claim = || {
             let index = next_free_index(routes, *peer)?;
-            claimed = Some(index);
+            peer_indices.entry(*peer).or_default().push(index);
             Some(index)
         };
 
@@ -326,8 +348,7 @@ impl Device {
 
         // A handshake may have installed a session under the index just
         // claimed, or under one claimed during an earlier call.
-        self.bind_peer_routes(peer, &tunnel);
-        let _ = claimed;
+        self.sync_peer_routes(peer, &tunnel);
         self.peers.insert(*peer, tunnel);
         outcome
     }
@@ -344,14 +365,22 @@ impl Device {
             return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
         };
 
-        let routes = &mut self.routes;
-        let mut claim = || next_free_index(routes, *peer);
+        let Device {
+            routes,
+            peer_indices,
+            ..
+        } = self;
+        let mut claim = || {
+            let index = next_free_index(routes, *peer)?;
+            peer_indices.entry(*peer).or_default().push(index);
+            Some(index)
+        };
 
         let outcome = tunnel
             .format_handshake_initiation(dst, &mut claim, force_resend)
             .into_outbound();
 
-        self.bind_peer_routes(peer, &tunnel);
+        self.sync_peer_routes(peer, &tunnel);
         self.peers.insert(*peer, tunnel);
         outcome
     }
@@ -408,6 +437,13 @@ impl Device {
         }
     }
 
+}
+
+/// Hand-rolled so the raw key material does not outlive the device.
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.static_private.fill(0);
+    }
 }
 
 #[cfg(test)]
@@ -507,10 +543,9 @@ mod tests {
             "a second claim on the same index must be refused"
         );
 
-        // The owner is untouched, session slot included.
+        // The owner is untouched.
         let route = &routes[&taken];
         assert_eq!(route.peer, owner);
-        assert_eq!(route.tunnel, 0);
 
         // Zero is never a valid index.
         assert!(!reserve_index(&mut routes, owner, 0));
@@ -729,6 +764,54 @@ mod tests {
             b.handle_datagram(src(1), &mut init, &mut b_buf),
             TunnelResult::InvalidPacket(WireGuardError::HandshakeNotAuthentic)
         ));
+    }
+
+    /// A replayed initiation is refused and its claimed index reclaimed: the
+    /// route table must not grow on input nobody asked for.
+    #[test]
+    fn a_replayed_initiation_does_not_grow_the_route_table() {
+        let (mut a, mut b) = paired();
+        let b_key = b.static_public().to_owned();
+
+        let mut a_buf = buf();
+        let mut b_buf = buf();
+        let mut init = match a.encapsulate(&b_key, b"hi", &mut a_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected an initiation, got {other:?}"),
+        };
+
+        // First delivery is answered and claims exactly one index.
+        let mut response = match b.handle_datagram(src(1), &mut init, &mut b_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected a response, got {other:?}"),
+        };
+        assert_eq!(b.route_count(), 1);
+
+        // The same bytes again: refused as a replay, and the index its failed
+        // handshake claimed is reclaimed rather than leaked.
+        for _ in 0..3 {
+            let mut replay = init.clone();
+            assert!(matches!(
+                b.handle_datagram(src(1), &mut replay, &mut b_buf),
+                TunnelResult::InvalidPacket(_)
+            ));
+            assert_eq!(
+                b.route_count(),
+                1,
+                "a refused handshake must not leak its claimed index"
+            );
+        }
+
+        // The genuine exchange still completes.
+        let mut keepalive = match a.handle_datagram(src(2), &mut response, &mut a_buf) {
+            TunnelResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected a keepalive, got {other:?}"),
+        };
+        assert!(matches!(
+            b.handle_datagram(src(1), &mut keepalive, &mut b_buf),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+        assert_eq!(b.route_count(), 1);
     }
 
     /// Under load the device challenges, and the peer that carries the cookie

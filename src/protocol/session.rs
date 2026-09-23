@@ -1,7 +1,7 @@
 //! One established transport session: a pair of direction keys plus the
 //! replay window for the receive direction.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::packet::{self, DataPacket, WireGuardError};
 use super::primitives::{AeadKey, TAG_LEN};
@@ -13,6 +13,13 @@ pub const MAX_TRANSPORT_PAYLOAD: usize = 65_535 - packet::DATA_HEADER_LEN - TAG_
 
 /// Counters at or above this value must not be used; the session has to rekey.
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13) - 1;
+
+/// A session must not carry traffic older than this (§6.3 reject-after-timer);
+/// both directions stop and a fresh handshake takes over.
+pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+/// Grace on the receive side: a data packet already in flight when the session
+/// turned `REJECT_AFTER_TIME` old must not be dropped on arrival.
+pub const REJECT_AFTER_TIME_SLACK: Duration = Duration::from_secs(5);
 
 /// Bytes a transport-data packet adds to the payload: the 16-byte header
 /// (type+reserved, receiver index, counter) plus the Poly1305 tag.
@@ -29,6 +36,8 @@ pub enum SessionError {
     Rejected(WireGuardError),
     /// The packet is too short to hold a tag, or longer than a datagram allows.
     Malformed,
+    /// The output buffer cannot hold the packet.
+    BufferTooSmall,
 }
 
 impl From<WireGuardError> for SessionError {
@@ -70,19 +79,34 @@ impl Session {
     }
 
     /// Encrypts `src` into a transport-data packet, writing it to `dst`, which
-    /// must hold at least `src.len() + DATA_OVERHEAD` bytes.
+    /// must hold at least `src.len() + DATA_OVERHEAD` bytes. A payload bigger
+    /// than [`MAX_TRANSPORT_PAYLOAD`] is refused as `Malformed`, a `dst` too
+    /// small as `BufferTooSmall`: neither may panic.
     pub fn format_packet_data(
         &mut self,
         src: &[u8],
         dst: &mut [u8],
     ) -> Result<usize, SessionError> {
         let total = src.len() + DATA_OVERHEAD;
+        if src.len() > MAX_TRANSPORT_PAYLOAD {
+            return Err(SessionError::Malformed);
+        }
+        if dst.len() < total {
+            return Err(SessionError::BufferTooSmall);
+        }
 
+        // Past the reject-after age the session must not send at all: the
+        // counter is not even spent, so the caller is free to retry later.
+        if self.is_expired(Instant::now()) {
+            return Err(SessionError::RekeyRequired);
+        }
+
+        // Checked before the increment: a refused send must not burn a counter.
         let counter = self.sending_counter;
-        self.sending_counter += 1;
         if counter >= REJECT_AFTER_MESSAGES {
             return Err(SessionError::RekeyRequired);
         }
+        self.sending_counter = counter + 1;
 
         let dst = &mut dst[..total];
         let (header, body) = dst.split_at_mut(packet::DATA_HEADER_LEN);
@@ -95,6 +119,19 @@ impl Session {
         self.sender.seal_in_place(counter, body);
 
         Ok(total)
+    }
+
+    /// True once the session is too old to send on (§6.3).
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.created_at)
+            .is_some_and(|age| age >= REJECT_AFTER_TIME)
+    }
+
+    /// True once even packets already in flight are too old to accept: the
+    /// receive side lives exactly [`REJECT_AFTER_TIME_SLACK`] longer.
+    fn is_expired_beyond_slack(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.created_at)
+            .is_some_and(|age| age >= REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK)
     }
 
     /// Authenticates and decrypts a transport-data packet in place, returning
@@ -111,6 +148,9 @@ impl Session {
         }
         if ciphertext_len < TAG_LEN || ciphertext_len - TAG_LEN > MAX_TRANSPORT_PAYLOAD {
             return Err(SessionError::Malformed);
+        }
+        if self.is_expired_beyond_slack(Instant::now()) {
+            return Err(SessionError::Rejected(WireGuardError::SessionExpired));
         }
 
         // Cheap replay check before the expensive AEAD open (DoS defence).
@@ -180,6 +220,94 @@ mod tests {
         assert_eq!(
             sender.format_packet_data(b"ping", &mut datagram),
             Err(SessionError::RekeyRequired)
+        );
+        // A refused send must not burn a counter: the gap would drift towards
+        // wrapping the u64, which would hand out reused nonces after overflow.
+        assert_eq!(sender.sending_counter, REJECT_AFTER_MESSAGES);
+    }
+
+    /// Neither a huge payload nor a short buffer may panic: both are errors.
+    #[test]
+    fn an_oversized_payload_is_refused_rather_than_panicking() {
+        let (mut sender, _receiver) = peer_pair();
+        let src = vec![0u8; MAX_TRANSPORT_PAYLOAD + 1];
+        let mut datagram = vec![0u8; src.len() + DATA_OVERHEAD];
+
+        assert_eq!(
+            sender.format_packet_data(&src, &mut datagram),
+            Err(SessionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_short_output_buffer_is_refused_rather_than_panicking() {
+        let (mut sender, _receiver) = peer_pair();
+        let mut datagram = [0u8; DATA_OVERHEAD];
+
+        assert_eq!(
+            sender.format_packet_data(b"payload", &mut datagram),
+            Err(SessionError::BufferTooSmall)
+        );
+    }
+
+    /// Past the reject-after age the session stops sending (§6.3).
+    #[test]
+    fn an_expired_session_refuses_to_send() {
+        let (mut sender, _receiver) = peer_pair();
+        let Some(past) = Instant::now().checked_sub(REJECT_AFTER_TIME) else {
+            return; // the clock has not run long enough to backdate with
+        };
+        sender.created_at = past;
+
+        let mut datagram = [0u8; 4 + DATA_OVERHEAD];
+        assert_eq!(
+            sender.format_packet_data(b"ping", &mut datagram),
+            Err(SessionError::RekeyRequired)
+        );
+    }
+
+    /// Within the slack a packet already in flight still decrypts.
+    #[test]
+    fn the_receive_side_keeps_the_slack_for_packets_in_flight() {
+        let (mut sender, mut receiver) = peer_pair();
+        let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
+        let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
+
+        let Some(aged) =
+            Instant::now().checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK - Duration::from_secs(1))
+        else {
+            return;
+        };
+        receiver.created_at = aged;
+
+        let packet = match Packet::parse_mut(&mut datagram[..n]).unwrap() {
+            PacketMut::Data(packet) => packet,
+            other => panic!("expected a data packet, got {other:?}"),
+        };
+        assert!(receiver.receive_packet_data(packet).is_ok());
+    }
+
+    /// Past the slack the session is dead in both directions.
+    #[test]
+    fn a_session_past_the_slack_refuses_to_receive() {
+        let (mut sender, mut receiver) = peer_pair();
+        let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
+        let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
+
+        let Some(expired) =
+            Instant::now().checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK)
+        else {
+            return;
+        };
+        receiver.created_at = expired;
+
+        let packet = match Packet::parse_mut(&mut datagram[..n]).unwrap() {
+            PacketMut::Data(packet) => packet,
+            other => panic!("expected a data packet, got {other:?}"),
+        };
+        assert_eq!(
+            receiver.receive_packet_data(packet).unwrap_err(),
+            SessionError::Rejected(WireGuardError::SessionExpired)
         );
     }
 

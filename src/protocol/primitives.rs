@@ -1,6 +1,7 @@
 //! WireGuard noise functions. Every function in ALL_CAPS matches whitepaper.
 #![allow(non_snake_case)]
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::aead::{self, CHACHA20_POLY1305, UnboundKey};
@@ -94,19 +95,9 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
 /// AEAD(key, counter, plain text, auth text) — encryption half:
 /// returns ciphertext || tag. `auth text` is authenticated, not encrypted.
 pub fn AEAD_ENCRYPT(key: &Key, counter: u64, auth: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let unbound =
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("key is always KEY_LEN bytes");
-    let key = aead::LessSafeKey::new(unbound);
-
-    let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(
-        aead::Nonce::assume_unique_for_key(nonce_from_counter(counter)),
-        aead::Aad::from(auth),
-        &mut in_out,
-    )
-    .expect("sealing cannot fail");
-
-    in_out
+    AeadKey::new(key)
+        .seal(nonce_from_counter(counter), auth, plaintext)
+        .expect("sealing cannot fail")
 }
 
 /// AEAD(key, counter, cipher text, auth text) — decryption half.
@@ -117,20 +108,9 @@ pub fn AEAD_DECRYPT(
     auth: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, AeadError> {
-    let unbound =
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("key is always KEY_LEN bytes");
-    let key = aead::LessSafeKey::new(unbound);
-
-    let mut in_out = ciphertext.to_vec();
-    let plaintext = key
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(nonce_from_counter(counter)),
-            aead::Aad::from(auth),
-            &mut in_out,
-        )
-        .map_err(|_| AeadError::InvalidTag)?;
-
-    Ok(plaintext.to_vec())
+    AeadKey::new(key)
+        .open(nonce_from_counter(counter), auth, ciphertext)
+        .map_err(|_| AeadError::InvalidTag)
 }
 
 /// AEAD_LEN(plain len): plain len + 16
@@ -356,6 +336,25 @@ pub fn TAI64N() -> [u8; TIMESTAMP_LEN] {
     let mut out = [0u8; TIMESTAMP_LEN];
     out[..8].copy_from_slice(&(0x4000_0000_0000_0000u64 + unix.as_secs()).to_be_bytes());
     out[8..].copy_from_slice(&unix.subsec_nanos().to_be_bytes());
+
+    // A timestamp must be strictly greater than every one we sent before
+    // (§5.4.4 replay protection), but the clock can tick twice in a row or
+    // stand still. Bump by one nanosecond rather than emit a repeat.
+    static LAST: Mutex<Option<[u8; TIMESTAMP_LEN]>> = Mutex::new(None);
+    let mut last = LAST.lock().expect("timestamp lock poisoned");
+    if let Some(previous) = *last {
+        if out <= previous {
+            out = previous;
+            for byte in out.iter_mut().rev() {
+                let (bumped, carry) = byte.overflowing_add(1);
+                *byte = bumped;
+                if !carry {
+                    break;
+                }
+            }
+        }
+    }
+    *last = Some(out);
     out
 }
 
