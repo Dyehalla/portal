@@ -1,7 +1,9 @@
 //! The peer-facing half of the protocol engine: a thin dispatcher over
 //! `handshake` and `session`, writing into caller-owned buffers.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use super::cookie;
@@ -71,7 +73,9 @@ impl<'d, 'o> TunnelResult<'d, 'o> {
             Self::Done => TunnelResult::Done,
             Self::WriteToNetwork(dst) => TunnelResult::WriteToNetwork(dst),
             Self::WriteToTunnel(dst) => TunnelResult::WriteToTunnel(dst),
-            Self::WriteToTunnelInPlace(_) => TunnelResult::InvalidPacket(WireGuardError::InvalidPacket),
+            Self::WriteToTunnelInPlace(_) => {
+                TunnelResult::InvalidPacket(WireGuardError::InvalidPacket)
+            }
             Self::InvalidPacket(error) => TunnelResult::InvalidPacket(error),
             Self::RekeyRequired => TunnelResult::RekeyRequired,
             Self::HandshakeInProgress => TunnelResult::HandshakeInProgress,
@@ -123,7 +127,10 @@ impl Sessions {
     }
 
     fn iter(&self) -> impl Iterator<Item = &Session> {
-        self.previous.iter().chain(self.current.iter()).chain(self.next.iter())
+        self.previous
+            .iter()
+            .chain(self.current.iter())
+            .chain(self.next.iter())
     }
 
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut Session> {
@@ -147,6 +154,8 @@ pub struct Tunnel {
     packet_queue: VecDeque<Vec<u8>>,
     tx_bytes: u64,
     rx_bytes: u64,
+    /// Encodes the single-thread owner invariant: movable, never shareable.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 #[derive(Default)]
@@ -157,7 +166,6 @@ struct Timers {
     persistent_keepalive: Option<Duration>,
 }
 
-
 impl Tunnel {
     pub fn new(
         static_private: [u8; KEY_LEN],
@@ -167,11 +175,7 @@ impl Tunnel {
     ) -> Self {
         Self {
             sessions: Sessions::default(),
-            handshake: handshake::Handshake::new(
-                static_private,
-                peer_static_public,
-                preshared_key,
-            ),
+            handshake: handshake::Handshake::new(static_private, peer_static_public, preshared_key),
             timers: Timers {
                 persistent_keepalive,
                 ..Timers::default()
@@ -179,6 +183,7 @@ impl Tunnel {
             packet_queue: VecDeque::new(),
             tx_bytes: 0,
             rx_bytes: 0,
+            _not_sync: PhantomData,
         }
     }
 
@@ -211,9 +216,80 @@ impl Tunnel {
         }
 
         // No session yet: hold the packet for when the handshake completes,
-        // then (re)start the handshake. 
+        // then (re)start the handshake.
         self.queue_packet(src);
         self.format_handshake_initiation(dst, claim, false)
+    }
+
+    /// Encrypts a TUN packet already placed in a buffer with 16 bytes of
+    /// headroom (§5.4.5), avoiding the plaintext copy used by [`Self::encapsulate`].
+    pub fn encapsulate_in_place<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+        payload_start: usize,
+        payload_len: usize,
+        claim: IndexClaim<'_>,
+    ) -> TunnelResult<'a, 'a> {
+        let Some(payload_end) = payload_start.checked_add(payload_len) else {
+            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+        };
+        if payload_start < packet::DATA_HEADER_LEN
+            || payload_len > MAX_TRANSPORT_PAYLOAD
+            || payload_end > buffer.len()
+        {
+            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+        }
+
+        if let Some(session) = self.current_session_mut() {
+            match session.format_packet_data_in_place(buffer, payload_start, payload_len) {
+                Ok(packet_range) => {
+                    self.timers.last_packet_sent = Some(Instant::now());
+                    self.tx_bytes += packet_range.len() as u64;
+                    return TunnelResult::WriteToNetwork(&mut buffer[packet_range]);
+                }
+                Err(SessionError::RekeyRequired) => {
+                    self.queue_packet(&buffer[payload_start..payload_end]);
+                    return TunnelResult::RekeyRequired;
+                }
+                Err(error) => return error.into(),
+            }
+        }
+
+        // Until the first session exists, the plaintext must survive the
+        // handshake. Queue it before reusing the slot for the initiation.
+        self.queue_packet(&buffer[payload_start..payload_end]);
+        self.format_handshake_initiation(buffer, claim, false)
+            .into_outbound()
+    }
+
+    /// Encrypts one already-buffered TUN packet without copying or retaining it
+    /// inside `Tunnel`; an inline worker keeps the buffer handle on `NoSession`.
+    pub fn try_encapsulate_in_place<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+        payload_start: usize,
+        payload_len: usize,
+    ) -> TunnelResult<'a, 'a> {
+        let Some(payload_end) = payload_start.checked_add(payload_len) else {
+            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+        };
+        if payload_start < packet::DATA_HEADER_LEN
+            || payload_len > MAX_TRANSPORT_PAYLOAD
+            || payload_end > buffer.len()
+        {
+            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+        }
+        let Some(session) = self.current_session_mut() else {
+            return TunnelResult::NoSession;
+        };
+        match session.format_packet_data_in_place(buffer, payload_start, payload_len) {
+            Ok(packet_range) => {
+                self.timers.last_packet_sent = Some(Instant::now());
+                self.tx_bytes += packet_range.len() as u64;
+                TunnelResult::WriteToNetwork(&mut buffer[packet_range])
+            }
+            Err(error) => error.into(),
+        }
     }
 
     /// Builds handshake initiation into `dst`. A retransmission keeps the index
@@ -242,10 +318,7 @@ impl Tunnel {
         let Some(message) = dst.get_mut(..packet::HANDSHAKE_INIT_LEN) else {
             return TunnelResult::BufferTooSmall;
         };
-        if let Err(error) = self
-            .handshake
-            .format_handshake_init(message, local_index)
-        {
+        if let Err(error) = self.handshake.format_handshake_init(message, local_index) {
             return TunnelResult::InvalidPacket(error.into());
         }
 
@@ -324,9 +397,7 @@ impl Tunnel {
             Ok(PacketMut::HandshakeInitiation(packet)) => {
                 self.handle_handshake_init(packet, dst, claim)
             }
-            Ok(PacketMut::HandshakeResponse(packet)) => {
-                self.handle_handshake_response(packet, dst)
-            }
+            Ok(PacketMut::HandshakeResponse(packet)) => self.handle_handshake_response(packet, dst),
             Ok(PacketMut::CookieReply(packet)) => self.handle_cookie_reply(packet),
             Err(error) => TunnelResult::InvalidPacket(error),
         }
@@ -378,13 +449,14 @@ impl Tunnel {
         // Any failure means the initiation is not authentic, is for another
         // peer, is a replay, or its keys cannot be agreed with ours; we stay
         // silent. The index just claimed is reclaimed by the device.
-        let session = match self
-            .handshake
-            .format_handshake_response(response, &initiation, local_index)
-        {
-            Ok(session) => session,
-            Err(error) => return TunnelResult::InvalidPacket(error.into()),
-        };
+        let session =
+            match self
+                .handshake
+                .format_handshake_response(response, &initiation, local_index)
+            {
+                Ok(session) => session,
+                Err(error) => return TunnelResult::InvalidPacket(error.into()),
+            };
 
         // Filed as pending: the peer's first authenticated packet proves it.
         self.install_session(session, false);
@@ -495,7 +567,10 @@ impl Tunnel {
         let Some(interval) = self.timers.persistent_keepalive else {
             return TimerAction::Nothing;
         };
-        let last_activity = self.timers.last_packet_sent.max(self.timers.last_packet_received);
+        let last_activity = self
+            .timers
+            .last_packet_sent
+            .max(self.timers.last_packet_received);
         let idle = !last_activity.is_some_and(|last| {
             now.checked_duration_since(last)
                 .is_none_or(|age| age < interval)
@@ -565,6 +640,22 @@ impl Tunnel {
         self.handshake.pending_index()
     }
 
+    /// Receiver indices still held by this tunnel, including a handshake in
+    /// flight. The worker uses this list to reclaim stale device-wide claims.
+    pub fn live_indices(&self) -> Vec<u32> {
+        let mut indices = self
+            .sessions
+            .iter()
+            .map(|session| session.local_id)
+            .collect::<Vec<_>>();
+        if let Some(pending) = self.pending_index() {
+            if !indices.contains(&pending) {
+                indices.push(pending);
+            }
+        }
+        indices
+    }
+
     /// Test hook: the session a receiver index resolves to, if any.
     #[cfg(test)]
     pub(super) fn session_for_tests(&self, receiver_index: u32) -> Option<&Session> {
@@ -589,15 +680,18 @@ impl Tunnel {
     pub fn rx_bytes(&self) -> u64 {
         self.rx_bytes
     }
-}
 
+    /// Number of plaintext packets held until a usable session can carry them.
+    pub fn queued_packet_count(&self) -> usize {
+        self.packet_queue.len()
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
     use crate::protocol::session::REJECT_AFTER_TIME;
-
 
     /// Two peers with matching static keys and mirrored indexes.
     pub(super) fn pair() -> (Tunnel, Tunnel) {
@@ -827,7 +921,10 @@ pub(crate) mod tests {
 
         let mut empty: [u8; 0] = [];
         assert!(
-            matches!(a.decapsulate(&mut empty, &mut buf, &mut claimer()), TunnelResult::Done),
+            matches!(
+                a.decapsulate(&mut empty, &mut buf, &mut claimer()),
+                TunnelResult::Done
+            ),
             "an empty datagram must not be read as a drain request"
         );
     }
@@ -1177,7 +1274,10 @@ mod concurrency {
 
         let (a, b) = pair();
         let moved = std::thread::spawn(move || (a.tx_bytes(), b.rx_bytes()));
-        assert_eq!(moved.join().expect("a tunnel must move into a thread"), (0, 0));
+        assert_eq!(
+            moved.join().expect("a tunnel must move into a thread"),
+            (0, 0)
+        );
     }
 
     /// The regression the index scheme exists for: a packet encrypted under S1
@@ -1190,10 +1290,11 @@ mod concurrency {
         // Encrypt a packet under S1 and hold it, as a worker would between
         // receiving it and decrypting it.
         let mut a_buf = vec![0u8; MAX_PACKET_SIZE];
-        let mut in_flight = match a.encapsulate(b"straddles the rehandshake", &mut a_buf, &mut claimer()) {
-            TunnelResult::WriteToNetwork(p) => p.to_vec(),
-            other => panic!("expected a data packet, got {other:?}"),
-        };
+        let mut in_flight =
+            match a.encapsulate(b"straddles the rehandshake", &mut a_buf, &mut claimer()) {
+                TunnelResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("expected a data packet, got {other:?}"),
+            };
         let s1_index = u32::from_le_bytes(in_flight[4..8].try_into().unwrap());
         let s1_id = b.current_session().expect("S1 is installed").local_id;
         assert_eq!(s1_id, s1_index);
@@ -1264,7 +1365,11 @@ mod concurrency {
             b.session_for_tests(first).is_none(),
             "the session two generations back is gone"
         );
-        assert_eq!(b.session_count(), 2, "steady state holds current + previous");
+        assert_eq!(
+            b.session_count(),
+            2,
+            "steady state holds current + previous"
+        );
     }
 
     /// Confirming an index that is not the pending one must do nothing: a

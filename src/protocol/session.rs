@@ -1,6 +1,7 @@
 //! One established transport session: a pair of direction keys plus the
 //! replay window for the receive direction.
 
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use super::packet::{self, DataPacket, WireGuardError};
@@ -60,12 +61,7 @@ pub struct Session {
 impl Session {
     /// Builds a session from a completed handshake. The initiator and responder
     /// pass `sending`/`receiving` in opposite order.
-    pub fn new(
-        local_id: u32,
-        remote_index: u32,
-        sending: &[u8; 32],
-        receiving: &[u8; 32],
-    ) -> Self {
+    pub fn new(local_id: u32, remote_index: u32, sending: &[u8; 32], receiving: &[u8; 32]) -> Self {
         Self {
             local_id,
             remote_index,
@@ -119,6 +115,50 @@ impl Session {
         self.sender.seal_in_place(counter, body);
 
         Ok(total)
+    }
+
+    /// Encrypts a TUN packet in place in a buffer with headroom (§5.4.5).
+    ///
+    /// `payload_start` identifies the first plaintext byte. The caller reads
+    /// the IP packet directly there; this method writes the WireGuard header
+    /// into the preceding 16 bytes and the Poly1305 tag into trailing space.
+    /// The returned range identifies the complete UDP payload in `buffer`.
+    pub fn format_packet_data_in_place(
+        &mut self,
+        buffer: &mut [u8],
+        payload_start: usize,
+        payload_len: usize,
+    ) -> Result<Range<usize>, SessionError> {
+        if payload_len > MAX_TRANSPORT_PAYLOAD || payload_start < packet::DATA_HEADER_LEN {
+            return Err(SessionError::Malformed);
+        }
+        let packet_start = payload_start - packet::DATA_HEADER_LEN;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or(SessionError::Malformed)?;
+        let packet_end = payload_end
+            .checked_add(TAG_LEN)
+            .ok_or(SessionError::Malformed)?;
+        if packet_end > buffer.len() {
+            return Err(SessionError::BufferTooSmall);
+        }
+
+        if self.is_expired(Instant::now()) {
+            return Err(SessionError::RekeyRequired);
+        }
+        let counter = self.sending_counter;
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(SessionError::RekeyRequired);
+        }
+        self.sending_counter = counter + 1;
+
+        let header = &mut buffer[packet_start..payload_start];
+        header[0..4].copy_from_slice(&packet::MSG_DATA.to_le_bytes());
+        header[4..8].copy_from_slice(&self.remote_index.to_le_bytes());
+        header[8..16].copy_from_slice(&counter.to_le_bytes());
+        self.sender
+            .seal_in_place(counter, &mut buffer[payload_start..packet_end]);
+        Ok(packet_start..packet_end)
     }
 
     /// True once the session is too old to send on (§6.3).
@@ -250,6 +290,43 @@ mod tests {
         );
     }
 
+    /// A TUN payload can be framed and authenticated without moving its bytes.
+    #[test]
+    fn in_place_framing_round_trips_with_reserved_headroom() {
+        let (mut sender, mut receiver) = peer_pair();
+        let mut buffer = [0u8; 96];
+        let payload_start = 16;
+        buffer[payload_start..payload_start + 7].copy_from_slice(b"payload");
+
+        let packet_range = sender
+            .format_packet_data_in_place(&mut buffer, payload_start, 7)
+            .unwrap();
+        assert_eq!(packet_range, 0..39);
+        let packet = match Packet::parse_mut(&mut buffer[packet_range]).unwrap() {
+            PacketMut::Data(packet) => packet,
+            other => panic!("expected data packet, got {other:?}"),
+        };
+        let plaintext = receiver.receive_packet_data(packet).unwrap();
+        assert_eq!(plaintext, b"payload");
+    }
+
+    /// In-place framing rejects missing headroom or tag space without spending a nonce.
+    #[test]
+    fn in_place_framing_checks_bounds_before_advancing_the_counter() {
+        let (mut sender, _receiver) = peer_pair();
+        let mut buffer = [0u8; 20];
+        assert_eq!(
+            sender.format_packet_data_in_place(&mut buffer, 16, 7),
+            Err(SessionError::BufferTooSmall)
+        );
+        assert_eq!(sender.sending_counter, 0);
+        assert_eq!(
+            sender.format_packet_data_in_place(&mut buffer, 8, 1),
+            Err(SessionError::Malformed)
+        );
+        assert_eq!(sender.sending_counter, 0);
+    }
+
     /// Past the reject-after age the session stops sending (§6.3).
     #[test]
     fn an_expired_session_refuses_to_send() {
@@ -273,8 +350,8 @@ mod tests {
         let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
         let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
 
-        let Some(aged) =
-            Instant::now().checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK - Duration::from_secs(1))
+        let Some(aged) = Instant::now()
+            .checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK - Duration::from_secs(1))
         else {
             return;
         };
@@ -294,8 +371,7 @@ mod tests {
         let mut datagram = vec![0u8; 4 + DATA_OVERHEAD];
         let n = sender.format_packet_data(b"ping", &mut datagram).unwrap();
 
-        let Some(expired) =
-            Instant::now().checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK)
+        let Some(expired) = Instant::now().checked_sub(REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK)
         else {
             return;
         };
@@ -421,9 +497,7 @@ mod tests {
 
         let mut datagram = [0u8; 6 + DATA_OVERHEAD];
         for _ in 0..(crate::protocol::replay::WINDOW_BITS + 1) {
-            let n = sender
-                .format_packet_data(b"filler", &mut datagram)
-                .unwrap();
+            let n = sender.format_packet_data(b"filler", &mut datagram).unwrap();
             let packet = match Packet::parse_mut(&mut datagram[..n]).unwrap() {
                 PacketMut::Data(packet) => packet,
                 other => panic!("expected a data packet, got {other:?}"),
