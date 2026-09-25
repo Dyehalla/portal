@@ -1,36 +1,44 @@
-use libc::{epoll_create1, epoll_ctl, epoll_wait, epoll_event, EPOLL_CTL_ADD, EINTR};
-use std::{os::fd::RawFd};
-use crate::Error::{self, OS};
-use crate::platform::socket::PacketSource;
-const MAX_EVENTS: usize = 128;  
+use std::io;
+use std::os::fd::RawFd;
 
-pub type EpollFlags = u32;                 
+use crate::index_table::WorkerId;
 
-// Event type, passed to epoll u64 data
-#[repr(u64)]
-#[derive(Clone, Copy)] 
+const MAX_EVENTS: usize = 64;
+
+/// Events returned by the dispatcher poller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventToken {
-    Zero = 0, // only for initialization, never registered
-    UDP = 1,
-    TUN = 2,
+    Udp,
+    Tun,
+    WorkerCompletion(WorkerId),
 }
 
 impl EventToken {
-    pub fn match_token(socket: &PacketSource) -> EventToken {
-        match socket {
-            PacketSource::TUN(_) => EventToken::TUN,
-            // PacketSource::UDP(_) => EventToken::UDP,
+    fn encode(self) -> u64 {
+        match self {
+            Self::Udp => 1,
+            Self::Tun => 2,
+            Self::WorkerCompletion(worker) => ((worker as u64) << 2) | 3,
+        }
+    }
+
+    fn decode(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Udp),
+            2 => Some(Self::Tun),
+            value if value & 3 == 3 => Some(Self::WorkerCompletion((value >> 2) as usize)),
+            _ => None,
         }
     }
 }
 
-// Same thing as epoll_event
-#[derive(Clone, Copy)]  
+/// One ready descriptor.
+#[derive(Debug, Clone, Copy)]
 pub struct Event {
-    pub epoll_flags: EpollFlags,
-    pub token: EventToken
+    pub token: EventToken,
 }
 
+/// Caller-owned storage for one epoll result batch.
 pub struct EventArray {
     pub data: [Event; MAX_EVENTS],
     pub count: usize,
@@ -39,76 +47,70 @@ pub struct EventArray {
 impl EventArray {
     pub fn new() -> Self {
         Self {
-            data: [Event { epoll_flags: 0, token: EventToken::Zero }; MAX_EVENTS],
+            data: [Event {
+                token: EventToken::Udp,
+            }; MAX_EVENTS],
             count: 0,
         }
     }
 }
 
+/// Thin RAII wrapper around one epoll instance.
 pub struct Poller {
     fd: RawFd,
 }
 
 impl Poller {
-    pub fn new() -> Result<Poller, Error> {
-        let epoll_fd = unsafe {epoll_create1(0)};
-        if epoll_fd < 0 {
-            return Err(OS(std::io::Error::last_os_error()))
+    pub fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
-
-        Ok(Poller { fd: epoll_fd })
+        Ok(Self { fd })
     }
 
-    pub fn register_event_trigger(&mut self, token: EventToken, epoll_flags: EpollFlags, fd: RawFd) -> Result<(), Error> {
-        let mut epoll_event = epoll_event {
-            events: epoll_flags,
-            u64: token as u64
+    /// Registers a descriptor for read readiness.
+    pub fn register(&self, token: EventToken, fd: RawFd) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+            u64: token.encode(),
         };
-        
-        let status = unsafe { epoll_ctl(self.fd, EPOLL_CTL_ADD, fd, &mut epoll_event) };
+        let status = unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
         if status < 0 {
-            return Err(OS(std::io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    // Does one event poll, return number of fetched events. Pass -1 for no timeout.
-    // The caller owns the output array — Poller is stateless between calls.
-    pub fn poll(&self, timeout_ms: i32, events: &mut EventArray) -> Result<usize, Error> {
-        let mut raw = [epoll_event {events: 0, u64: 0}; MAX_EVENTS];
-        let event_count = unsafe { epoll_wait(self.fd, raw.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
-
-        if event_count < 0 {
-            // EINTR is not an error, we can continue next time
-            if std::io::Error::last_os_error().raw_os_error() == Some(EINTR) {
-                return Ok(0)
+    /// Waits for readable descriptors and fills caller-owned storage.
+    pub fn poll(&self, timeout_ms: i32, output: &mut EventArray) -> io::Result<usize> {
+        let mut raw = [libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+        let count =
+            unsafe { libc::epoll_wait(self.fd, raw.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms) };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                output.count = 0;
+                return Ok(0);
             }
-            return Err(OS(std::io::Error::last_os_error()));
+            return Err(error);
         }
 
-        let n = event_count as usize;
-        events.count = 0;
-        for event in &raw[..n] {
-            let token = match event.u64 {
-                1 => EventToken::UDP,
-                2 => EventToken::TUN,
-                _ => continue,
+        output.count = 0;
+        for event in &raw[..count as usize] {
+            let raw_token = unsafe { std::ptr::addr_of!(event.u64).read_unaligned() };
+            let Some(token) = EventToken::decode(raw_token) else {
+                continue;
             };
-
-            events.data[events.count] = Event {
-                epoll_flags: event.events,
-                token,
-            };
-            events.count += 1;
+            output.data[output.count] = Event { token };
+            output.count += 1;
         }
-
-        Ok(events.count)
+        Ok(output.count)
     }
-
 }
 
-impl Drop for Poller {                                                                                                                                 
-    fn drop(&mut self) {                                                                                                                               
-        unsafe { libc::close(self.fd) };                                                                                                               
-    }                                                                                                                                                  
-}   
+impl Drop for Poller {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}

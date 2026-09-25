@@ -1,33 +1,21 @@
 //! The peer-facing half of the protocol engine: a thin dispatcher over
 //! `handshake` and `session`, writing into caller-owned buffers.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
-
-use arc_swap::ArcSwapOption;
 
 use super::cookie;
 use super::handshake;
-use super::index::SessionIndex;
 use super::packet::{
     self, CookieReply, DataPacket, HandshakeInitiation, HandshakeResponse, Packet, PacketMut,
-    WireGuardError,
 };
-use super::primitives::{self, DH_PRIVATE, DH_PUBKEY, MAC_LEN, KEY_LEN};
+use super::primitives::KEY_LEN;
 use super::session::{DATA_OVERHEAD, MAX_TRANSPORT_PAYLOAD, Session, SessionError};
 
-pub(crate) const N_SESSIONS: usize = 8;
-/// The ring maps an index to a slot with `% N_SESSIONS`, which is only a
-/// bitmask over the low index bits while this stays a power of two.
-const _: () = assert!(N_SESSIONS.is_power_of_two(), "N_SESSIONS must be a power of two");
+/// How many handshakes may be answered before the oldest session is dropped.
 const MAX_QUEUE_DEPTH: usize = 256;
-const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-/// A data packet is never allowed to sit in the ring longer than this: one
-/// already in flight when the session turns 180s old must not be dropped.
-const REJECT_AFTER_TIME_SLACK: Duration = Duration::from_secs(5);
 
 /// How long to wait for a handshake response before retransmitting (§6.1).
 const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +31,10 @@ enum TimerAction {
 
 pub const MAX_PACKET_SIZE: usize = MAX_TRANSPORT_PAYLOAD + DATA_OVERHEAD;
 
+/// How a tunnel obtains a receiver index. The device owns the routing table,
+/// so only it can guarantee uniqueness; issuing reserves the index.
+pub type IndexClaim<'f> = &'f mut dyn FnMut() -> Option<u32>;
+
 /// Result of one protocol operation. `'d` is the received datagram, `'o` the
 /// output buffer; only one is ever borrowed by a given value.
 #[derive(Debug)]
@@ -52,13 +44,11 @@ pub enum TunnelResult<'d, 'o> {
     Done,
     /// An encrypted WireGuard packet to send over UDP. Borrows `dst`.
     WriteToNetwork(&'o mut [u8]),
-    /// Plaintext to write to the TUN device. Borrows `dst`.
-    WriteToTunnel(&'o mut [u8]),
     /// Plaintext decrypted in place inside the received `datagram`.
     WriteToTunnelInPlace(&'d mut [u8]),
     /// The peer input was malformed, forged, or unusable. Carries the specific
     /// reason. Not a local failure: the caller normally just drops the datagram.
-    InvalidPacket(WireGuardError),
+    InvalidPacket,
     /// The sending counter is exhausted or the session is too old. The caller
     /// should start a fresh handshake.
     RekeyRequired,
@@ -68,6 +58,8 @@ pub enum TunnelResult<'d, 'o> {
     /// No session is established yet, so the tunnel cannot carry this packet.
     /// The caller should wait for the handshake to finish.
     NoSession,
+    /// The output buffer cannot hold the packet that would be produced.
+    BufferTooSmall,
 }
 
 impl<'d, 'o> From<SessionError> for TunnelResult<'d, 'o> {
@@ -75,26 +67,73 @@ impl<'d, 'o> From<SessionError> for TunnelResult<'d, 'o> {
         match error {
             SessionError::RekeyRequired => Self::RekeyRequired,
             // The session's own reason is preserved all the way out.
-            SessionError::Rejected(reason) => Self::InvalidPacket(reason),
-            SessionError::Malformed => Self::InvalidPacket(WireGuardError::InvalidPacket),
+            SessionError::Rejected(_) | SessionError::Malformed => Self::InvalidPacket,
+            SessionError::BufferTooSmall => Self::BufferTooSmall,
         }
     }
 }
 
-/// A single-peer WireGuard transport tunnel.
-pub struct Tunnel {
-    sessions: SessionTable,
-    control: Mutex<ControlState>,
-    tx_bytes: AtomicU64,
-    rx_bytes: AtomicU64,
+/// The sessions a tunnel holds: carrying traffic, superseded, and negotiated.
+/// The fixed count is what stops a flood of initiations growing memory.
+#[derive(Default)]
+struct Sessions {
+    /// Superseded by `current`; kept only while its packets may still arrive.
+    previous: Option<Session>,
+    /// Carries outbound traffic and is what a rekey replaces.
+    current: Option<Session>,
+    /// Negotiated but not yet proved usable by traffic from the peer.
+    next: Option<Session>,
 }
 
-struct SessionTable {
-    slots: [ArcSwapOption<Session>; N_SESSIONS],
-    /// The session outbound traffic uses: the most recent one installed.
-    ///
-    /// A send-side hint only: inbound packets are routed by receiver index.
-    current: ArcSwapOption<Session>,
+impl Sessions {
+    #[cfg(test)]
+    fn by_index(&self, index: u32) -> Option<&Session> {
+        self.iter().find(|session| session.local_id == index)
+    }
+
+    fn by_index_mut(&mut self, index: u32) -> Option<&mut Session> {
+        self.iter_mut().find(|session| session.local_id == index)
+    }
+
+    fn current(&self) -> Option<&Session> {
+        self.current.as_ref()
+    }
+
+    fn current_mut(&mut self) -> Option<&mut Session> {
+        self.current.as_mut()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Session> {
+        self.previous
+            .iter()
+            .chain(self.current.iter())
+            .chain(self.next.iter())
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Session> {
+        self.previous
+            .iter_mut()
+            .chain(self.current.iter_mut())
+            .chain(self.next.iter_mut())
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.iter().count()
+    }
+}
+
+/// A single-peer WireGuard transport tunnel. Owned exclusively by one thread:
+/// no field is shared, so the protocol path needs no synchronization.
+pub struct Tunnel {
+    sessions: Sessions,
+    handshake: handshake::Handshake,
+    timers: Timers,
+    packet_queue: VecDeque<Vec<u8>>,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    /// Encodes the single-thread owner invariant: movable, never shareable.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 #[derive(Default)]
@@ -105,196 +144,219 @@ struct Timers {
     persistent_keepalive: Option<Duration>,
 }
 
-struct ControlState {
-    handshake: handshake::Handshake,
-    timers: Timers,
-    packet_queue: VecDeque<Vec<u8>>,
-}
-
-impl SessionTable {
-    fn empty() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| ArcSwapOption::empty()),
-            current: ArcSwapOption::empty(),
-        }
-    }
-}
-
-impl Default for SessionTable {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-/// True when a session may no longer carry traffic at all. A dead slot can be
-/// recycled: nothing still on the wire can be addressed to it.
-fn is_dead(session: &Session) -> bool {
-    session.created_at.elapsed() >= REJECT_AFTER_TIME + REJECT_AFTER_TIME_SLACK
-}
-
-impl Default for ControlState {
-    fn default() -> Self {
-        Self {
-            handshake: handshake::Handshake::default(),
-            timers: Timers::default(),
-            packet_queue: VecDeque::new(),
-        }
-    }
-}
-
 impl Tunnel {
     pub fn new(
         static_private: [u8; KEY_LEN],
         peer_static_public: [u8; KEY_LEN],
         preshared_key: Option<[u8; KEY_LEN]>,
         persistent_keepalive: Option<Duration>,
-        peer_index: u32,
     ) -> Self {
         Self {
-            sessions: SessionTable::default(),
-            control: Mutex::new(ControlState {
-                handshake: handshake::Handshake::new(
-                    static_private,
-                    peer_static_public,
-                    preshared_key,
-                    SessionIndex::new(peer_index),
-                ),
-                timers: Timers {
-                    persistent_keepalive,
-                    ..Timers::default()
-                },
-                packet_queue: VecDeque::new(),
-            }),
-            tx_bytes: AtomicU64::new(0),
-            rx_bytes: AtomicU64::new(0),
+            sessions: Sessions::default(),
+            handshake: handshake::Handshake::new(static_private, peer_static_public, preshared_key),
+            timers: Timers {
+                persistent_keepalive,
+                ..Timers::default()
+            },
+            packet_queue: VecDeque::new(),
+            tx_bytes: 0,
+            rx_bytes: 0,
+            _not_sync: PhantomData,
         }
     }
 
-    /// Encrypts one IP packet into `dst` (`MAX_PACKET_SIZE` bytes); without a
-    /// session this writes an initiation and queues the packet instead.
-    pub fn encapsulate<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
-        if let Some(session) = self.current_session() {
-            let written = match session.format_packet_data(src, dst) {
-                Ok(written) => written,
+    /// Encrypts one IP packet into `dst`; without a session this writes an
+    /// initiation and queues the packet. `claim` is used only then.
+    pub fn encapsulate<'a>(
+        &mut self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        claim: IndexClaim<'_>,
+    ) -> TunnelResult<'_, 'a> {
+        if let Some(session) = self.current_session_mut() {
+            match session.format_packet_data(src, dst) {
+                Ok(written) => {
+                    self.timers.last_packet_sent = Some(Instant::now());
+
+                    // `written` is the whole datagram, header and tag included:
+                    // the counter reports bytes on the wire, not payload (§6.6).
+                    self.tx_bytes += written as u64;
+                    return TunnelResult::WriteToNetwork(&mut dst[..written]);
+                }
+                // Expired or exhausted: the packet is held, not lost, and the
+                // caller starts the fresh handshake `RekeyRequired` asks for.
+                Err(SessionError::RekeyRequired) => {
+                    self.queue_packet(src);
+                    return TunnelResult::RekeyRequired;
+                }
                 Err(error) => return error.into(),
-            };
-
-            self.control().timers.last_packet_sent = Some(Instant::now());
-
-            // `written` is the whole datagram, header and tag included: the
-            // counter reports bytes on the wire, not payload (§6.6).
-            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
-            return TunnelResult::WriteToNetwork(&mut dst[..written]);
+            }
         }
 
         // No session yet: hold the packet for when the handshake completes,
-        // then (re)start the handshake. 
+        // then (re)start the handshake.
         self.queue_packet(src);
-        self.format_handshake_initiation(dst, false)
+        self.format_handshake_initiation(dst, claim, false)
     }
 
-    /// Builds handshake initiation into `dst`.
-    /// One handshake is in flight at a time; `force_resend` retransmits it.
+    /// Encrypts one already-buffered TUN packet without copying or retaining it
+    /// inside `Tunnel`; an inline worker keeps the buffer handle on `NoSession`.
+    pub fn try_encapsulate_in_place<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+        payload_start: usize,
+        payload_len: usize,
+    ) -> TunnelResult<'a, 'a> {
+        let Some(payload_end) = payload_start.checked_add(payload_len) else {
+            return TunnelResult::InvalidPacket;
+        };
+        if payload_start < packet::DATA_HEADER_LEN
+            || payload_len > MAX_TRANSPORT_PAYLOAD
+            || payload_end > buffer.len()
+        {
+            return TunnelResult::InvalidPacket;
+        }
+        let Some(session) = self.current_session_mut() else {
+            return TunnelResult::NoSession;
+        };
+        match session.format_packet_data_in_place(buffer, payload_start, payload_len) {
+            Ok(packet_range) => {
+                self.timers.last_packet_sent = Some(Instant::now());
+                self.tx_bytes += packet_range.len() as u64;
+                TunnelResult::WriteToNetwork(&mut buffer[packet_range])
+            }
+            Err(error) => error.into(),
+        }
+    }
+
+    /// Builds handshake initiation into `dst`. A retransmission keeps the index
+    /// already claimed; a fresh handshake asks the device for one.
     pub fn format_handshake_initiation<'a>(
-        &self,
+        &mut self,
         dst: &'a mut [u8],
+        claim: IndexClaim<'_>,
         force_resend: bool,
     ) -> TunnelResult<'_, 'a> {
-        let mut control = self.control();
-
-        if control.handshake.has_pending_response() && !force_resend {
+        if self.handshake.has_pending_response() && !force_resend {
             return TunnelResult::HandshakeInProgress;
         }
 
-        let message = &mut dst[..packet::HANDSHAKE_INIT_LEN];
-        if let Err(error) = control.handshake.format_handshake_init(message) {
-            return TunnelResult::InvalidPacket(error.into());
+        // A retransmit reuses the claim: the peer may already have answered
+        // the first attempt, addressed to that very index.
+        let local_index = match self.handshake.pending_index() {
+            Some(existing) if force_resend => existing,
+            _ => match claim() {
+                Some(index) => index,
+                // Every 32-bit value is taken: nothing sane is left to do.
+                None => return TunnelResult::InvalidPacket,
+            },
+        };
+
+        let Some(message) = dst.get_mut(..packet::HANDSHAKE_INIT_LEN) else {
+            return TunnelResult::BufferTooSmall;
+        };
+        if self
+            .handshake
+            .format_handshake_init(message, local_index)
+            .is_err()
+        {
+            return TunnelResult::InvalidPacket;
         }
 
         let now = Instant::now();
-        control.timers.last_handshake = Some(now);
-        control.timers.last_packet_sent = Some(now);
-        drop(control);
+        self.timers.last_handshake = Some(now);
+        self.timers.last_packet_sent = Some(now);
 
         TunnelResult::WriteToNetwork(message)
     }
 
     /// Stores a packet until a session can carry it.
-    fn queue_packet(&self, src: &[u8]) {
-        let mut control = self.control();
-        if control.packet_queue.len() < MAX_QUEUE_DEPTH {
-            control.packet_queue.push_back(src.to_vec());
+    fn queue_packet(&mut self, src: &[u8]) {
+        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
+            self.packet_queue.push_back(src.to_vec());
         }
     }
 
-    /// Sends the oldest queued packet. Called with an empty input until it
-    fn send_queued_packet<'d, 'a>(&self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
-        let mut control = self.control();
-        let Some(src) = control.packet_queue.pop_front() else {
+    /// Sends the oldest held packet. Call until it stops returning
+    /// `WriteToNetwork`: `Done` is empty, `NoSession` means it went back.
+    #[cfg(test)]
+    pub fn send_queued_packet<'d, 'a>(&mut self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
+        let Some(src) = self.packet_queue.pop_front() else {
             return TunnelResult::Done;
         };
-        drop(control);
 
-        if let Some(session) = self.current_session() {
-            let written = match session.format_packet_data(&src, dst) {
-                Ok(written) => written,
-                Err(error) => return error.into(),
-            };
-            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
-            return TunnelResult::WriteToNetwork(&mut dst[..written]);
+        if let Some(session) = self.current_session_mut() {
+            match session.format_packet_data(&src, dst) {
+                Ok(written) => {
+                    self.tx_bytes += written as u64;
+                    return TunnelResult::WriteToNetwork(&mut dst[..written]);
+                }
+                Err(error) => {
+                    // Like the no-session case, the packet keeps its place at
+                    // the front instead of being dropped.
+                    self.packet_queue.push_front(src);
+                    return error.into();
+                }
+            }
         }
 
-        // Session disappeared meanwhile: put the packet back at the front.
-        let mut control = self.control();
-        if control.packet_queue.len() < MAX_QUEUE_DEPTH {
-            control.packet_queue.push_front(src);
-        }
+        // The session vanished between the pop and here: put the packet back
+        // so it keeps its place. It just vacated a slot, so no depth check.
+        self.packet_queue.push_front(src);
         TunnelResult::NoSession
     }
 
-    /// Locks the control state. A poisoned lock means a thread panicked
-    /// mid-update, leaving state we cannot repair: panicking is the honest exit.
-    fn control(&self) -> std::sync::MutexGuard<'_, ControlState> {
-        self.control.lock().expect("control lock poisoned")
+    /// Test hook: queues a packet as if `encapsulate` had held it.
+    #[cfg(test)]
+    pub(super) fn queue_for_tests(&mut self, src: &[u8]) {
+        self.queue_packet(src);
     }
 
+    /// Test hook: the payloads the queue currently holds, oldest first.
+    #[cfg(test)]
+    pub(super) fn queued_for_tests(&self) -> Vec<Vec<u8>> {
+        self.packet_queue.iter().cloned().collect()
+    }
 
     /// Parses one incoming datagram. `datagram` is `&mut` because a data packet
     /// is decrypted in place there; an empty one drains the queued backlog.
     pub fn decapsulate<'a, 'o>(
-        &self,
+        &mut self,
         datagram: &'a mut [u8],
         dst: &'o mut [u8],
+        claim: IndexClaim<'_>,
     ) -> TunnelResult<'a, 'o> {
+        // An empty datagram is inert input, not a command: draining the queue
+        // is `send_queued_packet`, which the caller drives in its own loop.
         if datagram.is_empty() {
-            // Nothing to decrypt; the queued packets are written to `dst`.
-            return self.send_queued_packet(dst);
+            return TunnelResult::Done;
         }
 
         // mac1/mac2 are verified by the device before it looks the peer up,
         // so a cookie reply never reaches this far.
         match Packet::parse_mut(datagram) {
             Ok(PacketMut::Data(packet)) => self.handle_data(packet),
-            Ok(PacketMut::HandshakeInitiation(packet)) => self.handle_handshake_init(packet, dst),
-            Ok(PacketMut::HandshakeResponse(packet)) => {
-                self.handle_handshake_response(packet, dst)
+            Ok(PacketMut::HandshakeInitiation(packet)) => {
+                self.handle_handshake_init(packet, dst, claim)
             }
+            Ok(PacketMut::HandshakeResponse(packet)) => self.handle_handshake_response(packet, dst),
             Ok(PacketMut::CookieReply(packet)) => self.handle_cookie_reply(packet),
-            Err(error) => TunnelResult::InvalidPacket(error),
+            Err(_) => TunnelResult::InvalidPacket,
         }
     }
 
     /// Decrypts a transport-data packet in place; the plaintext borrows the
-    /// datagram buffer, not `dst`. The session is chosen by the packet's own
-    /// receiver index, so a packet from the previous session still decrypts.
-    fn handle_data<'a, 'o>(&self, packet: DataPacket<'a>) -> TunnelResult<'a, 'o> {
-        let Some(session) = self.session_for(packet.receiver_index) else {
-            return TunnelResult::NoSession;
-        };
-
+    /// datagram, not `dst`. The session comes from the packet's own index.
+    fn handle_data<'a, 'o>(&mut self, packet: DataPacket<'a>) -> TunnelResult<'a, 'o> {
         // Capture the on-wire size before decrypting: `open_in_place` leaves
         // only the plaintext, and the header is carved off by `parse_mut`.
         let wire_len = packet.encrypted_payload.len() + packet::DATA_HEADER_LEN;
+
+        // Lookup before any key work, so an index nobody holds costs no AEAD.
+        let receiver_index = packet.receiver_index;
+        let Some(session) = self.sessions.by_index_mut(receiver_index) else {
+            return TunnelResult::NoSession;
+        };
 
         // The payload is decrypted in place inside the received datagram
         let plaintext = match session.receive_packet_data(packet) {
@@ -302,61 +364,61 @@ impl Tunnel {
             Err(error) => return error.into(),
         };
 
-        self.control().timers.last_packet_received = Some(Instant::now());
+        // Authenticated traffic is what proves a negotiated session usable, so
+        // only here does it displace the one in use.
+        self.confirm_session(receiver_index);
+        self.timers.last_packet_received = Some(Instant::now());
 
-        self.rx_bytes.fetch_add(wire_len as u64, Ordering::Relaxed);
+        self.rx_bytes += wire_len as u64;
         TunnelResult::WriteToTunnelInPlace(plaintext)
     }
 
     /// Answers a handshake initiation.
     fn handle_handshake_init<'d, 'a>(
-        &self,
+        &mut self,
         initiation: HandshakeInitiation<'_>,
         dst: &'a mut [u8],
+        claim: IndexClaim<'_>,
     ) -> TunnelResult<'d, 'a> {
-        let response = &mut dst[..packet::HANDSHAKE_RESPONSE_LEN];
-        let mut control = self.control();
-
-        // Any failure means the initiation is not authentic, is for another
-        // peer, or its keys cannot be agreed with ours; we stay silent.
-        let (session, index) = match control
-            .handshake
-            .format_handshake_response(response, &initiation)
-        {
-            Ok(pair) => pair,
-            Err(error) => return TunnelResult::InvalidPacket(error.into()),
+        let Some(response) = dst.get_mut(..packet::HANDSHAKE_RESPONSE_LEN) else {
+            return TunnelResult::BufferTooSmall;
         };
 
-        // The responder can read the initiator's traffic as soon as it replies.
-        // If the ring refuses the session, the response must not go out: the
-        // peer would encrypt to an index we cannot receive on.
-        if !self.install_session(session) {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        }
-        debug_assert_eq!(index, self.sessions.slots[index as usize % N_SESSIONS]
-            .load_full()
-            .map(|s| s.local_id)
-            .unwrap_or_default());
+        let Some(local_index) = claim() else {
+            return TunnelResult::InvalidPacket;
+        };
+
+        // Any failure means the initiation is not authentic, is for another
+        // peer, is a replay, or its keys cannot be agreed with ours; we stay
+        // silent. The index just claimed is reclaimed by the device.
+        let session =
+            match self
+                .handshake
+                .format_handshake_response(response, &initiation, local_index)
+            {
+                Ok(session) => session,
+                Err(_) => return TunnelResult::InvalidPacket,
+            };
+
+        // Filed as pending: the peer's first authenticated packet proves it.
+        self.install_session(session, false);
 
         let now = Instant::now();
-        control.timers.last_packet_received = Some(now);
-        control.timers.last_packet_sent = Some(now);
+        self.timers.last_packet_received = Some(now);
+        self.timers.last_packet_sent = Some(now);
 
         TunnelResult::WriteToNetwork(response)
     }
 
-    /// Consumes a handshake response, activates the session and confirms it
-    /// with a keepalive.
+    /// Consumes a response, activates the session and confirms with a keepalive.
     fn handle_handshake_response<'d, 'a>(
-        &self,
+        &mut self,
         response: HandshakeResponse<'_>,
         dst: &'a mut [u8],
     ) -> TunnelResult<'d, 'a> {
-        let mut control = self.control();
-
-        let (session, _index) = match control.handshake.consume_response(&response) {
-            Ok(pair) => pair,
-            Err(error) => return TunnelResult::InvalidPacket(error.into()),
+        let mut session = match self.handshake.consume_response(&response) {
+            Ok(session) => session,
+            Err(_) => return TunnelResult::InvalidPacket,
         };
 
         // The initiator proves liveness with a keepalive, which also tells the
@@ -366,99 +428,91 @@ impl Tunnel {
             Err(error) => return error.into(),
         };
 
-        if !self.install_session(session) {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        }
+        // The keepalive just built proves the session works, so use it now.
+        self.install_session(session, true);
 
         let now = Instant::now();
-        control.timers.last_packet_received = Some(now);
-        control.timers.last_packet_sent = Some(now);
-        control.timers.last_handshake = Some(now);
-        drop(control);
+        self.timers.last_packet_received = Some(now);
+        self.timers.last_packet_sent = Some(now);
+        self.timers.last_handshake = Some(now);
 
         TunnelResult::WriteToNetwork(&mut dst[..written])
     }
 
     /// Stores the cookie from a cookie reply for use in `mac2` (§5.4.4/§5.4.7).
     /// Unwrapping with the answered initiation's `mac1` binds it to that handshake.
-    fn handle_cookie_reply<'d, 'o>(&self, reply: CookieReply<'_>) -> TunnelResult<'d, 'o> {
+    fn handle_cookie_reply<'d, 'o>(&mut self, reply: CookieReply<'_>) -> TunnelResult<'d, 'o> {
         let now = Instant::now();
-        let mut control = self.control();
-        // Read the peer key before any further `control()` call: the mutex is
-        // not reentrant, so calling the accessor while holding it would hang.
-        let peer_static_public = control.handshake.peer_static_public;
+        let peer_static_public = self.handshake.peer_static_public;
 
         let (Some(our_index), Some(our_mac1)) = (
-            control.handshake.pending_index(),
-            control.handshake.last_sent_mac1().copied(),
+            self.handshake.pending_index(),
+            self.handshake.last_sent_mac1().copied(),
         ) else {
-            // Nothing in flight, so this reply answers a handshake we have
-            // already abandoned.
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+            // Nothing in flight: this answers a handshake we already abandoned.
+            return TunnelResult::InvalidPacket;
         };
 
         match cookie::open_cookie_reply(&peer_static_public, &reply, our_index, &our_mac1) {
             Ok(cookie) => {
-                control.handshake.store_cookie(cookie, now);
+                self.handshake.store_cookie(cookie, now);
                 TunnelResult::Done
             }
-            Err(error) => TunnelResult::InvalidPacket(error),
+            Err(_) => TunnelResult::InvalidPacket,
         }
     }
 
-    /// Advances timers and acts on whatever came due: retransmitting a stalled
-    /// handshake, starting a new one, or sending a keepalive. `dst` must satisfy
-    /// the same contract as `encapsulate`; the tunnel starts its own handshake.
-    pub fn update_timers<'a>(&self, now: Instant, dst: &'a mut [u8]) -> TunnelResult<'_, 'a> {
-        let decision = {
-            let control = self.control();
-
+    /// Acts on whatever came due: retransmit a stalled handshake, start a new
+    /// one, or send a keepalive. `dst` follows the `encapsulate` contract.
+    pub fn update_timers<'a>(
+        &mut self,
+        now: Instant,
+        dst: &'a mut [u8],
+        claim: IndexClaim<'_>,
+    ) -> TunnelResult<'_, 'a> {
+        let decision = if self.handshake.has_pending_response() {
             // An initiation is in flight: retransmit once the timeout passes.
-            if control.handshake.has_pending_response() {
-                let elapsed = control
-                    .timers
-                    .last_handshake
-                    .and_then(|started| now.checked_duration_since(started));
-                if elapsed.is_some_and(|age| age >= REKEY_TIMEOUT) {
-                    TimerAction::Initiate
-                } else {
-                    TimerAction::Nothing
-                }
+            let elapsed = self
+                .timers
+                .last_handshake
+                .and_then(|started| now.checked_duration_since(started));
+            if elapsed.is_some_and(|age| age >= REKEY_TIMEOUT) {
+                TimerAction::Initiate
             } else {
-                self.session_timer_action(&control, now)
+                TimerAction::Nothing
             }
+        } else {
+            self.session_timer_action(now)
         };
 
         match decision {
             TimerAction::Nothing => TunnelResult::Done,
-            TimerAction::Initiate => self.format_handshake_initiation(dst, true),
-            TimerAction::Keepalive => self.encapsulate(&[], dst),
+            TimerAction::Initiate => self.format_handshake_initiation(dst, claim, true),
+            TimerAction::Keepalive => self.encapsulate(&[], dst, claim),
         }
     }
 
     /// Decides what an established (or absent) session requires. Split out
     /// because the timer path and the tests want the same reasoning.
-    fn session_timer_action(&self, control: &ControlState, now: Instant) -> TimerAction {
+    fn session_timer_action(&self, now: Instant) -> TimerAction {
         let Some(session) = self.current_session() else {
             // Nothing to keep alive, and no session to replace: `encapsulate`
             // will start a handshake when there is actually a packet to send.
             return TimerAction::Nothing;
         };
 
-        let age = now.checked_duration_since(session.created_at);
-
         // Past the hard limit the session must not carry more traffic.
-        if age.is_some_and(|age| age >= REJECT_AFTER_TIME) {
+        if session.is_expired(now) {
             return TimerAction::Initiate;
         }
 
-        let Some(interval) = control.timers.persistent_keepalive else {
+        let Some(interval) = self.timers.persistent_keepalive else {
             return TimerAction::Nothing;
         };
-        let last_activity = control
+        let last_activity = self
             .timers
             .last_packet_sent
-            .max(control.timers.last_packet_received);
+            .max(self.timers.last_packet_received);
         let idle = !last_activity.is_some_and(|last| {
             now.checked_duration_since(last)
                 .is_none_or(|age| age < interval)
@@ -471,61 +525,118 @@ impl Tunnel {
         }
     }
 
-    /// Registers a new session in the ring and makes it current. Returns
-    /// `false` when that would evict a session another worker may still be
-    /// decrypting against; a slot may only be reused once its session is dead.
-    fn install_session(&self, session: Session) -> bool {
-        let slot = session.local_id as usize % N_SESSIONS;
+    /// Files a session, returning its index. As *responder* it waits in `next`
+    /// until traffic proves it; as *initiator* the keepalive already did.
+    fn install_session(&mut self, session: Session, usable: bool) -> u32 {
+        let index = session.local_id;
 
-        if let Some(existing) = self.sessions.slots[slot].load_full() {
-            // Same index means a retransmission of a handshake we already
-            // answered; refreshing it is fine and must not be refused.
-            if existing.local_id != session.local_id && !is_dead(&existing) {
-                return false;
-            }
+        // A retransmission of a handshake already answered refreshes in place.
+        if let Some(existing) = self.sessions.by_index_mut(index) {
+            *existing = session;
+            return index;
         }
 
-        let session = Arc::new(session);
-        self.sessions.slots[slot].store(Some(Arc::clone(&session)));
-        self.sessions.current.store(Some(session));
+        if usable {
+            // The session we supersede becomes `previous`; the one before it
+            // is past helping and goes.
+            self.sessions.previous = self.sessions.current.replace(session);
+            return index;
+        }
+
+        self.sessions.next = Some(session);
+        index
+    }
+
+    /// Promotes the negotiated session once the peer sends traffic on it: the
+    /// only moment `current` changes, so initiations cannot disturb it.
+    fn confirm_session(&mut self, index: u32) -> bool {
+        let Some(next) = self.sessions.next.as_ref() else {
+            return false;
+        };
+        if next.local_id != index {
+            return false;
+        }
+
+        let mut confirmed = self.sessions.next.take().expect("checked above");
+        confirmed.confirmed = true;
+        // The session being replaced is still needed for packets in flight.
+        self.sessions.previous = self.sessions.current.replace(confirmed);
         true
     }
 
-    /// Finds the session a received packet is addressed to. Routing is by the
-    /// full 32-bit receiver index, not the slot: the slot is only a cache
-    /// position and may since have been reused by a different session.
-    fn session_for(&self, receiver_index: u32) -> Option<Arc<Session>> {
-        let slot = receiver_index as usize % N_SESSIONS;
-        let session = self.sessions.slots[slot].load_full()?;
+    /// The position of the session filed under `index`, if any.
+    #[cfg(test)]
+    pub fn slot_of(&self, index: u32) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.local_id == index)
+    }
 
-        if session.local_id != receiver_index {
-            // A forged index, or a session whose slot was reused. Refusing
-            // stops it being decrypted under a stranger's keys.
-            return None;
+    /// Number of sessions held, at most three.
+    #[cfg(test)]
+    pub fn session_count(&self) -> usize {
+        self.sessions.count()
+    }
+
+    /// The index a handshake in flight has claimed, if any. It is routable
+    /// before its session exists, because the response names it.
+    pub fn pending_index(&self) -> Option<u32> {
+        self.handshake.pending_index()
+    }
+
+    /// Receiver indices still held by this tunnel, including a handshake in
+    /// flight. The worker uses this list to reclaim stale device-wide claims.
+    pub fn live_indices(&self) -> Vec<u32> {
+        let mut indices = self
+            .sessions
+            .iter()
+            .map(|session| session.local_id)
+            .collect::<Vec<_>>();
+        if let Some(pending) = self.pending_index() {
+            if !indices.contains(&pending) {
+                indices.push(pending);
+            }
         }
-        Some(session)
+        indices
     }
 
-    fn current_session(&self) -> Option<Arc<Session>> {
-        self.sessions.current.load_full()
+    /// Test hook: the session a receiver index resolves to, if any.
+    #[cfg(test)]
+    pub(super) fn session_for_tests(&self, receiver_index: u32) -> Option<&Session> {
+        self.sessions.by_index(receiver_index)
     }
 
+    /// The session outbound traffic uses. `current` is set only next to the
+    /// slot it names, so a stale pointer is a bug; `None` beats a panic here.
+    fn current_session_mut(&mut self) -> Option<&mut Session> {
+        self.sessions.current_mut()
+    }
+
+    /// The session outbound traffic currently uses.
+    pub(super) fn current_session(&self) -> Option<&Session> {
+        self.sessions.current()
+    }
 
     pub fn tx_bytes(&self) -> u64 {
-        self.tx_bytes.load(Ordering::Relaxed)
+        self.tx_bytes
     }
 
     pub fn rx_bytes(&self) -> u64 {
-        self.rx_bytes.load(Ordering::Relaxed)
+        self.rx_bytes
+    }
+
+    /// Number of plaintext packets held until a usable session can carry them.
+    #[cfg(test)]
+    pub fn queued_packet_count(&self) -> usize {
+        self.packet_queue.len()
     }
 }
 
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
-
+    use crate::protocol::session::REJECT_AFTER_TIME;
 
     /// Two peers with matching static keys and mirrored indexes.
     pub(super) fn pair() -> (Tunnel, Tunnel) {
@@ -534,64 +645,79 @@ mod tests {
         let a_public = DH_PUBKEY(&DH_PRIVATE(&a_private));
         let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
 
-        let a = Tunnel::new(a_private, b_public, None, None, 11);
-        let b = Tunnel::new(b_private, a_public, None, None, 22);
+        let a = Tunnel::new(a_private, b_public, None, None);
+        let b = Tunnel::new(b_private, a_public, None, None);
         (a, b)
+    }
+
+    /// Stands in for the device's allocator: the device is the sole issuer, so
+    /// the counter is shared and never repeats a value.
+    pub(crate) fn claimer() -> impl FnMut() -> Option<u32> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0x4000_0003);
+
+        // One process-wide counter, so no two draws anywhere are equal: the
+        // device is a single issuer and never repeats an index.
+        move || Some(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     fn dst() -> Vec<u8> {
         vec![0u8; MAX_PACKET_SIZE]
     }
 
-    /// Runs a full handshake between two peers.
+    /// Runs a full handshake between two peers. `a` and `b` stand for two
+    /// devices, so each issues its own indices and their slots stay unrelated.
     pub(super) fn handshake(a: &mut Tunnel, b: &mut Tunnel) {
+        let mut a_claim = claimer();
+        let mut b_claim = claimer();
         let mut a_buf = dst();
         let mut b_buf = dst();
 
-        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+        let mut init = match a.encapsulate(b"hi", &mut a_buf, &mut a_claim) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected initiation, got {other:?}"),
         };
 
-        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+        let mut response = match b.decapsulate(&mut init, &mut b_buf, &mut b_claim) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected response, got {other:?}"),
         };
 
-        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf) {
+        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf, &mut a_claim) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected keepalive, got {other:?}"),
         };
 
-        match b.decapsulate(&mut keepalive, &mut b_buf) {
+        match b.decapsulate(&mut keepalive, &mut b_buf, &mut b_claim) {
             TunnelResult::WriteToTunnelInPlace(payload) => assert!(payload.is_empty()),
             other => panic!("expected empty keepalive payload, got {other:?}"),
         }
     }
 
-    /// Runs a handshake between peers that already have a session, i.e. a
-    /// rekey. Unlike [`handshake`] this cannot start from `encapsulate`, which
-    /// writes data whenever a session exists.
+    /// Runs a rekey between peers that already have a session. Unlike
+    /// [`handshake`] it cannot start from `encapsulate`, which writes data.
     pub(super) fn exchange_handshake(a: &mut Tunnel, b: &mut Tunnel) {
+        let mut a_claim = claimer();
+        let mut b_claim = claimer();
         let mut a_buf = dst();
         let mut b_buf = dst();
 
-        let mut init = match a.format_handshake_initiation(&mut a_buf, false) {
+        let mut init = match a.format_handshake_initiation(&mut a_buf, &mut a_claim, false) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a rekey initiation, got {other:?}"),
         };
 
-        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+        let mut response = match b.decapsulate(&mut init, &mut b_buf, &mut b_claim) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a rekey response, got {other:?}"),
         };
 
-        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf) {
+        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf, &mut a_claim) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a rekey keepalive, got {other:?}"),
         };
 
-        match b.decapsulate(&mut keepalive, &mut b_buf) {
+        match b.decapsulate(&mut keepalive, &mut b_buf, &mut b_claim) {
             TunnelResult::WriteToTunnelInPlace(payload) => assert!(payload.is_empty()),
             other => panic!("expected an empty rekey keepalive, got {other:?}"),
         }
@@ -604,12 +730,12 @@ mod tests {
 
         let mut a_buf = dst();
         let mut b_buf = dst();
-        let mut packet = match a.encapsulate(b"an IP packet", &mut a_buf) {
+        let mut packet = match a.encapsulate(b"an IP packet", &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a data packet, got {other:?}"),
         };
 
-        match b.decapsulate(&mut packet, &mut b_buf) {
+        match b.decapsulate(&mut packet, &mut b_buf, &mut claimer()) {
             TunnelResult::WriteToTunnelInPlace(payload) => {
                 assert_eq!(payload, b"an IP packet");
             }
@@ -625,20 +751,20 @@ mod tests {
         let mut a_buf = dst();
         let mut b_buf = dst();
 
-        let mut from_a = match a.encapsulate(b"ping", &mut a_buf) {
+        let mut from_a = match a.encapsulate(b"ping", &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a data packet, got {other:?}"),
         };
         assert!(matches!(
-            b.decapsulate(&mut from_a, &mut b_buf),
+            b.decapsulate(&mut from_a, &mut b_buf, &mut claimer()),
             TunnelResult::WriteToTunnelInPlace(_)
         ));
 
-        let mut from_b = match b.encapsulate(b"pong", &mut b_buf) {
+        let mut from_b = match b.encapsulate(b"pong", &mut b_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a data packet, got {other:?}"),
         };
-        match a.decapsulate(&mut from_b, &mut a_buf) {
+        match a.decapsulate(&mut from_b, &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToTunnelInPlace(payload) => assert_eq!(payload, b"pong"),
             other => panic!("expected plaintext, got {other:?}"),
         }
@@ -650,19 +776,19 @@ mod tests {
         let mut a_buf = dst();
         let mut b_buf = dst();
 
-        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+        let mut init = match a.encapsulate(b"hi", &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected initiation, got {other:?}"),
         };
-        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+        let mut response = match b.decapsulate(&mut init, &mut b_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected response, got {other:?}"),
         };
 
         response[44] ^= 0x01;
         assert!(matches!(
-            a.decapsulate(&mut response, &mut a_buf),
-            TunnelResult::InvalidPacket(WireGuardError::HandshakeNotAuthentic)
+            a.decapsulate(&mut response, &mut a_buf, &mut claimer()),
+            TunnelResult::InvalidPacket
         ));
     }
 
@@ -672,22 +798,22 @@ mod tests {
         let mut a_buf = dst();
         let mut b_buf = dst();
 
-        let mut init = match a.encapsulate(b"hi", &mut a_buf) {
+        let mut init = match a.encapsulate(b"hi", &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected initiation, got {other:?}"),
         };
-        let mut response = match b.decapsulate(&mut init, &mut b_buf) {
+        let mut response = match b.decapsulate(&mut init, &mut b_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected response, got {other:?}"),
         };
 
         assert!(matches!(
-            a.decapsulate(&mut response, &mut a_buf),
+            a.decapsulate(&mut response, &mut a_buf, &mut claimer()),
             TunnelResult::WriteToNetwork(_)
         ));
         assert!(matches!(
-            a.decapsulate(&mut response, &mut a_buf),
-            TunnelResult::InvalidPacket(_)
+            a.decapsulate(&mut response, &mut a_buf, &mut claimer()),
+            TunnelResult::InvalidPacket
         ));
     }
 
@@ -696,7 +822,7 @@ mod tests {
         let mut buf = dst();
         let (mut a, _b) = pair();
 
-        match a.encapsulate(b"hello", &mut buf) {
+        match a.encapsulate(b"hello", &mut buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => {
                 assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
             }
@@ -713,11 +839,11 @@ mod tests {
         let (mut a, _b) = pair();
 
         assert!(matches!(
-            a.encapsulate(b"hello", &mut buf),
+            a.encapsulate(b"hello", &mut buf, &mut claimer()),
             TunnelResult::WriteToNetwork(_)
         ));
         assert!(matches!(
-            a.encapsulate(b"second", &mut buf),
+            a.encapsulate(b"second", &mut buf, &mut claimer()),
             TunnelResult::HandshakeInProgress
         ));
     }
@@ -728,13 +854,74 @@ mod tests {
         let (mut a, _b) = pair();
 
         assert!(matches!(
-            a.encapsulate(b"hello", &mut buf),
+            a.encapsulate(b"hello", &mut buf, &mut claimer()),
             TunnelResult::WriteToNetwork(_)
         ));
-        let mut empty: [u8; 0] = [];
+        // Without a session the held packet cannot go out, and draining is a
+        // call of its own rather than a side effect of an empty datagram.
         assert!(matches!(
-            a.decapsulate(&mut empty, &mut buf),
+            a.send_queued_packet(&mut buf),
             TunnelResult::NoSession
+        ));
+
+        let mut empty: [u8; 0] = [];
+        assert!(
+            matches!(
+                a.decapsulate(&mut empty, &mut buf, &mut claimer()),
+                TunnelResult::Done
+            ),
+            "an empty datagram must not be read as a drain request"
+        );
+    }
+
+    /// Draining releases what was held, in the order it was queued, and then
+    /// reports the queue empty.
+    #[test]
+    fn draining_sends_the_held_packets_in_order() {
+        let (mut a, mut b) = pair();
+
+        // Two packets with no session: both are held, and the first call
+        // starts a handshake. The second is refused while one is in flight.
+        let mut a_buf = dst();
+        let mut b_buf = dst();
+        let mut init = match a.encapsulate(b"first", &mut a_buf, &mut claimer()) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected an initiation, got {other:?}"),
+        };
+        assert!(matches!(
+            a.encapsulate(b"second", &mut a_buf, &mut claimer()),
+            TunnelResult::HandshakeInProgress
+        ));
+
+        // Complete the handshake before draining.
+        let mut response = match b.decapsulate(&mut init, &mut b_buf, &mut claimer()) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a response, got {other:?}"),
+        };
+        let mut keepalive = match a.decapsulate(&mut response, &mut a_buf, &mut claimer()) {
+            TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a keepalive, got {other:?}"),
+        };
+        assert!(matches!(
+            b.decapsulate(&mut keepalive, &mut b_buf, &mut claimer()),
+            TunnelResult::WriteToTunnelInPlace(_)
+        ));
+
+        for expected in [&b"first"[..], &b"second"[..]] {
+            let mut sent = match a.send_queued_packet(&mut a_buf) {
+                TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected a queued packet, got {other:?}"),
+            };
+            match b.decapsulate(&mut sent, &mut b_buf, &mut claimer()) {
+                TunnelResult::WriteToTunnelInPlace(plaintext) => {
+                    assert_eq!(plaintext, expected);
+                }
+                other => panic!("expected plaintext, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            a.send_queued_packet(&mut a_buf),
+            TunnelResult::Done
         ));
     }
 
@@ -744,14 +931,89 @@ mod tests {
         let (mut b, _a) = pair();
         let mut garbage = *b"not-a-packet";
         assert!(matches!(
-            b.decapsulate(&mut garbage, &mut buf),
-            TunnelResult::InvalidPacket(WireGuardError::UnknownMessageType)
+            b.decapsulate(&mut garbage, &mut buf, &mut claimer()),
+            TunnelResult::InvalidPacket
         ));
     }
+    /// A packet that cannot be sent because the session vanished goes back to
+    /// the *front*: it keeps the place it had, so ordering survives the retry.
+    #[test]
+    fn a_packet_that_cannot_be_sent_keeps_its_place_in_the_queue() {
+        let mut buf = dst();
+        let (mut a, _b) = pair();
+
+        // Queue three packets with no session at all.
+        a.queue_for_tests(b"first");
+        a.queue_for_tests(b"second");
+        a.queue_for_tests(b"third");
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+
+        // No session: the send is refused, and the packet must return to the
+        // front rather than being dropped or appended.
+        assert!(matches!(
+            a.send_queued_packet(&mut buf),
+            TunnelResult::NoSession
+        ));
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+            "the refused packet must keep its place at the front"
+        );
+
+        // Repeated refusals stay idempotent: nothing is consumed or reordered.
+        for _ in 0..3 {
+            assert!(matches!(
+                a.send_queued_packet(&mut buf),
+                TunnelResult::NoSession
+            ));
+        }
+        assert_eq!(
+            a.queued_for_tests(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    /// A packet the sending session refuses (expired or exhausted) is held for
+    /// the next session rather than lost: `RekeyRequired` must cost nothing.
+    #[test]
+    fn a_packet_the_session_refuses_is_held_not_dropped() {
+        let (mut a, mut b) = pair();
+        handshake(&mut a, &mut b);
+
+        // Backdate A's sending session past the reject-after age.
+        let Some(past) = Instant::now().checked_sub(REJECT_AFTER_TIME) else {
+            return; // the clock has not run long enough to backdate with
+        };
+        a.sessions
+            .current
+            .as_mut()
+            .expect("the handshake installed a session")
+            .created_at = past;
+
+        // `handshake()` leaves its own `b"hi"` held behind us.
+        let before = a.queued_for_tests().len();
+
+        let mut buf = dst();
+        assert!(matches!(
+            a.encapsulate(b"held", &mut buf, &mut claimer()),
+            TunnelResult::RekeyRequired
+        ));
+        let queued = a.queued_for_tests();
+        assert_eq!(queued.len(), before + 1);
+        assert_eq!(
+            queued.last(),
+            Some(&b"held".to_vec()),
+            "the refused packet must be held for the next session"
+        );
+    }
+
     #[test]
     fn short_datagrams_do_not_panic() {
         let mut buf = dst();
-        let (b, _a) = pair();
+        let (mut b, _a) = pair();
 
         for len in 0..40usize {
             let mut datagram = vec![0u8; len];
@@ -759,7 +1021,7 @@ mod tests {
             if len >= 4 {
                 datagram[..4].copy_from_slice(&packet::MSG_HANDSHAKE_INIT.to_le_bytes());
             }
-            let result = b.decapsulate(&mut datagram, &mut buf);
+            let result = b.decapsulate(&mut datagram, &mut buf, &mut claimer());
             let _ = format!("{result:?}");
         }
 
@@ -767,14 +1029,13 @@ mod tests {
         let mut datagram = vec![0u8; packet::HANDSHAKE_INIT_LEN - 1];
         datagram[..4].copy_from_slice(&packet::MSG_HANDSHAKE_INIT.to_le_bytes());
         assert!(matches!(
-            b.decapsulate(&mut datagram, &mut buf),
-            TunnelResult::InvalidPacket(_)
+            b.decapsulate(&mut datagram, &mut buf, &mut claimer()),
+            TunnelResult::InvalidPacket
         ));
     }
 
-    /// Transfer counters report bytes on the wire, overhead included. The
-    /// clearest case is a keepalive: no payload at all, yet it costs exactly
-    /// `DATA_OVERHEAD` bytes in each direction.
+    /// Counters report bytes on the wire, overhead included: a keepalive has
+    /// no payload yet costs `DATA_OVERHEAD` bytes each way.
     #[test]
     fn counters_include_the_wire_overhead() {
         let (mut a, mut b) = pair();
@@ -786,7 +1047,7 @@ mod tests {
         let rx_before = b.rx_bytes();
 
         // An empty payload is a keepalive: the datagram is pure overhead.
-        let mut keepalive = match a.encapsulate(&[], &mut a_buf) {
+        let mut keepalive = match a.encapsulate(&[], &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected a keepalive, got {other:?}"),
         };
@@ -798,7 +1059,7 @@ mod tests {
         );
 
         assert!(matches!(
-            b.decapsulate(&mut keepalive, &mut b_buf),
+            b.decapsulate(&mut keepalive, &mut b_buf, &mut claimer()),
             TunnelResult::WriteToTunnelInPlace(_)
         ));
         assert_eq!(
@@ -822,7 +1083,7 @@ mod tests {
         let tx_before = a.tx_bytes();
         let rx_before = b.rx_bytes();
 
-        let mut packet = match a.encapsulate(&payload, &mut a_buf) {
+        let mut packet = match a.encapsulate(&payload, &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => packet.to_vec(),
             other => panic!("expected data, got {other:?}"),
         };
@@ -832,7 +1093,7 @@ mod tests {
         );
 
         assert!(matches!(
-            b.decapsulate(&mut packet, &mut b_buf),
+            b.decapsulate(&mut packet, &mut b_buf, &mut claimer()),
             TunnelResult::WriteToTunnelInPlace(_)
         ));
         assert_eq!(
@@ -843,20 +1104,18 @@ mod tests {
 
     #[test]
     fn timers_without_a_session_do_nothing() {
-        // With nothing to keep alive and no session to replace, there is no
-        // reason to spend a handshake; `encapsulate` starts one when a real
-        // packet needs to go out.
+        // Nothing to keep alive and no session to replace: no reason to spend a
+        // handshake, which `encapsulate` starts when a packet needs to go out.
         let mut buf = dst();
         let mut tunnel = Tunnel::new(
             [7u8; KEY_LEN],
             [9u8; KEY_LEN],
             None,
             Some(Duration::from_secs(1)),
-            11,
         );
         let now = Instant::now() + Duration::from_secs(2);
         assert!(matches!(
-            tunnel.update_timers(now, &mut buf),
+            tunnel.update_timers(now, &mut buf, &mut claimer()),
             TunnelResult::Done
         ));
     }
@@ -869,7 +1128,7 @@ mod tests {
         // Jump past REJECT_AFTER_TIME: the session may no longer carry traffic.
         let mut buf = dst();
         let now = Instant::now() + REJECT_AFTER_TIME;
-        match a.update_timers(now, &mut buf) {
+        match a.update_timers(now, &mut buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => {
                 assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
             }
@@ -884,20 +1143,20 @@ mod tests {
 
         // Start a handshake and leave it unanswered.
         assert!(matches!(
-            a.encapsulate(b"hello", &mut buf),
+            a.encapsulate(b"hello", &mut buf, &mut claimer()),
             TunnelResult::WriteToNetwork(_)
         ));
 
         // Before the timeout nothing happens; the initiation is still in flight.
         let early = Instant::now() + Duration::from_millis(1);
         assert!(matches!(
-            a.update_timers(early, &mut buf),
+            a.update_timers(early, &mut buf, &mut claimer()),
             TunnelResult::Done
         ));
 
         // Past REKEY_TIMEOUT it is retransmitted, without the caller asking.
         let late = Instant::now() + REKEY_TIMEOUT + Duration::from_secs(1);
-        match a.update_timers(late, &mut buf) {
+        match a.update_timers(late, &mut buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => {
                 assert_eq!(packet.len(), packet::HANDSHAKE_INIT_LEN);
             }
@@ -913,13 +1172,13 @@ mod tests {
         let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
 
         let keepalive = Duration::from_secs(1);
-        let mut a = Tunnel::new(a_private, b_public, None, Some(keepalive), 11);
-        let mut b = Tunnel::new(b_private, a_public, None, None, 22);
+        let mut a = Tunnel::new(a_private, b_public, None, Some(keepalive));
+        let mut b = Tunnel::new(b_private, a_public, None, None);
         handshake(&mut a, &mut b);
 
         let mut buf = dst();
         let now = Instant::now() + keepalive * 2;
-        match a.update_timers(now, &mut buf) {
+        match a.update_timers(now, &mut buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(packet) => {
                 // A keepalive is an empty transport-data packet.
                 assert_eq!(packet.len(), DATA_OVERHEAD);
@@ -939,7 +1198,7 @@ mod tests {
         datagram[4..8].copy_from_slice(&11u32.to_le_bytes());
 
         assert!(matches!(
-            b.decapsulate(&mut datagram, &mut buf),
+            b.decapsulate(&mut datagram, &mut buf, &mut claimer()),
             TunnelResult::NoSession
         ));
     }
@@ -947,64 +1206,27 @@ mod tests {
 
 #[cfg(test)]
 mod concurrency {
-    use super::tests::pair;
+    use super::tests::{claimer, pair};
     use super::*;
 
-    /// Compile-time proof that a `Tunnel` can be shared across worker threads:
-    /// all workers decrypt in parallel, only the control lock serialises.
+    /// The scheduler moves a tunnel into its owning thread, so both must be
+    /// `Send`; a `Sync` bound would mean shared access, which we gave up.
     #[test]
-    fn tunnel_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Tunnel>();
-        assert_send_sync::<Arc<Tunnel>>();
+    fn a_tunnel_and_a_session_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Tunnel>();
+        assert_send::<Session>();
+
+        let (a, b) = pair();
+        let moved = std::thread::spawn(move || (a.tx_bytes(), b.rx_bytes()));
+        assert_eq!(
+            moved.join().expect("a tunnel must move into a thread"),
+            (0, 0)
+        );
     }
 
-    #[test]
-    fn workers_decrypt_one_peers_packets_in_parallel() {
-        use std::thread;
-
-        let (mut a, mut b) = super::tests::pair();
-        super::tests::handshake(&mut a, &mut b);
-
-        let b = Arc::new(b);
-
-        // Build one datagram per worker, each with its own counter.
-        let mut datagrams: Vec<Vec<u8>> = Vec::new();
-        for i in 0..8 {
-            let mut buf = vec![0u8; MAX_PACKET_SIZE];
-            let payload = format!("packet {i}");
-            match a.encapsulate(payload.as_bytes(), &mut buf) {
-                TunnelResult::WriteToNetwork(p) => datagrams.push(p.to_vec()),
-                other => panic!("expected a data packet, got {other:?}"),
-            }
-        }
-
-        let handles: Vec<_> = datagrams
-            .into_iter()
-            .enumerate()
-            .map(|(i, mut datagram)| {
-                let b = Arc::clone(&b);
-                thread::spawn(move || {
-                    let mut dst = vec![0u8; MAX_PACKET_SIZE];
-                    // The borrow cannot cross the thread boundary, so decide here.
-                    let ok = matches!(
-                        b.decapsulate(&mut datagram, &mut dst),
-                        TunnelResult::WriteToTunnelInPlace(_)
-                    );
-                    (i, ok)
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            let (i, ok) = handle.join().expect("decrypt must not panic");
-            assert!(ok, "packet {i} failed to decrypt");
-        }
-    }
-
-    /// The regression this whole index scheme exists for: a packet encrypted
-    /// under S1 must still decrypt against S1 after a rehandshake makes S2
-    /// current, rather than being dropped or handed to S2.
+    /// The regression the index scheme exists for: a packet encrypted under S1
+    /// must still decrypt against S1 once a rehandshake makes S2 current.
     #[test]
     fn a_packet_straddling_a_rehandshake_still_decrypts() {
         let (mut a, mut b) = pair();
@@ -1013,38 +1235,30 @@ mod concurrency {
         // Encrypt a packet under S1 and hold it, as a worker would between
         // receiving it and decrypting it.
         let mut a_buf = vec![0u8; MAX_PACKET_SIZE];
-        let mut in_flight = match a.encapsulate(b"straddles the rehandshake", &mut a_buf) {
-            TunnelResult::WriteToNetwork(p) => p.to_vec(),
-            other => panic!("expected a data packet, got {other:?}"),
-        };
+        let mut in_flight =
+            match a.encapsulate(b"straddles the rehandshake", &mut a_buf, &mut claimer()) {
+                TunnelResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("expected a data packet, got {other:?}"),
+            };
         let s1_index = u32::from_le_bytes(in_flight[4..8].try_into().unwrap());
-        let s1 = b.current_session().expect("S1 is installed");
-        assert_eq!(s1.local_id, s1_index);
+        let s1_id = b.current_session().expect("S1 is installed").local_id;
+        assert_eq!(s1_id, s1_index);
 
-        // The rehandshake completes while that packet is still in flight and
-        // installs S2 under a fresh index. It goes through
-        // `format_handshake_initiation`: `encapsulate` would just write data.
+        // The rehandshake installs S2 under a fresh index while that packet is
+        // still in flight. `encapsulate` would write data, so go via handshake.
         super::tests::exchange_handshake(&mut a, &mut b);
-        let s2 = b.current_session().expect("S2 is installed");
-        assert_ne!(
-            s1.local_id, s2.local_id,
-            "a rehandshake must claim a fresh index"
-        );
-        assert_ne!(
-            s1.local_id as usize % N_SESSIONS,
-            s2.local_id as usize % N_SESSIONS,
-            "consecutive sessions must land in different ring slots"
-        );
+        let s2_id = b.current_session().expect("S2 is installed").local_id;
+        assert_ne!(s1_id, s2_id, "a rehandshake must claim a fresh index");
 
         // S1 is still routable by its own index even though S2 is current.
         assert_eq!(
-            b.session_for(s1_index).map(|s| s.local_id),
-            Some(s1.local_id),
+            b.session_for_tests(s1_index).map(|s| s.local_id),
+            Some(s1_id),
             "the superseded session must still be reachable"
         );
 
         let mut b_buf = vec![0u8; MAX_PACKET_SIZE];
-        match b.decapsulate(&mut in_flight, &mut b_buf) {
+        match b.decapsulate(&mut in_flight, &mut b_buf, &mut claimer()) {
             TunnelResult::WriteToTunnelInPlace(payload) => {
                 assert_eq!(payload, b"straddles the rehandshake");
             }
@@ -1052,39 +1266,120 @@ mod concurrency {
         }
     }
 
-    /// A rehandshake must not evict the session currently carrying traffic:
-    /// the ring is only reusable once a session is genuinely dead.
+    /// Rotation: confirming a negotiated session moves the one in use to
+    /// `previous`, where packets already in flight can still reach it.
     #[test]
-    fn installing_a_session_never_evicts_a_live_one() {
+    fn confirming_a_session_rotates_the_previous_one_out() {
         let (mut a, mut b) = pair();
         super::tests::handshake(&mut a, &mut b);
 
-        let live = b.current_session().expect("handshake installed a session");
-        let local_id = live.local_id;
+        let first = b.current_session().expect("a session is in use").local_id;
+        assert!(b.sessions.previous.is_none(), "nothing superseded yet");
 
-        // A second session claiming the *same* index is a retransmission and is
-        // allowed to replace it.
-        let duplicate = Session::new(local_id, 7, &[9u8; 32], &[9u8; 32]);
-        assert!(b.install_session(duplicate), "same index may be refreshed");
-
-        // A different session that happens to hash to the same slot must be
-        // refused while the incumbent is alive.
-        let colliding_id = local_id + N_SESSIONS as u32;
-        let colliding = Session::new(colliding_id, 7, &[8u8; 32], &[8u8; 32]);
+        // A second session, filed as pending, then proved by traffic.
+        let second_id = first.wrapping_add(1);
+        let second = Session::new(second_id, 7, &[8u8; 32], &[8u8; 32]);
+        b.install_session(second, false);
         assert_eq!(
-            colliding_id as usize % N_SESSIONS,
-            local_id as usize % N_SESSIONS,
-            "the test needs a genuine slot collision"
+            b.current_session().map(|s| s.local_id),
+            Some(first),
+            "still pending, so nothing rotates yet"
+        );
+
+        assert!(b.confirm_session(second_id), "the pending session confirms");
+        assert_eq!(
+            b.current_session().map(|s| s.local_id),
+            Some(second_id),
+            "the confirmed session takes over"
+        );
+        assert_eq!(
+            b.sessions.previous.as_ref().map(|s| s.local_id),
+            Some(first),
+            "the superseded session moves to `previous`"
+        );
+
+        // A third rotation drops the oldest: only two are ever kept.
+        let third_id = second_id.wrapping_add(1);
+        b.install_session(Session::new(third_id, 7, &[7u8; 32], &[7u8; 32]), false);
+        assert!(b.confirm_session(third_id));
+        assert_eq!(
+            b.sessions.previous.as_ref().map(|s| s.local_id),
+            Some(second_id)
         );
         assert!(
-            !b.install_session(colliding),
-            "a live session must not be evicted from its slot"
+            b.session_for_tests(first).is_none(),
+            "the session two generations back is gone"
         );
         assert_eq!(
-            b.session_for(colliding_id).map(|s| s.local_id),
-            None,
-            "the refused session must not be reachable"
+            b.session_count(),
+            2,
+            "steady state holds current + previous"
         );
+    }
+
+    /// Confirming an index that is not the pending one must do nothing: a
+    /// forged or stale index must not disturb the session in use.
+    #[test]
+    fn confirming_an_unknown_index_changes_nothing() {
+        let (mut a, mut b) = pair();
+        super::tests::handshake(&mut a, &mut b);
+
+        let current = b.current_session().expect("a session is in use").local_id;
+        assert!(!b.confirm_session(0xdead_beef));
+        assert!(!b.confirm_session(current), "`current` is not pending");
+        assert_eq!(b.current_session().map(|s| s.local_id), Some(current));
+        assert!(b.sessions.previous.is_none());
+    }
+
+    /// The bound that stops a session flood: unconfirmed handshakes replace
+    /// each other instead of accumulating, so memory cannot grow with input.
+    #[test]
+    fn repeated_initiations_do_not_accumulate_sessions() {
+        let (mut a, mut b) = pair();
+        super::tests::handshake(&mut a, &mut b);
+
+        // Two hundred initiations, each answered by `b`. `encapsulate` would
+        // just send data once a session exists, so force a rekey each time.
+        for _ in 0..200 {
+            super::tests::exchange_handshake(&mut a, &mut b);
+        }
+
+        assert!(
+            b.session_count() <= 3,
+            "at most three sessions may be held, got {}",
+            b.session_count()
+        );
+    }
+
+    /// A negotiated session becomes usable only once the peer sends traffic,
+    /// and only then does it displace the session carrying that traffic.
+    #[test]
+    fn a_negotiated_session_is_pending_until_traffic_proves_it() {
+        let (mut a, mut b) = pair();
+        super::tests::handshake(&mut a, &mut b);
+
+        let first = b.current_session().expect("a session is in use").local_id;
+
+        // A fresh session under a new index, as the responder would file it.
+        let second = Session::new(first.wrapping_add(1), 7, &[8u8; 32], &[8u8; 32]);
+        assert_eq!(b.install_session(second, false), first.wrapping_add(1));
+
+        assert_eq!(
+            b.current_session().map(|s| s.local_id),
+            Some(first),
+            "an unconfirmed session must not displace the one in use"
+        );
+        assert_eq!(
+            b.session_for_tests(first.wrapping_add(1)).is_some(),
+            true,
+            "the pending session is still reachable by its index"
+        );
+        assert_eq!(b.session_count(), 2, "current plus pending");
+
+        // The same index again is a retransmission: it refreshes, not adds.
+        let duplicate = Session::new(first, 7, &[9u8; 32], &[9u8; 32]);
+        assert_eq!(b.install_session(duplicate, false), first);
+        assert!(b.session_count() <= 3);
     }
 
     /// A packet whose index matches nothing must be refused, never handed to
@@ -1097,80 +1392,96 @@ mod concurrency {
         let mut a_buf = vec![0u8; MAX_PACKET_SIZE];
         let mut b_buf = vec![0u8; MAX_PACKET_SIZE];
 
-        let mut packet = match a.encapsulate(b"payload", &mut a_buf) {
+        let mut packet = match a.encapsulate(b"payload", &mut a_buf, &mut claimer()) {
             TunnelResult::WriteToNetwork(p) => p.to_vec(),
             other => panic!("expected a data packet, got {other:?}"),
         };
 
-        // Point the packet at another index that shares the same ring slot:
-        // the old code would have decrypted it via `current` regardless.
+        // Point the packet at an index no session holds: it must not be
+        // decrypted via `current` regardless.
         let real = u32::from_le_bytes(packet[4..8].try_into().unwrap());
-        let stale = real + N_SESSIONS as u32;
+        let stale = real.wrapping_add(1);
         packet[4..8].copy_from_slice(&stale.to_le_bytes());
 
         assert!(
-            b.session_for(stale).is_none(),
+            b.session_for_tests(stale).is_none(),
             "a stale index must not resolve to a session"
         );
         assert!(matches!(
-            b.decapsulate(&mut packet, &mut b_buf),
+            b.decapsulate(&mut packet, &mut b_buf, &mut claimer()),
             TunnelResult::NoSession
         ));
     }
 
-    /// The allocator is what feeds `Tunnel::new` in the real device: every peer
-    /// gets its own 24-bit number, and two peers must never collide even though
-    /// their session bytes start out identical.
+    /// An index a tunnel was handed is the one its session answers to, and
+    /// `slot_of` reports where that session sits. The device relies on both.
     #[test]
-    fn peers_allocated_from_one_device_get_disjoint_index_spaces() {
-        use super::super::index::{IndexAllocator, peer_of, session_of};
-
-        let mut allocator = IndexAllocator::new();
-        let a_peer = allocator.next_peer().expect("space is not exhausted");
-        let b_peer = allocator.next_peer().expect("space is not exhausted");
-        assert_ne!(a_peer, b_peer);
-
-        let a_first = SessionIndex::new(a_peer).next_index();
-        let b_first = SessionIndex::new(b_peer).next_index();
-
-        assert_ne!(a_first, b_first);
-        assert_eq!(peer_of(a_first), a_peer);
-        assert_eq!(peer_of(b_first), b_peer);
-        // The session bytes match, so the ring *slot* collides; only the full
-        // index distinguishes them, which is what `session_for` checks.
-        assert_eq!(session_of(a_first), session_of(b_first));
-        assert_eq!(
-            a_first as usize % N_SESSIONS,
-            b_first as usize % N_SESSIONS
-        );
-    }
-
-    /// Two independently built tunnels start with no session, and a packet
-    /// addressed to an index nobody claimed must not resolve to anything.
-    #[test]
-    fn an_unclaimed_index_resolves_to_no_session() {
-        use super::super::index::{IndexAllocator, SessionIndex};
+    fn a_tunnel_files_its_session_under_the_index_it_was_given() {
         use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
-
-        let mut allocator = IndexAllocator::new();
-        let a_peer = allocator.next_peer().unwrap();
-        let b_peer = allocator.next_peer().unwrap();
 
         let a_private = [0x11u8; 32];
         let b_private = [0x22u8; 32];
         let a_public = DH_PUBKEY(&DH_PRIVATE(&a_private));
         let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
 
-        let a = Tunnel::new(a_private, b_public, None, None, a_peer);
-        let b = Tunnel::new(b_private, a_public, None, None, b_peer);
+        let mut a = Tunnel::new(a_private, b_public, None, None);
+        let mut b = Tunnel::new(b_private, a_public, None, None);
+
+        // A fixed index handed in from outside, exactly as the device would.
+        let handed = 0x1234_5678u32;
+        let mut claim = || Some(handed);
+
+        let mut init = vec![0u8; MAX_PACKET_SIZE];
+        let written = match a.encapsulate(b"hello", &mut init, &mut claim) {
+            TunnelResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected an initiation, got {other:?}"),
+        };
+        assert_eq!(
+            a.handshake.pending_index(),
+            Some(handed),
+            "the initiation must claim the index it was handed"
+        );
+
+        // The responder claims an index of its own and files its session
+        // under exactly that value, which `slot_of` must resolve.
+        let responder_index = 0x0abc_def0u32;
+        let mut responder_claim = || Some(responder_index);
+        let mut response = vec![0u8; MAX_PACKET_SIZE];
+        let mut b_buf = vec![0u8; MAX_PACKET_SIZE];
+        match b.decapsulate(&mut init[..written], &mut response, &mut responder_claim) {
+            TunnelResult::WriteToNetwork(_) => {}
+            other => panic!("expected a response, got {other:?}"),
+        }
+
+        b.slot_of(responder_index)
+            .expect("the responder's session is filed under the index it claimed");
+        assert!(
+            b.slot_of(0xdead_beef).is_none(),
+            "an index nobody claimed must not resolve"
+        );
+        let _ = b_buf;
+    }
+
+    /// A packet addressed to an index nobody claimed must not resolve to a
+    /// session, in either tunnel.
+    #[test]
+    fn an_unclaimed_index_resolves_to_no_session() {
+        use crate::protocol::primitives::{DH_PRIVATE, DH_PUBKEY};
+
+        let a_private = [0x11u8; 32];
+        let b_private = [0x22u8; 32];
+        let a_public = DH_PUBKEY(&DH_PRIVATE(&a_private));
+        let b_public = DH_PUBKEY(&DH_PRIVATE(&b_private));
+
+        let a = Tunnel::new(a_private, b_public, None, None);
+        let b = Tunnel::new(b_private, a_public, None, None);
 
         assert!(a.current_session().is_none());
         assert!(b.current_session().is_none());
 
-        // Each peer's own first index, not yet claimed by any session.
-        for index in [SessionIndex::new(a_peer).peek(), SessionIndex::new(b_peer).peek()] {
-            assert!(a.session_for(index).is_none());
-            assert!(b.session_for(index).is_none());
+        for index in [1u32, 2, 0xdead_beef] {
+            assert!(a.session_for_tests(index).is_none());
+            assert!(b.session_for_tests(index).is_none());
         }
     }
 }

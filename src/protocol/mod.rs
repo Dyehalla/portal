@@ -1,19 +1,29 @@
-//! WireGuard protocol engine. The rest of the application only deals in
-//! `Tunnel` and `TunnelResult`; packet layouts, replay protection and AEAD
-//! state stay private to this module.
+//! WireGuard protocol engine.
 
-pub mod cookie;
-pub mod packet;
-pub mod primitives;
-
+mod cookie;
 mod handshake;
-mod index;
+mod packet;
+mod primitives;
 mod replay;
 mod session;
 mod tunnel;
 
-pub use session::{DATA_OVERHEAD, MAX_TRANSPORT_PAYLOAD, Session, SessionError};
-pub use cookie::{Cookie, CookieChallenge, CookieChecker, StoredCookie};
-pub use packet::{Packet, WireGuardError};
-pub use index::{IndexAllocator, SessionIndex};
+pub use cookie::{CookieChallenge, CookieChecker};
+pub use packet::{HandshakeInitiation, Packet};
 pub use tunnel::{MAX_PACKET_SIZE, Tunnel, TunnelResult};
+// The device layer verifies handshake MACs before looking a peer up, so it
+// needs the packet layout and the key helpers as well.
+pub use packet::{
+    COOKIE_REPLY_LEN, DATA_HEADER_LEN, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN,
+    MSG_COOKIE_REPLY, MSG_DATA, MSG_HANDSHAKE_INIT, MSG_HANDSHAKE_RESPONSE,
+};
+pub(crate) use primitives::RAND;
+pub use primitives::{DH_PRIVATE, DH_PUBKEY, KEY_LEN};
+
+/// Stand-in index source for tests; see `tunnel::tests::claimer`.
+#[cfg(test)]
+pub(crate) fn tests_claimer() -> impl FnMut() -> Option<u32> {
+    tunnel::tests::claimer()
+}
+pub use cookie::verify_macs as verify_handshake_macs;
+pub use handshake::parse_handshake_anon;

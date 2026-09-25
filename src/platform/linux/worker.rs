@@ -1,85 +1,78 @@
+//! Linux thread and eventfd adapter for the portable datapath worker.
+
 use std::io;
-use std::net::UdpSocket;
-use std::os::fd::{AsFd, AsRawFd};
-use libc::{EPOLLIN, EPOLLERR, EPOLLHUP};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{JoinHandle, Thread};
 
-use crate::platform::socket::{PacketSource};
-use crate::platform::event::{self, Event, EventArray, EventToken, Poller, EpollFlags};
-use crate::Error;
+use arc_swap::ArcSwap;
 
-const BUFFER_SIZE: usize = 65535;
-// const EPOLL_ERRORS: u32 = (EPOLLERR | EPOLLHUP) as u32;
+use crate::datapath::pipeline::{CompletionNotifier, DispatcherPort};
+use crate::datapath::worker::{Worker, WorkerCommand};
+use crate::device::{DeviceSnapshot, TunnelConfig};
+use crate::index_table::{IndexTable, WorkerId};
 
-struct Worker {
-    source: PacketSource,
-    wg_socket: UdpSocket,
-    poller: Poller,
-    buffer: [u8; BUFFER_SIZE]
+/// Linux dispatcher endpoints plus the descriptor used by epoll for wakeups.
+pub struct WorkerPort {
+    pub(crate) queues: DispatcherPort,
+    pub(crate) completion_fd: Arc<OwnedFd>,
+    pub(crate) control: Sender<WorkerCommand>,
+    pub(crate) wake: Thread,
 }
 
-impl Worker {
-    // Creates and registers worker.
-    pub fn new(source: PacketSource, wg_socket: UdpSocket) -> Result<Worker, Error> {
-        let mut poller = Poller::new()?;
+/// Spawns the portable worker core with Linux eventfd notification.
+pub struct WorkerSpawner;
 
-        let token = EventToken::match_token(&source);
-        let epoll_flags = EPOLLIN as u32;
-        let fd = source.fd();
-
-        poller.register_event_trigger(EventToken::UDP, epoll_flags, wg_socket.as_fd().as_raw_fd())?;       
-        poller.register_event_trigger(token, epoll_flags, fd)?;
-
-        let buffer = [0u8; BUFFER_SIZE];
-        Ok(Worker { source, wg_socket, poller, buffer })
+impl WorkerSpawner {
+    /// Starts a worker and returns its dispatcher-facing queues and wake fd.
+    pub fn spawn(
+        id: WorkerId,
+        configs: Vec<TunnelConfig>,
+        indices: Arc<IndexTable>,
+        snapshot: Arc<ArcSwap<DeviceSnapshot>>,
+        ring_capacity: usize,
+    ) -> io::Result<(WorkerPort, JoinHandle<io::Result<()>>)> {
+        let raw_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let completion_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        let notifier = Arc::new(EventFdNotifier(Arc::clone(&completion_fd)));
+        let (control, control_rx) = mpsc::channel();
+        let (queues, thread) = Worker::spawn(
+            id,
+            configs,
+            indices,
+            snapshot,
+            ring_capacity,
+            notifier,
+            control_rx,
+        )?;
+        let wake = thread.thread().clone();
+        Ok((
+            WorkerPort {
+                queues,
+                completion_fd,
+                control,
+                wake,
+            },
+            thread,
+        ))
     }
+}
 
-    // Main event loop
-    pub fn run(&mut self) -> Result<(), Error> {
-        let mut events = EventArray::new();
+struct EventFdNotifier(Arc<OwnedFd>);
 
-        loop {
-            self.poller.poll(-1, &mut events)?;
-
-            let events = events.data[..events.count].to_vec();
-
-            for event in &events {
-                let (epoll_flags, token) = (event.epoll_flags, event.token);
-                match token {
-                    EventToken::TUN => {
-                        self.packet_source_readable()?;                                      
-                    }
-
-                    EventToken::UDP => {
-
-                    }
-
-                    EventToken::Zero => {}
-                }
-            }
+impl CompletionNotifier for EventFdNotifier {
+    fn notify(&self) {
+        let value = 1u64;
+        unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
         }
     }
-
-    fn packet_source_readable(&mut self) -> Result<(), Error> {
-        loop {
-            let bytes_read = match self.source.read(&mut self.buffer) {
-                Ok(n) => n,
-                // Non-blocking socket return error if the buffer is empty
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(_) => return Err(Error::DeadPacketSource),
-            };
-
-            // копия пакета: self.buffer занят, а wg_device нужен &mut self.
-            // Потом уберём — когда появятся настоящие буферы устройств.
-            let packet = self.buffer[..bytes_read].to_vec();
-            self.pass_to_wg_device(&packet)?;
-        }
-    }
-
-
-    fn pass_to_wg_device(&mut self, packet: &[u8]) -> Result<(), Error> {
-        // TODO: cryptokey routing → encrypt → wg_socket.send_to
-        let _ = packet;
-        Ok(())
-    }
-
 }

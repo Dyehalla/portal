@@ -5,7 +5,6 @@ const WORDS: usize = (WINDOW_BITS / 64) as usize;
 
 pub struct ReplayWindow {
     next: u64,
-    received: u64,
     bitmap: [u64; WORDS],
 }
 
@@ -13,7 +12,6 @@ impl ReplayWindow {
     pub const fn new() -> Self {
         Self {
             next: 0,
-            received: 0,
             bitmap: [0; WORDS],
         }
     }
@@ -35,7 +33,6 @@ impl ReplayWindow {
 
         if counter < self.next {
             self.set(counter);
-            self.received += 1;
             return Ok(());
         }
 
@@ -55,12 +52,7 @@ impl ReplayWindow {
 
         self.set(counter);
         self.next = counter + 1;
-        self.received += 1;
         Ok(())
-    }
-
-    pub fn counters(&self) -> (u64, u64) {
-        (self.next, self.received)
     }
 
     fn floor(&self) -> u64 {

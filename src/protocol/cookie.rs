@@ -1,9 +1,7 @@
-//! Cookie-based DoS mitigation (§5.4.4/§5.4.7): under load a responder answers
-//! an initiation whose `mac2` does not prove ownership of the source address
-//! with a `cookie_reply`, and the initiator retries with the cookie in `mac2`.
+//! Cookie-based DoS mitigation (§5.4.4/§5.4.7): a `mac2` that does not prove
+//! the source address earns a `cookie_reply`; the initiator retries with it.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::packet::{self, CookieReply, WireGuardError};
@@ -40,7 +38,9 @@ pub fn cookie_key(public_key: &Key) -> Key {
 pub fn cookie_for(secret: &Key, addr: IpAddr) -> Cookie {
     let mut addr_bytes = [0u8; 16];
     match addr {
-        IpAddr::V4(v4) => addr_bytes[..4].copy_from_slice(&v4.octets()),
+        // Mapped into IPv6 space, so an IPv4 address cannot alias an IPv6 one
+        // whose low bytes happen to match.
+        IpAddr::V4(v4) => addr_bytes.copy_from_slice(&v4.to_ipv6_mapped().octets()),
         IpAddr::V6(v6) => addr_bytes.copy_from_slice(&v6.octets()),
     }
     MAC_KEYED(secret, &addr_bytes)
@@ -66,6 +66,10 @@ pub fn verify_macs(
     under_load: bool,
     message: &[u8],
 ) -> Result<(), CookieChallenge> {
+    // A handshake message is at least its two trailing MACs.
+    if message.len() < 2 * MAC_LEN {
+        return Err(CookieChallenge::NotForUs);
+    }
     let mac1_off = message.len() - 2 * MAC_LEN;
     let mac2_off = message.len() - MAC_LEN;
     let body = &message[..mac1_off];
@@ -74,7 +78,8 @@ pub fn verify_macs(
         .expect("slice is MAC_LEN");
     let mac2: &[u8; MAC_LEN] = message[mac2_off..].try_into().expect("slice is MAC_LEN");
 
-    if MAC(&mac1_key(public_key), body) != *mac1 {
+    // Compared in constant time: the tags are attacker-provided.
+    if !mac_eq(&MAC(&mac1_key(public_key), body), mac1) {
         return Err(CookieChallenge::NotForUs);
     }
     if !under_load {
@@ -89,7 +94,7 @@ pub fn verify_macs(
 
     let cookie = cookie_for(secret, addr);
     // `mac2` covers everything before it, `mac1` included.
-    if MAC_KEYED(&cookie, &message[..mac2_off]) == *mac2 {
+    if mac_eq(&MAC_KEYED(&cookie, &message[..mac2_off]), mac2) {
         return Ok(());
     }
     Err(CookieChallenge::WrongMac2 { cookie })
@@ -120,9 +125,8 @@ impl StoredCookie {
     }
 }
 
-/// The device-wide half of the cookie mechanism: the secret, the rate counter
-/// and the reply codec. Shared by every peer, since a cookie proves a source
-/// address rather than a peer identity.
+/// The device-wide half: secret, rate counter and reply codec. Shared by every
+/// peer, since a cookie proves a source address, not a peer identity.
 pub struct CookieChecker {
     /// The key our `mac1` and cookie keys are derived from.
     public_key: Key,
@@ -131,13 +135,13 @@ pub struct CookieChecker {
     /// When `secret` was drawn, so it can be rotated.
     secret_birth: Instant,
     /// Feeds reply nonces; only uniqueness matters.
-    nonce_counter: AtomicU64,
+    nonce_counter: u64,
     /// Handshakes seen in the current window.
-    count: AtomicU64,
+    count: u64,
     /// Handshakes per window tolerated before cookies are demanded.
     limit: u64,
     /// When `count` was last reset; advanced by `reset_count`.
-    window_start: std::cell::Cell<Instant>,
+    window_start: Instant,
 }
 
 impl CookieChecker {
@@ -154,10 +158,10 @@ impl CookieChecker {
             public_key,
             secret,
             secret_birth: now,
-            nonce_counter: AtomicU64::new(0),
-            count: AtomicU64::new(0),
+            nonce_counter: 0,
+            count: 0,
             limit,
-            window_start: std::cell::Cell::new(now),
+            window_start: now,
         }
     }
 
@@ -165,11 +169,6 @@ impl CookieChecker {
     #[cfg(test)]
     pub(super) fn public_key_for_tests(&self) -> Key {
         self.public_key
-    }
-
-    /// The key a peer must build `mac1` with, and that we verify against.
-    pub fn mac1_key(&self) -> Key {
-        mac1_key(&self.public_key)
     }
 
     /// The key that wraps cookie replies we send.
@@ -183,6 +182,7 @@ impl CookieChecker {
     }
 
     /// The cookie we currently expect from `addr`.
+    #[cfg(test)]
     pub fn current_cookie(&self, addr: IpAddr) -> Cookie {
         cookie_for(&self.secret, addr)
     }
@@ -200,56 +200,38 @@ impl CookieChecker {
     }
 
     /// Resets the rate counter; meant to run about once a second.
-    pub fn reset_count(&self, now: Instant) {
-        let start = self.window_start.get();
+    pub fn reset_count(&mut self, now: Instant) {
+        let start = self.window_start;
         if now
             .checked_duration_since(start)
             .is_some_and(|age| age >= Duration::from_secs(1))
         {
-            self.count.store(0, Ordering::Relaxed);
+            self.count = 0;
             // Advance the window, otherwise every later call would reset
             // again and the device could never stay "under load".
-            self.window_start.set(now);
+            self.window_start = now;
         }
     }
 
     /// Counts a handshake and reports whether cookies must now be demanded.
-    pub fn note_handshake(&self) -> bool {
-        self.count.fetch_add(1, Ordering::Relaxed) >= self.limit
-    }
-
-    /// Verifies a handshake message's `mac1`/`mac2`, counting it towards the
-    /// rate window: an unloaded device demands no cookie.
-    pub fn check_handshake(
-        &mut self,
-        src_addr: Option<IpAddr>,
-        message: &[u8],
-        now: Instant,
-    ) -> Result<(), CookieChallenge> {
-        self.rotate_secret_if_stale(now);
-        self.reset_count(now);
-        let under_load = self.note_handshake();
-        verify_macs(
-            &self.public_key,
-            src_addr,
-            &self.secret,
-            under_load,
-            message,
-        )
+    pub fn note_handshake(&mut self) -> bool {
+        let under_load = self.count >= self.limit;
+        self.count = self.count.saturating_add(1);
+        under_load
     }
 
     /// A fresh reply nonce. It need not be secret, only unique.
     fn nonce(&mut self) -> [u8; NONCE_LEN] {
-        let counter = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.nonce_counter;
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
         let digest = HASH(&[&self.secret, &counter.to_le_bytes()]);
         let mut out = [0u8; NONCE_LEN];
         out.copy_from_slice(&digest[..NONCE_LEN]);
         out
     }
 
-    /// Builds a `cookie_reply` into `dst`, returning its length. `sender_index`
-    /// echoes the initiator's; `mac1` is the reply's AAD. Wrapped with our own
-    /// key, since the initiator unwraps with it (§5.4.7).
+    /// Builds a `cookie_reply` into `dst`, returning its length. Wrapped with
+    /// our own key, since the initiator unwraps with it (§5.4.7).
     pub fn format_cookie_reply(
         &mut self,
         dst: &mut [u8],
@@ -272,12 +254,10 @@ impl CookieChecker {
         out[32..64].copy_from_slice(&encrypted);
         Ok(len)
     }
-
 }
 
-/// Recovers the cookie from a reply, given the `mac1` of the initiation it
-/// answers; the index must match ours. We are the initiator, so
-/// `peer_public_key` is the responder's key, which wrapped it.
+/// Recovers the cookie from a reply given the `mac1` it answers. As the
+/// initiator we unwrap with the responder's key, which wrapped it.
 pub fn open_cookie_reply(
     peer_public_key: &Key,
     reply: &CookieReply<'_>,
@@ -392,7 +372,10 @@ mod tests {
         let cookie = cookie_for(&secret, addr(1));
         let mut good = message(b"body");
         sign(&public_key, Some(&cookie), &mut good);
-        assert_eq!(verify_macs(&public_key, Some(addr(1)), &secret, true, &good), Ok(()));
+        assert_eq!(
+            verify_macs(&public_key, Some(addr(1)), &secret, true, &good),
+            Ok(())
+        );
 
         // The same cookie presented from another address must fail: that is
         // the whole point, it proves ownership of the address.
@@ -506,7 +489,7 @@ mod tests {
 
     #[test]
     fn the_rate_window_decides_when_cookies_are_demanded() {
-        let checker = CookieChecker::with_limit(key(0x11), 3);
+        let mut checker = CookieChecker::with_limit(key(0x11), 3);
         let now = Instant::now();
 
         // The first `limit` handshakes are served without cookies.
@@ -530,5 +513,19 @@ mod tests {
         };
         assert!(!stored.is_expired(now + COOKIE_MAX_AGE - Duration::from_secs(1)));
         assert!(stored.is_expired(now + COOKIE_MAX_AGE));
+    }
+
+    /// Anything shorter than the two MACs is not a handshake message at all:
+    /// refused, never sliced (the length arithmetic would underflow).
+    #[test]
+    fn a_message_shorter_than_its_macs_is_refused_not_panicked_on() {
+        for len in 0..(2 * MAC_LEN) {
+            let msg = vec![0u8; len];
+            assert_eq!(
+                verify_macs(&key(1), Some(addr(1)), &key(7), false, &msg),
+                Err(CookieChallenge::NotForUs),
+                "{len}-byte message"
+            );
+        }
     }
 }

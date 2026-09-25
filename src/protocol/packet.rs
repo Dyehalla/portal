@@ -24,12 +24,20 @@ pub enum WireGuardError {
     CounterTooOld,
     /// The sending counter reached `REJECT_AFTER_MESSAGES`.
     CounterExhausted,
-    /// A handshake message did not authenticate: forged, corrupt, or built for
-    /// a different peer.
+    /// A handshake did not authenticate: forged, corrupt, or for another peer.
     HandshakeNotAuthentic,
+    /// A handshake message was replayed: its timestamp is not newer than the
+    /// last accepted from that peer.
+    HandshakeReplayed,
     /// The handshake could not be processed: a Diffie-Hellman step was refused,
     /// so no key can be agreed with this peer.
     HandshakeKeyAgreementFailed,
+    /// The transport session is older than `REJECT_AFTER_TIME` and must be
+    /// replaced before it carries traffic again.
+    SessionExpired,
+    /// A transport-data packet was handed to `Packet::parse`, which cannot
+    /// borrow its payload mutably; use `Packet::parse_mut` instead.
+    Unsupported,
 }
 
 impl From<crate::protocol::handshake::HandshakeError> for WireGuardError {
@@ -46,6 +54,7 @@ impl From<crate::protocol::handshake::HandshakeError> for WireGuardError {
             | HandshakeError::InitiationForAnotherPeer
             | HandshakeError::TimestampNotAuthentic
             | HandshakeError::ResponseNotAuthentic => Self::HandshakeNotAuthentic,
+            HandshakeError::TimestampReplayed => Self::HandshakeReplayed,
         }
     }
 }
@@ -55,7 +64,6 @@ pub enum Packet<'a> {
     HandshakeInitiation(HandshakeInitiation<'a>),
     HandshakeResponse(HandshakeResponse<'a>),
     CookieReply(CookieReply<'a>),
-    Data(DataPacket<'a>),
 }
 
 /// A parsed packet whose data payload is borrowed mutably, so it can be
@@ -82,8 +90,6 @@ pub struct HandshakeInitiation<'a> {
     pub ephemeral: &'a [u8; 32],
     pub encrypted_static: &'a [u8; 48],
     pub encrypted_timestamp: &'a [u8; 28],
-    pub mac1: &'a [u8; 16],
-    pub mac2: &'a [u8; 16],
 }
 
 #[derive(Debug)]
@@ -92,8 +98,6 @@ pub struct HandshakeResponse<'a> {
     pub receiver_index: u32,
     pub ephemeral: &'a [u8; 32],
     pub encrypted_nothing: &'a [u8; 16],
-    pub mac1: &'a [u8; 16],
-    pub mac2: &'a [u8; 16],
 }
 
 #[derive(Debug)]
@@ -113,9 +117,8 @@ pub struct DataPacket<'a> {
 }
 
 impl<'a> Packet<'a> {
-    /// Parses a datagram the caller lets us modify in place. Only a data
-    /// packet needs that: its ciphertext is handed out as `&mut [u8]` so it can
-    /// be decrypted in the receive buffer without copying.
+    /// Parses a datagram the caller lets us modify in place: a data packet's
+    /// ciphertext is decrypted in the receive buffer without copying.
     pub fn parse_mut(src: &'a mut [u8]) -> Result<PacketMut<'a>, WireGuardError> {
         let packet_type = packet_type(src)?;
 
@@ -139,7 +142,6 @@ impl<'a> Packet<'a> {
                 Packet::HandshakeInitiation(packet) => PacketMut::HandshakeInitiation(packet),
                 Packet::HandshakeResponse(packet) => PacketMut::HandshakeResponse(packet),
                 Packet::CookieReply(packet) => PacketMut::CookieReply(packet),
-                Packet::Data(_) => unreachable!("data handled above"),
             }),
         }
     }
@@ -166,8 +168,6 @@ impl<'a> Packet<'a> {
             ephemeral: src[8..40].try_into().unwrap(),
             encrypted_static: src[40..88].try_into().unwrap(),
             encrypted_timestamp: src[88..116].try_into().unwrap(),
-            mac1: src[116..132].try_into().unwrap(),
-            mac2: src[132..148].try_into().unwrap(),
         }))
     }
 
@@ -181,8 +181,6 @@ impl<'a> Packet<'a> {
             receiver_index: u32::from_le_bytes(src[8..12].try_into().unwrap()),
             ephemeral: src[12..44].try_into().unwrap(),
             encrypted_nothing: src[44..60].try_into().unwrap(),
-            mac1: src[60..76].try_into().unwrap(),
-            mac2: src[76..92].try_into().unwrap(),
         }))
     }
 
@@ -199,8 +197,8 @@ impl<'a> Packet<'a> {
     }
 
     /// Data packets need a mutable payload, so this immutable entry point
-    /// rejects them: callers on the receive path use `parse_mut` instead.
+    /// refuses them: callers on the receive path use `parse_mut` instead.
     fn parse_data(_src: &'a [u8]) -> Result<Self, WireGuardError> {
-        Err(WireGuardError::InvalidPacket)
+        Err(WireGuardError::Unsupported)
     }
 }
