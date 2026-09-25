@@ -43,11 +43,6 @@ impl DispatcherCore {
         }
     }
 
-    /// Replaces the active routing snapshot after a control-plane update.
-    pub fn publish_snapshot(&self, device: &Device) {
-        self.snapshot.store(device.snapshot());
-    }
-
     /// Returns worker identifiers for polling their completion queues.
     pub fn worker_ids(&self) -> Vec<WorkerId> {
         self.workers.keys().copied().collect()
@@ -96,6 +91,15 @@ impl DispatcherCore {
     /// Resolves a worker's peer route to its current authenticated endpoint.
     pub fn endpoint(&self, route: Route) -> Option<SocketAddr> {
         self.endpoints.get(&route).copied()
+    }
+
+    /// Replaces a configured or authenticated endpoint after a peer update.
+    pub fn set_endpoint(&mut self, route: Route, endpoint: Option<SocketAddr>) {
+        if let Some(endpoint) = endpoint {
+            self.endpoints.insert(route, endpoint);
+        } else {
+            self.endpoints.remove(&route);
+        }
     }
 
     /// Schedules flush work for worker-held packets after a handshake completes.

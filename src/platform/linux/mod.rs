@@ -1,6 +1,10 @@
 //! Linux-specific I/O and worker wakeup adapters.
 
-pub mod dispatch;
-pub mod event;
-pub mod socket;
-pub mod worker;
+mod dispatch;
+mod event;
+mod socket;
+mod worker;
+
+pub(crate) use dispatch::{DispatchCommand, DispatchSource};
+pub(crate) use socket::TunSocket;
+pub(crate) use worker::{WorkerPort, WorkerSpawner};

@@ -1,13 +1,14 @@
 use std::time::Instant;
 
 use super::cookie::{self, StoredCookie};
-use super::packet::{HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInitiation, HandshakeResponse};
+use super::packet::{
+    HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInitiation, HandshakeResponse,
+};
 use super::primitives::{
     AEAD_DECRYPT, AEAD_ENCRYPT, DH, DH_GENERATE, DH_PRIVATE, DH_PUBKEY, DhError, HASH, KDF1, KDF2,
     KDF3, LABEL_MAC1, MAC, MAC_KEYED, MAC_LEN, PrivateKey, TAI64N, TIMESTAMP_LEN,
 };
 use super::session::Session;
-
 
 //   INITIAL_CHAIN_KEY  = HASH(Construction)
 //   INITIAL_CHAIN_HASH = HASH(INITIAL_CHAIN_KEY || Identifier)
@@ -230,7 +231,6 @@ impl Handshake {
         Ok(HANDSHAKE_INIT_LEN)
     }
 
-
     /// Builds handshake response into `buf`, returning the session that reads
     /// the initiator's traffic. The response is written under `local_index`.
     pub fn format_handshake_response(
@@ -302,13 +302,13 @@ impl Handshake {
         chaining_key = ck;
         hash = HASH(&[&hash, &tau]);
         let encrypted_nothing = AEAD_ENCRYPT(&key, 0, &hash, &[]);
-        hash = HASH(&[&hash, &encrypted_nothing]);
 
         let msg = &mut buf[..HANDSHAKE_RESPONSE_LEN];
         msg[0] = MSG_HANDSHAKE_RESPONSE;
         msg[1..R_OFF_SENDER].fill(0); // reserved
         msg[R_OFF_SENDER..R_OFF_RECEIVER].copy_from_slice(&local_index.to_le_bytes());
-        msg[R_OFF_RECEIVER..R_OFF_EPHEMERAL].copy_from_slice(&initiation.sender_index.to_le_bytes());
+        msg[R_OFF_RECEIVER..R_OFF_EPHEMERAL]
+            .copy_from_slice(&initiation.sender_index.to_le_bytes());
         msg[R_OFF_EPHEMERAL..R_OFF_EMPTY].copy_from_slice(&ephemeral_public);
         msg[R_OFF_EMPTY..R_OFF_MAC1].copy_from_slice(&encrypted_nothing);
 
@@ -331,7 +331,12 @@ impl Handshake {
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as responder, tau_2 sends.
         let (recv, send) = KDF2(&chaining_key, &[]);
-        Ok(Session::new(local_index, initiation.sender_index, &send, &recv))
+        Ok(Session::new(
+            local_index,
+            initiation.sender_index,
+            &send,
+            &recv,
+        ))
     }
 
     /// `msg.mac2`: `MAC(cookie, message)` when a fresh cookie is held, else
@@ -349,11 +354,6 @@ impl Handshake {
             cookie,
             received_at: now,
         });
-    }
-
-    /// True when we hold a cookie the peer will still accept.
-    pub fn has_fresh_cookie(&self, now: Instant) -> bool {
-        self.cookie.is_some_and(|stored| !stored.is_expired(now))
     }
 
     /// The `mac1` of the last message we built, needed to unwrap a cookie
@@ -390,8 +390,14 @@ impl Handshake {
 
         // We are the initiator, so our saved state continues the chain.
         // Cr := Kdf1(Cr, Erpub); Hr := Hash(Hr || Erpub)
-        let mut chaining_key = self.chaining_key.take().ok_or(HandshakeError::NoInitiationInFlight)?;
-        let mut hash = self.hash.take().ok_or(HandshakeError::NoInitiationInFlight)?;
+        let mut chaining_key = self
+            .chaining_key
+            .take()
+            .ok_or(HandshakeError::NoInitiationInFlight)?;
+        let mut hash = self
+            .hash
+            .take()
+            .ok_or(HandshakeError::NoInitiationInFlight)?;
 
         let responder_ephemeral = response.ephemeral;
         chaining_key = KDF1(&chaining_key, responder_ephemeral);
@@ -399,10 +405,7 @@ impl Handshake {
 
         // Cr := Kdf1(Cr, DH(Eipriv, Erpub))
         // Cr := Kdf1(Cr, DH(Sipriv, Erpub))
-        chaining_key = KDF1(
-            &chaining_key,
-            &DH(&ephemeral_private, responder_ephemeral)?,
-        );
+        chaining_key = KDF1(&chaining_key, &DH(&ephemeral_private, responder_ephemeral)?);
         let static_private = DH_PRIVATE(&self.static_private);
         chaining_key = KDF1(&chaining_key, &DH(&static_private, responder_ephemeral)?);
 
@@ -423,7 +426,12 @@ impl Handshake {
 
         // (T_send, T_recv) := Kdf2(Cr, ε) — as initiator, tau_1 sends.
         let (send, recv) = KDF2(&chaining_key, &[]);
-        Ok(Session::new(local_index, response.sender_index, &send, &recv))
+        Ok(Session::new(
+            local_index,
+            response.sender_index,
+            &send,
+            &recv,
+        ))
     }
 }
 
@@ -503,7 +511,9 @@ mod tests {
         // own handshake later; otherwise it can never rekey.
         let (mut initiator, mut responder) = peer_pair();
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
         responder
@@ -539,7 +549,9 @@ mod tests {
         let (mut initiator, mut responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
         let session = responder
@@ -548,7 +560,10 @@ mod tests {
 
         // The responder's session reads the initiator's index and writes to ours.
         assert_eq!(session.remote_index, 0x0a0b_0c0d);
-        assert_eq!(session.local_id, 0x1122_3344, "the response must claim our index");
+        assert_eq!(
+            session.local_id, 0x1122_3344,
+            "the response must claim our index"
+        );
         assert_eq!(response[0], MSG_HANDSHAKE_RESPONSE);
         assert_eq!(&response[1..4], &[0, 0, 0]);
         // Sender is the responder's own index, receiver is the initiator's.
@@ -572,7 +587,9 @@ mod tests {
         let (mut initiator, mut responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         // Flip a byte inside encrypted_static; the AEAD tag must reject it.
         init[OFF_STATIC] ^= 0x01;
@@ -590,7 +607,9 @@ mod tests {
         let (mut initiator, _responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         // A responder configured for a *different* initiator static key: the
         // ciphertext authenticates, but the claimed static is not ours.
@@ -612,7 +631,9 @@ mod tests {
         let (mut initiator, mut responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
         responder
@@ -620,9 +641,12 @@ mod tests {
             .unwrap();
 
         // Retarget the receiver index; `encrypted_nothing` still verifies.
-        let genuine = u32::from_le_bytes(response[R_OFF_RECEIVER..R_OFF_EPHEMERAL].try_into().unwrap());
-        response[R_OFF_RECEIVER..R_OFF_EPHEMERAL]
-            .copy_from_slice(&(genuine + 1).to_le_bytes());
+        let genuine = u32::from_le_bytes(
+            response[R_OFF_RECEIVER..R_OFF_EPHEMERAL]
+                .try_into()
+                .unwrap(),
+        );
+        response[R_OFF_RECEIVER..R_OFF_EPHEMERAL].copy_from_slice(&(genuine + 1).to_le_bytes());
 
         let parsed = match Packet::parse(&response).unwrap() {
             Packet::HandshakeResponse(response) => response,
@@ -639,7 +663,9 @@ mod tests {
         let (mut initiator, mut responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         // Corrupt encrypted_timestamp only; encrypted_static stays valid, so
         // the failure must be attributed to the timestamp step, not the first.
@@ -660,7 +686,9 @@ mod tests {
         let (mut initiator, mut responder) = peer_pair();
 
         let mut init = [0u8; HANDSHAKE_INIT_LEN];
-        initiator.format_handshake_init(&mut init, 0x0a0b_0c0d).unwrap();
+        initiator
+            .format_handshake_init(&mut init, 0x0a0b_0c0d)
+            .unwrap();
 
         let mut response = [0u8; HANDSHAKE_RESPONSE_LEN];
         responder
@@ -691,4 +719,3 @@ mod tests {
         }
     }
 }
-

@@ -1,17 +1,8 @@
-mod datapath;
-mod device;
-mod index_table;
-mod platform;
-mod protocol;
-mod ring;
-mod runtime;
-
 use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use device::AllowedIp;
-use runtime::{PeerConfig, RuntimeConfig};
+use portal::{AllowedIp, Engine, PeerConfig};
 
 const USAGE: &str = "Usage: portal <listen-socket> <tun-name> <private-key-hex> <workers> [<peer-key-hex> <endpoint|-> <allowed-prefixes|-> <psk-hex|-> <keepalive-seconds|->]...\n\nExample: portal 0.0.0.0:51820 wg0 <private-key> 4 <peer-public-key> 198.51.100.2:51820 10.20.0.0/16 - 25";
 
@@ -47,33 +38,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map(parse_allowed_ip)
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let preshared_key = if fields[3] == "-" {
-            None
-        } else {
-            Some(parse_key(&fields[3])?)
-        };
         let persistent_keepalive = if fields[4] == "-" {
             None
         } else {
             Some(Duration::from_secs(fields[4].parse()?))
         };
+        let mut preshared_key = if fields[3] == "-" {
+            None
+        } else {
+            Some(parse_key(&fields[3])?)
+        };
         peers.push(PeerConfig {
-            static_public,
+            public_key: static_public,
             preshared_key,
             persistent_keepalive,
             endpoint,
             allowed_ips,
         });
+        if let Some(key) = &mut preshared_key {
+            key.fill(0);
+        }
     }
 
-    let static_private = parse_key(&args[2])?;
-    runtime::run(RuntimeConfig {
-        static_private,
-        listen,
-        tun_name,
-        workers,
-        peers,
-    })?;
+    let mut static_private = parse_key(&args[2])?;
+    let mut builder = Engine::builder(static_private)
+        .listen(listen)
+        .tun_name(tun_name)
+        .workers(workers);
+    static_private.fill(0);
+    for peer in peers {
+        builder = builder.peer(peer);
+    }
+
+    builder.start()?.wait()?;
     Ok(())
 }
 

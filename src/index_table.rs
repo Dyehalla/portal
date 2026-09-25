@@ -78,16 +78,6 @@ impl IndexTable {
         routes.retain(|_, owner| *owner != route);
         before - routes.len()
     }
-
-    /// Number of currently claimed receiver indices.
-    pub fn len(&self) -> usize {
-        self.routes.read().map_or(0, |routes| routes.len())
-    }
-
-    /// Whether no receiver indices are claimed.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[cfg(test)]

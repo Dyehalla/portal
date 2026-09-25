@@ -10,7 +10,6 @@ use super::cookie;
 use super::handshake;
 use super::packet::{
     self, CookieReply, DataPacket, HandshakeInitiation, HandshakeResponse, Packet, PacketMut,
-    WireGuardError,
 };
 use super::primitives::KEY_LEN;
 use super::session::{DATA_OVERHEAD, MAX_TRANSPORT_PAYLOAD, Session, SessionError};
@@ -45,13 +44,11 @@ pub enum TunnelResult<'d, 'o> {
     Done,
     /// An encrypted WireGuard packet to send over UDP. Borrows `dst`.
     WriteToNetwork(&'o mut [u8]),
-    /// Plaintext to write to the TUN device. Borrows `dst`.
-    WriteToTunnel(&'o mut [u8]),
     /// Plaintext decrypted in place inside the received `datagram`.
     WriteToTunnelInPlace(&'d mut [u8]),
     /// The peer input was malformed, forged, or unusable. Carries the specific
     /// reason. Not a local failure: the caller normally just drops the datagram.
-    InvalidPacket(WireGuardError),
+    InvalidPacket,
     /// The sending counter is exhausted or the session is too old. The caller
     /// should start a fresh handshake.
     RekeyRequired,
@@ -65,33 +62,12 @@ pub enum TunnelResult<'d, 'o> {
     BufferTooSmall,
 }
 
-impl<'d, 'o> TunnelResult<'d, 'o> {
-    /// Reborrows an outbound result so it no longer borrows its input buffer,
-    /// which lets the device put the tunnel back in its map.
-    pub fn into_outbound(self) -> TunnelResult<'o, 'o> {
-        match self {
-            Self::Done => TunnelResult::Done,
-            Self::WriteToNetwork(dst) => TunnelResult::WriteToNetwork(dst),
-            Self::WriteToTunnel(dst) => TunnelResult::WriteToTunnel(dst),
-            Self::WriteToTunnelInPlace(_) => {
-                TunnelResult::InvalidPacket(WireGuardError::InvalidPacket)
-            }
-            Self::InvalidPacket(error) => TunnelResult::InvalidPacket(error),
-            Self::RekeyRequired => TunnelResult::RekeyRequired,
-            Self::HandshakeInProgress => TunnelResult::HandshakeInProgress,
-            Self::NoSession => TunnelResult::NoSession,
-            Self::BufferTooSmall => TunnelResult::BufferTooSmall,
-        }
-    }
-}
-
 impl<'d, 'o> From<SessionError> for TunnelResult<'d, 'o> {
     fn from(error: SessionError) -> Self {
         match error {
             SessionError::RekeyRequired => Self::RekeyRequired,
             // The session's own reason is preserved all the way out.
-            SessionError::Rejected(reason) => Self::InvalidPacket(reason),
-            SessionError::Malformed => Self::InvalidPacket(WireGuardError::InvalidPacket),
+            SessionError::Rejected(_) | SessionError::Malformed => Self::InvalidPacket,
             SessionError::BufferTooSmall => Self::BufferTooSmall,
         }
     }
@@ -110,6 +86,7 @@ struct Sessions {
 }
 
 impl Sessions {
+    #[cfg(test)]
     fn by_index(&self, index: u32) -> Option<&Session> {
         self.iter().find(|session| session.local_id == index)
     }
@@ -140,6 +117,7 @@ impl Sessions {
             .chain(self.next.iter_mut())
     }
 
+    #[cfg(test)]
     fn count(&self) -> usize {
         self.iter().count()
     }
@@ -221,47 +199,6 @@ impl Tunnel {
         self.format_handshake_initiation(dst, claim, false)
     }
 
-    /// Encrypts a TUN packet already placed in a buffer with 16 bytes of
-    /// headroom (§5.4.5), avoiding the plaintext copy used by [`Self::encapsulate`].
-    pub fn encapsulate_in_place<'a>(
-        &mut self,
-        buffer: &'a mut [u8],
-        payload_start: usize,
-        payload_len: usize,
-        claim: IndexClaim<'_>,
-    ) -> TunnelResult<'a, 'a> {
-        let Some(payload_end) = payload_start.checked_add(payload_len) else {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        };
-        if payload_start < packet::DATA_HEADER_LEN
-            || payload_len > MAX_TRANSPORT_PAYLOAD
-            || payload_end > buffer.len()
-        {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
-        }
-
-        if let Some(session) = self.current_session_mut() {
-            match session.format_packet_data_in_place(buffer, payload_start, payload_len) {
-                Ok(packet_range) => {
-                    self.timers.last_packet_sent = Some(Instant::now());
-                    self.tx_bytes += packet_range.len() as u64;
-                    return TunnelResult::WriteToNetwork(&mut buffer[packet_range]);
-                }
-                Err(SessionError::RekeyRequired) => {
-                    self.queue_packet(&buffer[payload_start..payload_end]);
-                    return TunnelResult::RekeyRequired;
-                }
-                Err(error) => return error.into(),
-            }
-        }
-
-        // Until the first session exists, the plaintext must survive the
-        // handshake. Queue it before reusing the slot for the initiation.
-        self.queue_packet(&buffer[payload_start..payload_end]);
-        self.format_handshake_initiation(buffer, claim, false)
-            .into_outbound()
-    }
-
     /// Encrypts one already-buffered TUN packet without copying or retaining it
     /// inside `Tunnel`; an inline worker keeps the buffer handle on `NoSession`.
     pub fn try_encapsulate_in_place<'a>(
@@ -271,13 +208,13 @@ impl Tunnel {
         payload_len: usize,
     ) -> TunnelResult<'a, 'a> {
         let Some(payload_end) = payload_start.checked_add(payload_len) else {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+            return TunnelResult::InvalidPacket;
         };
         if payload_start < packet::DATA_HEADER_LEN
             || payload_len > MAX_TRANSPORT_PAYLOAD
             || payload_end > buffer.len()
         {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+            return TunnelResult::InvalidPacket;
         }
         let Some(session) = self.current_session_mut() else {
             return TunnelResult::NoSession;
@@ -311,15 +248,19 @@ impl Tunnel {
             _ => match claim() {
                 Some(index) => index,
                 // Every 32-bit value is taken: nothing sane is left to do.
-                None => return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket),
+                None => return TunnelResult::InvalidPacket,
             },
         };
 
         let Some(message) = dst.get_mut(..packet::HANDSHAKE_INIT_LEN) else {
             return TunnelResult::BufferTooSmall;
         };
-        if let Err(error) = self.handshake.format_handshake_init(message, local_index) {
-            return TunnelResult::InvalidPacket(error.into());
+        if self
+            .handshake
+            .format_handshake_init(message, local_index)
+            .is_err()
+        {
+            return TunnelResult::InvalidPacket;
         }
 
         let now = Instant::now();
@@ -338,6 +279,7 @@ impl Tunnel {
 
     /// Sends the oldest held packet. Call until it stops returning
     /// `WriteToNetwork`: `Done` is empty, `NoSession` means it went back.
+    #[cfg(test)]
     pub fn send_queued_packet<'d, 'a>(&mut self, dst: &'a mut [u8]) -> TunnelResult<'d, 'a> {
         let Some(src) = self.packet_queue.pop_front() else {
             return TunnelResult::Done;
@@ -399,7 +341,7 @@ impl Tunnel {
             }
             Ok(PacketMut::HandshakeResponse(packet)) => self.handle_handshake_response(packet, dst),
             Ok(PacketMut::CookieReply(packet)) => self.handle_cookie_reply(packet),
-            Err(error) => TunnelResult::InvalidPacket(error),
+            Err(_) => TunnelResult::InvalidPacket,
         }
     }
 
@@ -443,7 +385,7 @@ impl Tunnel {
         };
 
         let Some(local_index) = claim() else {
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+            return TunnelResult::InvalidPacket;
         };
 
         // Any failure means the initiation is not authentic, is for another
@@ -455,7 +397,7 @@ impl Tunnel {
                 .format_handshake_response(response, &initiation, local_index)
             {
                 Ok(session) => session,
-                Err(error) => return TunnelResult::InvalidPacket(error.into()),
+                Err(_) => return TunnelResult::InvalidPacket,
             };
 
         // Filed as pending: the peer's first authenticated packet proves it.
@@ -476,7 +418,7 @@ impl Tunnel {
     ) -> TunnelResult<'d, 'a> {
         let mut session = match self.handshake.consume_response(&response) {
             Ok(session) => session,
-            Err(error) => return TunnelResult::InvalidPacket(error.into()),
+            Err(_) => return TunnelResult::InvalidPacket,
         };
 
         // The initiator proves liveness with a keepalive, which also tells the
@@ -508,7 +450,7 @@ impl Tunnel {
             self.handshake.last_sent_mac1().copied(),
         ) else {
             // Nothing in flight: this answers a handshake we already abandoned.
-            return TunnelResult::InvalidPacket(WireGuardError::InvalidPacket);
+            return TunnelResult::InvalidPacket;
         };
 
         match cookie::open_cookie_reply(&peer_static_public, &reply, our_index, &our_mac1) {
@@ -516,7 +458,7 @@ impl Tunnel {
                 self.handshake.store_cookie(cookie, now);
                 TunnelResult::Done
             }
-            Err(error) => TunnelResult::InvalidPacket(error),
+            Err(_) => TunnelResult::InvalidPacket,
         }
     }
 
@@ -623,6 +565,7 @@ impl Tunnel {
     }
 
     /// The position of the session filed under `index`, if any.
+    #[cfg(test)]
     pub fn slot_of(&self, index: u32) -> Option<usize> {
         self.sessions
             .iter()
@@ -630,6 +573,7 @@ impl Tunnel {
     }
 
     /// Number of sessions held, at most three.
+    #[cfg(test)]
     pub fn session_count(&self) -> usize {
         self.sessions.count()
     }
@@ -682,6 +626,7 @@ impl Tunnel {
     }
 
     /// Number of plaintext packets held until a usable session can carry them.
+    #[cfg(test)]
     pub fn queued_packet_count(&self) -> usize {
         self.packet_queue.len()
     }
@@ -843,7 +788,7 @@ pub(crate) mod tests {
         response[44] ^= 0x01;
         assert!(matches!(
             a.decapsulate(&mut response, &mut a_buf, &mut claimer()),
-            TunnelResult::InvalidPacket(WireGuardError::HandshakeNotAuthentic)
+            TunnelResult::InvalidPacket
         ));
     }
 
@@ -868,7 +813,7 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             a.decapsulate(&mut response, &mut a_buf, &mut claimer()),
-            TunnelResult::InvalidPacket(_)
+            TunnelResult::InvalidPacket
         ));
     }
 
@@ -987,7 +932,7 @@ pub(crate) mod tests {
         let mut garbage = *b"not-a-packet";
         assert!(matches!(
             b.decapsulate(&mut garbage, &mut buf, &mut claimer()),
-            TunnelResult::InvalidPacket(WireGuardError::UnknownMessageType)
+            TunnelResult::InvalidPacket
         ));
     }
     /// A packet that cannot be sent because the session vanished goes back to
@@ -1085,7 +1030,7 @@ pub(crate) mod tests {
         datagram[..4].copy_from_slice(&packet::MSG_HANDSHAKE_INIT.to_le_bytes());
         assert!(matches!(
             b.decapsulate(&mut datagram, &mut buf, &mut claimer()),
-            TunnelResult::InvalidPacket(_)
+            TunnelResult::InvalidPacket
         ));
     }
 

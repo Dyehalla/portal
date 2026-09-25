@@ -2,16 +2,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::device::{DeviceSnapshot, TunnelAssignment, TunnelConfig, TunnelStats};
-use crate::index_table::{IndexTable, Route, TunnelId, WorkerId};
 use crate::datapath::ip::source as packet_source;
 use crate::datapath::pipeline::{
     Completion, CompletionNotifier, DispatcherPort, PacketKind, RxMessage, TxTarget, WorkerQueues,
     worker_queues,
 };
+use crate::device::{DeviceSnapshot, TunnelAssignment, TunnelConfig, TunnelStats};
+use crate::index_table::{IndexTable, Route, TunnelId, WorkerId};
 use crate::protocol::{DATA_HEADER_LEN, Tunnel, TunnelResult};
 use crate::ring::BufHandle;
 use arc_swap::ArcSwap;
@@ -31,6 +32,24 @@ struct PendingPacket {
     len: usize,
 }
 
+pub(crate) enum WorkerCommand {
+    AddTunnel {
+        config: TunnelConfig,
+        reply: SyncSender<Result<(), WorkerCommandError>>,
+    },
+    RemoveTunnel {
+        tunnel: TunnelId,
+        reply: SyncSender<()>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WorkerCommandError {
+    WrongWorker,
+    TunnelAlreadyExists,
+}
+
 const DISPATCH_BATCH: usize = 32;
 const MAX_PENDING_PACKETS: usize = 256;
 
@@ -42,7 +61,9 @@ pub struct Worker {
     snapshot: Arc<ArcSwap<DeviceSnapshot>>,
     queues: WorkerQueues,
     completion_notifier: Arc<dyn CompletionNotifier>,
+    control: Receiver<WorkerCommand>,
     pending: Option<Completion>,
+    deferred: VecDeque<Completion>,
     scheduled: HashMap<TunnelId, VecDeque<RxMessage>>,
     ready_tunnels: VecDeque<TunnelId>,
 }
@@ -56,6 +77,7 @@ impl Worker {
         snapshot: Arc<ArcSwap<DeviceSnapshot>>,
         ring_capacity: usize,
         completion_notifier: Arc<dyn CompletionNotifier>,
+        control: Receiver<WorkerCommand>,
     ) -> io::Result<(DispatcherPort, JoinHandle<io::Result<()>>)> {
         let (mut port, queues) = worker_queues(ring_capacity);
         let mut tunnels = HashMap::new();
@@ -86,7 +108,9 @@ impl Worker {
             snapshot,
             queues,
             completion_notifier,
+            control,
             pending: None,
+            deferred: VecDeque::new(),
             scheduled: HashMap::new(),
             ready_tunnels: VecDeque::new(),
         };
@@ -100,6 +124,22 @@ impl Worker {
     fn run(&mut self) -> io::Result<()> {
         let mut idle = 0usize;
         loop {
+            if !self.process_control() {
+                return Ok(());
+            }
+            if let Some(completion) = self.deferred.pop_front() {
+                let was_empty = self.queues.egress.is_empty();
+                if let Err(completion) = self.queues.egress.try_push(completion) {
+                    self.deferred.push_front(completion);
+                    thread::yield_now();
+                    continue;
+                }
+                if was_empty {
+                    self.wake_dispatcher();
+                }
+                idle = 0;
+                continue;
+            }
             if let Some(completion) = self.pending.take() {
                 let was_empty = self.queues.egress.is_empty();
                 match self.queues.egress.try_push(completion) {
@@ -138,6 +178,68 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    fn process_control(&mut self) -> bool {
+        loop {
+            match self.control.try_recv() {
+                Ok(WorkerCommand::AddTunnel { config, reply }) => {
+                    let result = if config.assignment.worker != self.id {
+                        Err(WorkerCommandError::WrongWorker)
+                    } else if self.tunnels.contains_key(&config.assignment.tunnel) {
+                        Err(WorkerCommandError::TunnelAlreadyExists)
+                    } else {
+                        let stats = Arc::clone(&config.stats);
+                        self.tunnels.insert(
+                            config.assignment.tunnel,
+                            TunnelSlot {
+                                tunnel: config.build_tunnel(),
+                                claimed: HashSet::new(),
+                                pending_packets: VecDeque::new(),
+                                stats,
+                                observed_tx: 0,
+                                observed_rx: 0,
+                            },
+                        );
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                Ok(WorkerCommand::RemoveTunnel { tunnel, reply }) => {
+                    self.remove_tunnel(tunnel);
+                    let _ = reply.send(());
+                }
+                Ok(WorkerCommand::Shutdown) => return false,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn remove_tunnel(&mut self, tunnel: TunnelId) {
+        let Some(mut slot) = self.tunnels.remove(&tunnel) else {
+            return;
+        };
+        let route = Route {
+            worker: self.id,
+            tunnel,
+        };
+        for index in slot.claimed.drain() {
+            self.indices.release(index, route);
+        }
+        update_stats(&mut slot);
+        for packet in slot.pending_packets.drain(..) {
+            self.deferred.push_back(Completion {
+                handle: packet.handle,
+                recycle: None,
+                offset: 0,
+                len: 0,
+                route,
+                target: TxTarget::Discard,
+                authenticated_source: None,
+                flush_more: false,
+            });
         }
     }
 
@@ -644,9 +746,9 @@ fn update_stats(slot: &mut TunnelSlot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datapath::pipeline::{PacketKind, RxMessage, TxTarget, worker_queues};
     use crate::device::{AllowedIp, Device};
     use crate::index_table::IndexTable;
-    use crate::datapath::pipeline::{PacketKind, RxMessage, TxTarget, worker_queues};
     use crate::protocol::{KEY_LEN, MAX_PACKET_SIZE};
     use crate::ring::BufPool;
     use std::net::SocketAddr;
@@ -671,6 +773,7 @@ mod tests {
         let stats = Arc::clone(&config.stats);
         let (port, queues) = worker_queues(16);
         drop(port);
+        let (_, control) = std::sync::mpsc::channel();
         Worker {
             id,
             tunnels: HashMap::from([(
@@ -688,7 +791,9 @@ mod tests {
             snapshot,
             queues,
             completion_notifier: Arc::new(NoopNotifier),
+            control,
             pending: None,
+            deferred: VecDeque::new(),
             scheduled: HashMap::new(),
             ready_tunnels: VecDeque::new(),
         }

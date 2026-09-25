@@ -32,10 +32,9 @@ impl EventToken {
     }
 }
 
-/// One ready descriptor and its epoll flags.
+/// One ready descriptor.
 #[derive(Debug, Clone, Copy)]
 pub struct Event {
-    pub flags: u32,
     pub token: EventToken,
 }
 
@@ -49,7 +48,6 @@ impl EventArray {
     pub fn new() -> Self {
         Self {
             data: [Event {
-                flags: 0,
                 token: EventToken::Udp,
             }; MAX_EVENTS],
             count: 0,
@@ -101,11 +99,10 @@ impl Poller {
         output.count = 0;
         for event in &raw[..count as usize] {
             let raw_token = unsafe { std::ptr::addr_of!(event.u64).read_unaligned() };
-            let flags = unsafe { std::ptr::addr_of!(event.events).read_unaligned() };
             let Some(token) = EventToken::decode(raw_token) else {
                 continue;
             };
-            output.data[output.count] = Event { flags, token };
+            output.data[output.count] = Event { token };
             output.count += 1;
         }
         Ok(output.count)

@@ -64,7 +64,6 @@ pub enum Packet<'a> {
     HandshakeInitiation(HandshakeInitiation<'a>),
     HandshakeResponse(HandshakeResponse<'a>),
     CookieReply(CookieReply<'a>),
-    Data(DataPacket<'a>),
 }
 
 /// A parsed packet whose data payload is borrowed mutably, so it can be
@@ -91,8 +90,6 @@ pub struct HandshakeInitiation<'a> {
     pub ephemeral: &'a [u8; 32],
     pub encrypted_static: &'a [u8; 48],
     pub encrypted_timestamp: &'a [u8; 28],
-    pub mac1: &'a [u8; 16],
-    pub mac2: &'a [u8; 16],
 }
 
 #[derive(Debug)]
@@ -101,8 +98,6 @@ pub struct HandshakeResponse<'a> {
     pub receiver_index: u32,
     pub ephemeral: &'a [u8; 32],
     pub encrypted_nothing: &'a [u8; 16],
-    pub mac1: &'a [u8; 16],
-    pub mac2: &'a [u8; 16],
 }
 
 #[derive(Debug)]
@@ -147,7 +142,6 @@ impl<'a> Packet<'a> {
                 Packet::HandshakeInitiation(packet) => PacketMut::HandshakeInitiation(packet),
                 Packet::HandshakeResponse(packet) => PacketMut::HandshakeResponse(packet),
                 Packet::CookieReply(packet) => PacketMut::CookieReply(packet),
-                Packet::Data(_) => unreachable!("data handled above"),
             }),
         }
     }
@@ -174,8 +168,6 @@ impl<'a> Packet<'a> {
             ephemeral: src[8..40].try_into().unwrap(),
             encrypted_static: src[40..88].try_into().unwrap(),
             encrypted_timestamp: src[88..116].try_into().unwrap(),
-            mac1: src[116..132].try_into().unwrap(),
-            mac2: src[132..148].try_into().unwrap(),
         }))
     }
 
@@ -189,8 +181,6 @@ impl<'a> Packet<'a> {
             receiver_index: u32::from_le_bytes(src[8..12].try_into().unwrap()),
             ephemeral: src[12..44].try_into().unwrap(),
             encrypted_nothing: src[44..60].try_into().unwrap(),
-            mac1: src[60..76].try_into().unwrap(),
-            mac2: src[76..92].try_into().unwrap(),
         }))
     }
 

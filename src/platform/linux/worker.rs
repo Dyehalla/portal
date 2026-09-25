@@ -3,19 +3,22 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{JoinHandle, Thread};
 
 use arc_swap::ArcSwap;
 
 use crate::datapath::pipeline::{CompletionNotifier, DispatcherPort};
-use crate::datapath::worker::Worker;
+use crate::datapath::worker::{Worker, WorkerCommand};
 use crate::device::{DeviceSnapshot, TunnelConfig};
 use crate::index_table::{IndexTable, WorkerId};
 
 /// Linux dispatcher endpoints plus the descriptor used by epoll for wakeups.
 pub struct WorkerPort {
-    pub queues: DispatcherPort,
-    pub completion_fd: Arc<OwnedFd>,
+    pub(crate) queues: DispatcherPort,
+    pub(crate) completion_fd: Arc<OwnedFd>,
+    pub(crate) control: Sender<WorkerCommand>,
+    pub(crate) wake: Thread,
 }
 
 /// Spawns the portable worker core with Linux eventfd notification.
@@ -36,6 +39,7 @@ impl WorkerSpawner {
         }
         let completion_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_fd) });
         let notifier = Arc::new(EventFdNotifier(Arc::clone(&completion_fd)));
+        let (control, control_rx) = mpsc::channel();
         let (queues, thread) = Worker::spawn(
             id,
             configs,
@@ -43,8 +47,18 @@ impl WorkerSpawner {
             snapshot,
             ring_capacity,
             notifier,
+            control_rx,
         )?;
-        Ok((WorkerPort { queues, completion_fd }, thread))
+        let wake = thread.thread().clone();
+        Ok((
+            WorkerPort {
+                queues,
+                completion_fd,
+                control,
+                wake,
+            },
+            thread,
+        ))
     }
 }
 

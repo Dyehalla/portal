@@ -171,11 +171,6 @@ impl CookieChecker {
         self.public_key
     }
 
-    /// The key a peer must build `mac1` with, and that we verify against.
-    pub fn mac1_key(&self) -> Key {
-        mac1_key(&self.public_key)
-    }
-
     /// The key that wraps cookie replies we send.
     pub fn cookie_key(&self) -> Key {
         cookie_key(&self.public_key)
@@ -187,6 +182,7 @@ impl CookieChecker {
     }
 
     /// The cookie we currently expect from `addr`.
+    #[cfg(test)]
     pub fn current_cookie(&self, addr: IpAddr) -> Cookie {
         cookie_for(&self.secret, addr)
     }
@@ -258,7 +254,6 @@ impl CookieChecker {
         out[32..64].copy_from_slice(&encrypted);
         Ok(len)
     }
-
 }
 
 /// Recovers the cookie from a reply given the `mac1` it answers. As the
@@ -377,7 +372,10 @@ mod tests {
         let cookie = cookie_for(&secret, addr(1));
         let mut good = message(b"body");
         sign(&public_key, Some(&cookie), &mut good);
-        assert_eq!(verify_macs(&public_key, Some(addr(1)), &secret, true, &good), Ok(()));
+        assert_eq!(
+            verify_macs(&public_key, Some(addr(1)), &secret, true, &good),
+            Ok(())
+        );
 
         // The same cookie presented from another address must fail: that is
         // the whole point, it proves ownership of the address.

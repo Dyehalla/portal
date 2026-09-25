@@ -117,7 +117,6 @@ unsafe impl Sync for PoolInner {}
 pub struct BufPool {
     inner: Arc<PoolInner>,
     free: Vec<usize>,
-    headroom: usize,
 }
 
 /// Exclusive ownership of one pool slot. This value is movable across threads,
@@ -144,7 +143,6 @@ impl BufPool {
         Self {
             inner: Arc::new(PoolInner { buffers }),
             free,
-            headroom,
         }
     }
 
@@ -171,13 +169,9 @@ impl BufPool {
     }
 
     /// Number of currently free slots.
+    #[cfg(test)]
     pub fn available(&self) -> usize {
         self.free.len()
-    }
-
-    /// Bytes reserved before the packet start in buffers from this pool.
-    pub fn headroom(&self) -> usize {
-        self.headroom
     }
 }
 
@@ -185,16 +179,6 @@ impl BufHandle {
     /// Total capacity of this slot.
     pub fn capacity(&self) -> usize {
         unsafe { (&*self.inner.buffers[self.slot].get()).len() }
-    }
-
-    /// Current packet length recorded in this handle.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether this handle currently describes an empty packet.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Records the packet length after a read or packet transformation.
@@ -218,13 +202,8 @@ impl BufHandle {
         buffer
     }
 
-    /// Mutably accesses the currently recorded packet.
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        let len = self.len;
-        &mut self.storage_mut()[..len]
-    }
-
     /// Returns the slot number for diagnostics and pool ownership checks.
+    #[cfg(test)]
     pub fn slot(&self) -> usize {
         self.slot
     }

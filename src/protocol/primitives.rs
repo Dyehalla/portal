@@ -10,10 +10,8 @@ use aws_lc_rs::error::Unspecified;
 use aws_lc_rs::rand;
 use blake2::digest::consts::U16;
 use blake2::digest::{KeyInit, Mac as MacTrait};
-use blake2::{Blake2sMac, Blake2s256, Digest};
+use blake2::{Blake2s256, Blake2sMac, Digest};
 
-pub const CONSTRUCTION: &[u8; 37] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-pub const IDENTIFIER: &[u8; 34] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
 pub const LABEL_MAC1: &[u8; 8] = b"mac1----";
 pub const LABEL_COOKIE: &[u8; 8] = b"cookie--";
 
@@ -113,11 +111,6 @@ pub fn AEAD_DECRYPT(
         .map_err(|_| AeadError::InvalidTag)
 }
 
-/// AEAD_LEN(plain len): plain len + 16
-pub const fn AEAD_LEN(plain_len: usize) -> usize {
-    plain_len + TAG_LEN
-}
-
 /// Failure of an AEAD operation: only the tag check can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeadError {
@@ -173,7 +166,12 @@ impl AeadKey {
 
     /// Encrypts into a fresh buffer, returning ciphertext || tag. Unlike
     /// `seal_in_place` this takes an explicit nonce and AAD, as XAEAD needs.
-    pub fn seal(&self, nonce: [u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Unspecified> {
+    pub fn seal(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, Unspecified> {
         let mut out = plaintext.to_vec();
         let nonce = aead::Nonce::assume_unique_for_key(nonce);
         self.inner
@@ -182,7 +180,12 @@ impl AeadKey {
     }
 
     /// Decrypts ciphertext || tag into a fresh buffer; `Err` on a bad tag.
-    pub fn open(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Unspecified> {
+    pub fn open(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, Unspecified> {
         let mut out = ciphertext.to_vec();
         let nonce = aead::Nonce::assume_unique_for_key(nonce);
         let plaintext = self
@@ -274,7 +277,6 @@ pub fn XAEAD_DECRYPT(
     AeadKey::new(&subkey).open(xchacha_nonce(nonce), auth, ciphertext)
 }
 
-
 /// Failure of a Diffie-Hellman operation: the peer key is malformed or a
 /// low-order point, so the shared secret would be all zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,8 +300,7 @@ pub fn DH(my_priv: &PrivateKey, peer_pub: &[u8; 32]) -> Result<Key, DhError> {
 /// Rebuilds a `PrivateKey` from the raw 32 secret bytes WireGuard stores. An
 /// invalid encoding here is a programming error, not attacker input.
 pub fn DH_PRIVATE(bytes: &[u8; KEY_LEN]) -> PrivateKey {
-    PrivateKey::from_private_key(&agreement::X25519, bytes)
-        .expect("32-byte X25519 private key")
+    PrivateKey::from_private_key(&agreement::X25519, bytes).expect("32-byte X25519 private key")
 }
 
 /// DH_GENERATE(): a random Curve25519 private key and its public key, kept in
@@ -314,17 +315,15 @@ pub fn DH_GENERATE() -> (PrivateKey, Key) {
 
 /// DH-PUBKEY(private key): derive the Curve25519 public key.
 pub fn DH_PUBKEY(priv_key: &PrivateKey) -> Key {
-    let pub_key = priv_key
-        .compute_public_key()
-        .unwrap(); // Realistically never panics
+    let pub_key = priv_key.compute_public_key().unwrap(); // Realistically never panics
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(pub_key.as_ref());
     out
 }
 
 /// RAND(len): fill buffer with random bytes
-pub fn RAND<const N: usize>(buf: &mut [u8; N]){
-    rand::fill(buf).expect("Unexpected RNG generator failure"); 
+pub fn RAND<const N: usize>(buf: &mut [u8; N]) {
+    rand::fill(buf).expect("Unexpected RNG generator failure");
 }
 
 /// TAI64N(): 12-byte timestamp. TAI64 label (2^62 + unix seconds, BE) || nanoseconds BE.
@@ -413,9 +412,7 @@ mod tests {
         let key: [u8; 32] = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
             .try_into()
             .unwrap();
-        let nonce: [u8; 16] = hex("000000090000004a0000000031415927")
-            .try_into()
-            .unwrap();
+        let nonce: [u8; 16] = hex("000000090000004a0000000031415927").try_into().unwrap();
 
         let subkey = hchacha20(&key, &nonce);
         assert_eq!(
@@ -529,12 +526,7 @@ only one tip for the future, sunscreen would be it.";
                 &b"associated data"[..],
                 &b"a cookie worth 32 bytes exactly!!"[..],
             ),
-            (
-                [0xffu8; 32],
-                [0xffu8; 24],
-                &b"aad"[..],
-                &[0xabu8; 200][..],
-            ),
+            ([0xffu8; 32], [0xffu8; 24], &b"aad"[..], &[0xabu8; 200][..]),
         ] {
             let cipher = XChaCha20Poly1305::new(&key.into());
             let expected = cipher

@@ -3,23 +3,35 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::Instant;
 
-use crate::device::{Device, TunnelAssignment};
-use crate::index_table::{Route, WorkerId};
-use crate::datapath::ip::destination as packet_destination;
 use crate::datapath::dispatcher::DispatcherCore;
+use crate::datapath::ip::destination as packet_destination;
 use crate::datapath::pipeline::{Completion, PacketKind, RxMessage, TxTarget};
 use crate::datapath::router::{DatagramRoute, DatagramRouter};
+use crate::device::{Device, TunnelAssignment};
+use crate::index_table::{Route, WorkerId};
 use crate::protocol::MAX_PACKET_SIZE;
 use crate::ring::{BufHandle, BufPool};
-use crate::platform::linux::worker::WorkerPort;
 
 use super::event::{EventArray, EventToken, Poller};
 use super::socket::TunSocket;
+use super::worker::WorkerPort;
 
 const BUFFER_HEADROOM: usize = 16;
 const UDP_BATCH: usize = 32;
+const MAX_UDP_BATCHES_PER_POLL: usize = 4;
+const MAX_TUN_PACKETS_PER_POLL: usize = 32;
+
+pub(crate) enum DispatchCommand {
+    SetEndpoint {
+        route: Route,
+        endpoint: Option<SocketAddr>,
+        reply: SyncSender<()>,
+    },
+    Shutdown,
+}
 
 /// Linux dispatcher backend: one UDP socket and one TUN queue feed per-worker
 /// SPSC rings. The dispatcher is the only socket reader and buffer allocator.
@@ -32,6 +44,7 @@ pub struct DispatchSource {
     core: DispatcherCore,
     completion_fds: HashMap<WorkerId, Arc<std::os::fd::OwnedFd>>,
     router: DatagramRouter,
+    commands: Receiver<DispatchCommand>,
 }
 
 impl DispatchSource {
@@ -42,6 +55,7 @@ impl DispatchSource {
         device: &Device,
         workers: HashMap<WorkerId, WorkerPort>,
         buffer_count: usize,
+        commands: Receiver<DispatchCommand>,
     ) -> io::Result<Self> {
         if buffer_count == 0 {
             return Err(io::Error::new(
@@ -84,12 +98,16 @@ impl DispatchSource {
             core,
             completion_fds,
             router,
+            commands,
         })
     }
 
-    /// Runs the dispatcher poll loop until the socket or TUN reports a local error.
+    /// Runs until shutdown is requested or the socket/TUN reports a local error.
     pub fn run(&mut self) -> io::Result<()> {
         loop {
+            if !self.process_commands() {
+                return Ok(());
+            }
             self.drain_completions();
             self.poller.poll(10, &mut self.events)?;
             for index in 0..self.events.count {
@@ -99,11 +117,32 @@ impl DispatchSource {
                     EventToken::WorkerCompletion(worker) => self.clear_completion_signal(worker)?,
                 }
             }
+            if !self.process_commands() {
+                return Ok(());
+            }
             self.drain_completions();
             self.schedule_timers();
             self.schedule_pending_flushes();
             self.router.rotate_cookie_secret_if_stale(Instant::now());
             self.router.reset_cookie_count(Instant::now());
+        }
+    }
+
+    fn process_commands(&mut self) -> bool {
+        loop {
+            match self.commands.try_recv() {
+                Ok(DispatchCommand::SetEndpoint {
+                    route,
+                    endpoint,
+                    reply,
+                }) => {
+                    self.core.set_endpoint(route, endpoint);
+                    let _ = reply.send(());
+                }
+                Ok(DispatchCommand::Shutdown) => return false,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
         }
     }
 
@@ -131,6 +170,7 @@ impl DispatchSource {
     }
 
     fn receive_udp_batch(&mut self) -> io::Result<()> {
+        let mut batches = 0;
         loop {
             let mut handles = Vec::with_capacity(UDP_BATCH);
             while handles.len() < UDP_BATCH {
@@ -228,6 +268,10 @@ impl DispatchSource {
             if (received as usize) < UDP_BATCH {
                 return Ok(());
             }
+            batches += 1;
+            if batches >= MAX_UDP_BATCHES_PER_POLL {
+                return Ok(());
+            }
         }
     }
 
@@ -238,9 +282,7 @@ impl DispatchSource {
         len: usize,
         source: SocketAddr,
     ) {
-        let classification = self
-            .router
-            .classify(source, &handle.bytes()[..len]);
+        let classification = self.router.classify(source, &handle.bytes()[..len]);
         match classification {
             DatagramRoute::Tunnel(assignment) => {
                 let route = route(assignment);
@@ -269,7 +311,11 @@ impl DispatchSource {
     }
 
     fn receive_tun_packets(&mut self) -> io::Result<()> {
+        let mut received = 0;
         loop {
+            if received >= MAX_TUN_PACKETS_PER_POLL {
+                return Ok(());
+            }
             let Some(mut handle) = self.pool.allocate() else {
                 return Ok(());
             };
@@ -295,6 +341,7 @@ impl DispatchSource {
                 self.pool.recycle(spare);
                 return Ok(());
             }
+            received += 1;
             handle.set_len(BUFFER_HEADROOM + read);
             let packet = &handle.storage_mut()[BUFFER_HEADROOM..BUFFER_HEADROOM + read];
             let Some(destination) = packet_destination(packet) else {

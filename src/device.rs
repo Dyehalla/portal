@@ -119,11 +119,6 @@ impl DeviceSnapshot {
             .map(|(_, assignment)| *assignment)
     }
 
-    /// Looks up a peer's current tunnel assignment.
-    pub fn peer_route(&self, peer: &PeerKey) -> Option<&PeerRoute> {
-        self.peers.get(peer)
-    }
-
     /// Recovers the peer identity inside an authenticated-format initiation.
     /// MAC verification must happen first, before this DH operation (§5.4.2).
     pub fn identify_initiation(
@@ -175,7 +170,6 @@ impl Drop for Identity {
 
 struct PeerConfig {
     preshared_key: Option<PeerKey>,
-    persistent_keepalive: Option<Duration>,
     route: PeerRoute,
     stats: Arc<TunnelStats>,
 }
@@ -266,6 +260,27 @@ pub struct Device {
     indices: Arc<IndexTable>,
 }
 
+/// A peer configuration prepared for a worker but not yet visible to packet readers.
+pub(crate) struct PreparedPeer {
+    peer: PeerKey,
+    config: PeerConfig,
+    tunnel: Option<TunnelConfig>,
+}
+
+impl PreparedPeer {
+    pub(crate) fn assignment(&self) -> TunnelAssignment {
+        self.config.route.assignment
+    }
+
+    pub(crate) fn endpoint(&self) -> Option<SocketAddr> {
+        self.config.route.endpoint
+    }
+
+    pub(crate) fn take_tunnel(&mut self) -> TunnelConfig {
+        self.tunnel.take().expect("prepared tunnel is available")
+    }
+}
+
 impl Device {
     /// Creates a control plane for a device static private key.
     pub fn new(static_private: PeerKey) -> Self {
@@ -308,6 +323,27 @@ impl Device {
         endpoint: Option<SocketAddr>,
         allowed_ips: Vec<AllowedIp>,
     ) -> Result<TunnelConfig, ControlError> {
+        let mut prepared = self.prepare_peer(
+            peer,
+            preshared_key,
+            persistent_keepalive,
+            endpoint,
+            allowed_ips,
+        )?;
+        let tunnel = prepared.take_tunnel();
+        let _ = self.commit_peer(prepared);
+        Ok(tunnel)
+    }
+
+    /// Prepares a replacement tunnel without publishing its route to readers.
+    pub(crate) fn prepare_peer(
+        &mut self,
+        peer: PeerKey,
+        preshared_key: Option<PeerKey>,
+        persistent_keepalive: Option<Duration>,
+        endpoint: Option<SocketAddr>,
+        allowed_ips: Vec<AllowedIp>,
+    ) -> Result<PreparedPeer, ControlError> {
         let Some((&worker, _)) = self
             .worker_load
             .iter()
@@ -326,41 +362,54 @@ impl Device {
             .get(&peer)
             .map(|config| Arc::clone(&config.stats))
             .unwrap_or_default();
-        if let Some(old) = self.peers.remove(&peer) {
-            self.indices.release_tunnel(old.route.assignment.route());
-            if let Some(load) = self.worker_load.get_mut(&old.route.assignment.worker) {
-                *load = load.saturating_sub(1);
-            }
-        }
-        *self
-            .worker_load
-            .get_mut(&worker)
-            .expect("selected registered worker") += 1;
         let route = PeerRoute {
             assignment: TunnelAssignment { worker, tunnel },
             endpoint,
             allowed_ips,
         };
-        let assignment = route.assignment;
-        self.peers.insert(
+        let config = PeerConfig {
+            preshared_key,
+            route,
+            stats: Arc::clone(&stats),
+        };
+        let tunnel = TunnelConfig {
             peer,
-            PeerConfig {
-                preshared_key,
-                persistent_keepalive,
-                route,
-                stats: Arc::clone(&stats),
-            },
-        );
-        self.publish_snapshot();
-
-        Ok(TunnelConfig {
-            peer,
-            assignment,
+            assignment: config.route.assignment,
             static_private: self.identity.private,
             preshared_key,
             persistent_keepalive,
             stats,
+        };
+        Ok(PreparedPeer {
+            peer,
+            config,
+            tunnel: Some(tunnel),
         })
+    }
+
+    /// Publishes a prepared peer after its worker has installed the tunnel.
+    pub(crate) fn commit_peer(&mut self, prepared: PreparedPeer) -> Option<TunnelAssignment> {
+        let PreparedPeer {
+            peer,
+            config,
+            tunnel: _,
+        } = prepared;
+        let assignment = config.route.assignment;
+        let previous = self.peers.remove(&peer).map(|old| {
+            let old_assignment = old.route.assignment;
+            self.indices.release_tunnel(old_assignment.route());
+            if let Some(load) = self.worker_load.get_mut(&old_assignment.worker) {
+                *load = load.saturating_sub(1);
+            }
+            old_assignment
+        });
+        *self
+            .worker_load
+            .get_mut(&assignment.worker)
+            .expect("prepared worker remains registered") += 1;
+        self.peers.insert(peer, config);
+        self.publish_snapshot();
+        previous
     }
 
     /// Removes a peer, its cryptokey routes and its receiver-index claims.
@@ -373,19 +422,6 @@ impl Device {
         };
         self.publish_snapshot();
         Some(assignment)
-    }
-
-    /// Builds a fresh tunnel configuration for a control-plane peer update.
-    pub fn tunnel_config(&self, peer: &PeerKey) -> Option<TunnelConfig> {
-        let config = self.peers.get(peer)?;
-        Some(TunnelConfig {
-            peer: *peer,
-            assignment: config.route.assignment,
-            static_private: self.identity.private,
-            preshared_key: config.preshared_key,
-            persistent_keepalive: config.persistent_keepalive,
-            stats: Arc::clone(&config.stats),
-        })
     }
 
     /// Aggregated wire-byte counters for the currently configured peer.
@@ -410,24 +446,6 @@ impl Device {
     /// Returns the device-wide receiver-index table shared with dispatchers.
     pub fn index_table(&self) -> Arc<IndexTable> {
         Arc::clone(&self.indices)
-    }
-
-    /// Claims a random nonzero receiver index for one worker-owned tunnel.
-    pub fn claim_index(&self, assignment: TunnelAssignment) -> Option<u32> {
-        for _ in 0..128 {
-            let mut bytes = [0u8; 4];
-            crate::protocol::RAND(&mut bytes);
-            let index = u32::from_le_bytes(bytes);
-            if self.indices.try_claim(index, assignment.route()) {
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    /// Releases one index if it is still owned by this tunnel.
-    pub fn release_index(&self, index: u32, assignment: TunnelAssignment) -> bool {
-        self.indices.release(index, assignment.route())
     }
 
     /// Public key used by peers to configure their endpoint.
