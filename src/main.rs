@@ -1,3 +1,4 @@
+mod datapath;
 mod device;
 mod index_table;
 mod platform;

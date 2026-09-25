@@ -1,51 +1,46 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::device::{Device, TunnelAssignment};
-use crate::index_table::{IndexTable, Route, WorkerId};
-use crate::platform::pipeline::{Completion, DispatcherPort, PacketKind, RxMessage, TxTarget};
-use crate::protocol::{
-    COOKIE_REPLY_LEN, CookieChallenge, CookieChecker, DATA_HEADER_LEN, HANDSHAKE_INIT_LEN,
-    HANDSHAKE_RESPONSE_LEN, MAX_PACKET_SIZE, MSG_DATA, MSG_HANDSHAKE_INIT, MSG_HANDSHAKE_RESPONSE,
-    Packet, verify_handshake_macs,
-};
+use crate::index_table::{Route, WorkerId};
+use crate::datapath::ip::destination as packet_destination;
+use crate::datapath::dispatcher::DispatcherCore;
+use crate::datapath::pipeline::{Completion, PacketKind, RxMessage, TxTarget};
+use crate::datapath::router::{DatagramRoute, DatagramRouter};
+use crate::protocol::MAX_PACKET_SIZE;
 use crate::ring::{BufHandle, BufPool};
+use crate::platform::linux::worker::WorkerPort;
 
 use super::event::{EventArray, EventToken, Poller};
 use super::socket::TunSocket;
 
 const BUFFER_HEADROOM: usize = 16;
 const UDP_BATCH: usize = 32;
-const COOKIE_REPLY_BUFFER: usize = COOKIE_REPLY_LEN;
-const TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Linux dispatcher backend: one UDP socket and one TUN queue feed per-worker
 /// SPSC rings. The dispatcher is the only socket reader and buffer allocator.
 pub struct DispatchSource {
-    udp: std::net::UdpSocket,
+    udp: UdpSocket,
     tun: TunSocket,
     poller: Poller,
     events: EventArray,
     pool: BufPool,
-    workers: HashMap<WorkerId, DispatcherPort>,
-    snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::device::DeviceSnapshot>>,
-    indices: std::sync::Arc<IndexTable>,
-    cookies: CookieChecker,
-    endpoints: HashMap<Route, SocketAddr>,
-    pending_flush: VecDeque<Route>,
-    last_timer: Instant,
+    core: DispatcherCore,
+    completion_fds: HashMap<WorkerId, Arc<std::os::fd::OwnedFd>>,
+    router: DatagramRouter,
 }
 
 impl DispatchSource {
     /// Opens the read side around existing device sockets and registered workers.
     pub fn new(
-        udp: std::net::UdpSocket,
+        udp: UdpSocket,
         tun: TunSocket,
         device: &Device,
-        workers: HashMap<WorkerId, DispatcherPort>,
+        workers: HashMap<WorkerId, WorkerPort>,
         buffer_count: usize,
     ) -> io::Result<Self> {
         if buffer_count == 0 {
@@ -58,19 +53,24 @@ impl DispatchSource {
         let poller = Poller::new()?;
         poller.register(EventToken::Udp, udp.as_raw_fd())?;
         poller.register(EventToken::Tun, tun.fd())?;
-        for (&worker, port) in &workers {
-            if let Some(fd) = &port.completion_fd {
-                poller.register(EventToken::WorkerCompletion(worker), fd.as_raw_fd())?;
-            }
+        let mut queues = HashMap::with_capacity(workers.len());
+        let mut completion_fds = HashMap::with_capacity(workers.len());
+        for (worker, port) in workers {
+            poller.register(
+                EventToken::WorkerCompletion(worker),
+                port.completion_fd.as_raw_fd(),
+            )?;
+            completion_fds.insert(worker, Arc::clone(&port.completion_fd));
+            queues.insert(worker, port.queues);
         }
         let snapshot = device.snapshot();
-        let mut endpoints = HashMap::new();
-        for (_, assignment, endpoint) in snapshot.assignments() {
-            if let Some(endpoint) = endpoint {
-                endpoints.insert(route(assignment), endpoint);
-            }
-        }
-        let cookies = CookieChecker::new(*snapshot.static_public());
+        let snapshot_source = device.snapshot_source();
+        let core = DispatcherCore::new(device, queues);
+        let router = DatagramRouter::new(
+            Arc::clone(&snapshot_source),
+            device.index_table(),
+            *snapshot.static_public(),
+        );
         Ok(Self {
             udp,
             tun,
@@ -81,19 +81,10 @@ impl DispatchSource {
                 MAX_PACKET_SIZE + BUFFER_HEADROOM,
                 BUFFER_HEADROOM,
             ),
-            workers,
-            snapshot: device.snapshot_source(),
-            indices: device.index_table(),
-            cookies,
-            endpoints,
-            pending_flush: VecDeque::new(),
-            last_timer: Instant::now(),
+            core,
+            completion_fds,
+            router,
         })
-    }
-
-    /// Replaces the active peer/configuration snapshot after a control-plane update.
-    pub fn publish_snapshot(&self, device: &Device) {
-        self.snapshot.store(device.snapshot());
     }
 
     /// Runs the dispatcher poll loop until the socket or TUN reports a local error.
@@ -111,17 +102,13 @@ impl DispatchSource {
             self.drain_completions();
             self.schedule_timers();
             self.schedule_pending_flushes();
-            self.cookies.rotate_secret_if_stale(Instant::now());
-            self.cookies.reset_count(Instant::now());
+            self.router.rotate_cookie_secret_if_stale(Instant::now());
+            self.router.reset_cookie_count(Instant::now());
         }
     }
 
     fn clear_completion_signal(&self, worker: WorkerId) -> io::Result<()> {
-        let Some(fd) = self
-            .workers
-            .get(&worker)
-            .and_then(|port| port.completion_fd.as_ref())
-        else {
+        let Some(fd) = self.completion_fds.get(&worker) else {
             return Ok(());
         };
         let mut counter = 0u64;
@@ -246,137 +233,38 @@ impl DispatchSource {
 
     fn dispatch_udp(
         &mut self,
-        mut handle: BufHandle,
+        handle: BufHandle,
         spare: BufHandle,
         len: usize,
         source: SocketAddr,
     ) {
-        let snapshot = self.snapshot.load_full();
-        let message_type = handle
-            .storage_mut()
-            .get(..4)
-            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-            .map(u32::from_le_bytes);
-        let Some(message_type) = message_type else {
-            self.pool.recycle(handle);
-            self.pool.recycle(spare);
-            return;
-        };
-
-        let assignment = match message_type {
-            MSG_HANDSHAKE_INIT => {
-                if Packet::parse(&handle.storage_mut()[..len]).is_err()
-                    || !self.verify_handshake_mac(source, &mut handle, len)
-                {
-                    self.pool.recycle(handle);
-                    self.pool.recycle(spare);
-                    return;
-                }
-                let peer = match Packet::parse(&handle.storage_mut()[..len]) {
-                    Ok(Packet::HandshakeInitiation(initiation)) => {
-                        snapshot.identify_initiation(&initiation)
-                    }
-                    _ => None,
-                };
-                peer.and_then(|peer| snapshot.assignment_for_peer(&peer))
-            }
-            MSG_HANDSHAKE_RESPONSE => {
-                if Packet::parse(&handle.storage_mut()[..len]).is_err()
-                    || !self.verify_handshake_mac(source, &mut handle, len)
-                {
-                    self.pool.recycle(handle);
-                    self.pool.recycle(spare);
-                    return;
-                }
-                let index = u32::from_le_bytes(
-                    handle.storage_mut()[8..12]
-                        .try_into()
-                        .expect("validated response length"),
+        let classification = self
+            .router
+            .classify(source, &handle.bytes()[..len]);
+        match classification {
+            DatagramRoute::Tunnel(assignment) => {
+                let route = route(assignment);
+                self.push_to_worker(
+                    assignment.worker,
+                    RxMessage::Packet {
+                        handle,
+                        spare,
+                        offset: 0,
+                        len,
+                        route,
+                        kind: PacketKind::Udp { source },
+                    },
                 );
-                self.indices.lookup(index).map(|r| TunnelAssignment {
-                    worker: r.worker,
-                    tunnel: r.tunnel,
-                })
             }
-            crate::protocol::MSG_COOKIE_REPLY => {
-                match Packet::parse(&handle.storage_mut()[..len]) {
-                    Ok(Packet::CookieReply(reply)) => self
-                        .indices
-                        .lookup(reply.receiver_index)
-                        .map(|r| TunnelAssignment {
-                            worker: r.worker,
-                            tunnel: r.tunnel,
-                        }),
-                    _ => None,
-                }
+            DatagramRoute::CookieReply { packet, len } => {
+                let _ = self.udp.send_to(&packet[..len], source);
+                self.pool.recycle(handle);
+                self.pool.recycle(spare);
             }
-            MSG_DATA if len >= DATA_HEADER_LEN + 16 => {
-                let index = handle
-                    .storage_mut()
-                    .get(4..8)
-                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                    .map(u32::from_le_bytes);
-                index
-                    .and_then(|index| self.indices.lookup(index))
-                    .map(|r| TunnelAssignment {
-                        worker: r.worker,
-                        tunnel: r.tunnel,
-                    })
+            DatagramRoute::Drop => {
+                self.pool.recycle(handle);
+                self.pool.recycle(spare);
             }
-            _ => None,
-        };
-        let Some(assignment) = assignment else {
-            self.pool.recycle(handle);
-            self.pool.recycle(spare);
-            return;
-        };
-        let route = route(assignment);
-        self.push_to_worker(
-            assignment.worker,
-            RxMessage::Packet {
-                handle,
-                spare,
-                offset: 0,
-                len,
-                route,
-                kind: PacketKind::Udp { source },
-            },
-        );
-    }
-
-    fn verify_handshake_mac(
-        &mut self,
-        source: SocketAddr,
-        handle: &mut BufHandle,
-        len: usize,
-    ) -> bool {
-        let bytes = &handle.storage_mut()[..len];
-        let kind = u32::from_le_bytes(bytes[..4].try_into().expect("parsed packet has type"));
-        let mac_offset = match kind {
-            MSG_HANDSHAKE_INIT if len == HANDSHAKE_INIT_LEN => HANDSHAKE_INIT_LEN - 32,
-            MSG_HANDSHAKE_RESPONSE if len == HANDSHAKE_RESPONSE_LEN => HANDSHAKE_RESPONSE_LEN - 32,
-            _ => return false,
-        };
-        let under_load = self.cookies.note_handshake();
-        let public_key = *self.snapshot.load().static_public();
-        let secret = self.cookies.secret();
-        match verify_handshake_macs(&public_key, Some(source.ip()), &secret, under_load, bytes) {
-            Ok(()) => true,
-            Err(CookieChallenge::WrongMac2 { cookie }) => {
-                let sender = u32::from_le_bytes(bytes[4..8].try_into().expect("parsed header"));
-                let mac1: [u8; 16] = bytes[mac_offset..mac_offset + 16]
-                    .try_into()
-                    .expect("parsed mac");
-                let mut reply = [0u8; COOKIE_REPLY_BUFFER];
-                if let Ok(written) = self
-                    .cookies
-                    .format_cookie_reply(&mut reply, sender, &cookie, &mac1)
-                {
-                    let _ = self.udp.send_to(&reply[..written], source);
-                }
-                false
-            }
-            Err(CookieChallenge::NotForUs | CookieChallenge::NeedSourceAddress) => false,
         }
     }
 
@@ -414,7 +302,7 @@ impl DispatchSource {
                 self.pool.recycle(spare);
                 continue;
             };
-            let assignment = self.snapshot.load().route_for_ip(destination);
+            let assignment = self.core.route_for_ip(destination);
             let Some(assignment) = assignment else {
                 self.pool.recycle(handle);
                 self.pool.recycle(spare);
@@ -436,32 +324,14 @@ impl DispatchSource {
     }
 
     fn push_to_worker(&mut self, worker: WorkerId, message: RxMessage) -> bool {
-        let Some(port) = self.workers.get_mut(&worker) else {
-            recycle_message(&mut self.pool, message);
-            return false;
-        };
-        let was_empty = port.ingress.is_empty();
-        if let Err(message) = port.ingress.try_push(message) {
-            recycle_message(&mut self.pool, message);
-            false
-        } else {
-            if was_empty {
-                if let Some(wake) = &port.wake {
-                    wake.unpark();
-                }
-            }
-            true
-        }
+        self.core.push_to_worker(&mut self.pool, worker, message)
     }
 
     fn drain_completions(&mut self) {
-        let worker_ids = self.workers.keys().copied().collect::<Vec<_>>();
+        let worker_ids = self.core.worker_ids();
         for worker in worker_ids {
             loop {
-                let completion = self
-                    .workers
-                    .get_mut(&worker)
-                    .and_then(|port| port.egress.try_pop());
+                let completion = self.core.pop_completion(worker);
                 let Some(completion) = completion else { break };
                 self.complete(completion);
             }
@@ -469,19 +339,17 @@ impl DispatchSource {
     }
 
     fn complete(&mut self, completion: Completion) {
+        self.core.accept_completion(&completion);
         let Completion {
             mut handle,
             recycle,
             offset,
             len,
-            route,
+            route: _,
             target,
-            authenticated_source,
-            flush_more,
+            authenticated_source: _,
+            flush_more: _,
         } = completion;
-        if let Some(source) = authenticated_source {
-            self.endpoints.insert(route, source);
-        }
         match target {
             TxTarget::Address(address) => {
                 if let Some(bytes) = handle.storage_mut().get(offset..offset.saturating_add(len)) {
@@ -489,7 +357,7 @@ impl DispatchSource {
                 }
             }
             TxTarget::Peer(route) => {
-                if let Some(address) = self.endpoints.get(&route).copied() {
+                if let Some(address) = self.core.endpoint(route) {
                     if let Some(bytes) =
                         handle.storage_mut().get(offset..offset.saturating_add(len))
                     {
@@ -508,52 +376,14 @@ impl DispatchSource {
         if let Some(recycle) = recycle {
             self.pool.recycle(recycle);
         }
-        if flush_more {
-            self.pending_flush.push_back(route);
-        }
     }
 
     fn schedule_pending_flushes(&mut self) {
-        let pending = self.pending_flush.len();
-        for _ in 0..pending {
-            let Some(route) = self.pending_flush.pop_front() else {
-                break;
-            };
-            let Some(handle) = self.pool.allocate() else {
-                self.pending_flush.push_front(route);
-                break;
-            };
-            if !self.push_to_worker(
-                route.worker,
-                RxMessage::Flush {
-                    handle,
-                    tunnel: route.tunnel,
-                },
-            ) {
-                self.pending_flush.push_back(route);
-            }
-        }
+        self.core.schedule_pending_flushes(&mut self.pool);
     }
 
     fn schedule_timers(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_timer) < TIMER_INTERVAL {
-            return;
-        }
-        self.last_timer = now;
-        let assignments = self.snapshot.load().assignments();
-        for (_, assignment, _) in assignments {
-            let Some(handle) = self.pool.allocate() else {
-                break;
-            };
-            self.push_to_worker(
-                assignment.worker,
-                RxMessage::Timer {
-                    handle,
-                    tunnel: assignment.tunnel,
-                },
-            );
-        }
+        self.core.schedule_timers(&mut self.pool, Instant::now());
     }
 }
 
@@ -561,28 +391,6 @@ fn route(assignment: TunnelAssignment) -> Route {
     Route {
         worker: assignment.worker,
         tunnel: assignment.tunnel,
-    }
-}
-
-fn recycle_message(pool: &mut BufPool, message: RxMessage) {
-    match message {
-        RxMessage::Packet { handle, spare, .. } => {
-            pool.recycle(handle);
-            pool.recycle(spare);
-        }
-        RxMessage::Timer { handle, .. } | RxMessage::Flush { handle, .. } => pool.recycle(handle),
-    }
-}
-
-fn packet_destination(packet: &[u8]) -> Option<IpAddr> {
-    match packet.first().map(|byte| byte >> 4)? {
-        4 if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
-            packet[16], packet[17], packet[18], packet[19],
-        ))),
-        6 if packet.len() >= 40 => Some(IpAddr::V6(Ipv6Addr::from(
-            <[u8; 16]>::try_from(&packet[24..40]).ok()?,
-        ))),
-        _ => None,
     }
 }
 
@@ -608,37 +416,5 @@ fn socket_addr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Option
             )))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// IPv4 and IPv6 TUN packets use the correct destination address offsets.
-    #[test]
-    fn tun_route_extraction_reads_ipv4_and_ipv6_destinations() {
-        let mut ipv4 = [0u8; 20];
-        ipv4[0] = 0x45;
-        ipv4[16..20].copy_from_slice(&[192, 0, 2, 7]);
-        assert_eq!(
-            packet_destination(&ipv4),
-            Some("192.0.2.7".parse().unwrap())
-        );
-
-        let mut ipv6 = [0u8; 40];
-        ipv6[0] = 0x60;
-        ipv6[24..40].copy_from_slice(&"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
-        assert_eq!(
-            packet_destination(&ipv6),
-            Some("2001:db8::7".parse().unwrap())
-        );
-    }
-
-    /// Truncated IP packets do not reach cryptokey routing.
-    #[test]
-    fn a_truncated_ip_packet_has_no_destination() {
-        assert_eq!(packet_destination(&[0x45; 12]), None);
-        assert_eq!(packet_destination(&[0x60; 20]), None);
     }
 }

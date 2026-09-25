@@ -1,6 +1,4 @@
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::thread::Thread;
 
 use crate::index_table::{Route, TunnelId};
@@ -65,8 +63,11 @@ pub struct DispatcherPort {
     pub egress: Consumer<Completion>,
     /// Unparks the worker only when its ingress ring transitions from empty.
     pub wake: Option<Thread>,
-    /// eventfd signaled when the worker's completion ring transitions empty.
-    pub completion_fd: Option<Arc<OwnedFd>>,
+}
+
+/// Platform hook used to wake a dispatcher after a worker publishes output.
+pub trait CompletionNotifier: Send + Sync {
+    fn notify(&self);
 }
 
 /// The worker's halves of the same SPSC queues.
@@ -84,7 +85,6 @@ pub fn worker_queues(capacity: usize) -> (DispatcherPort, WorkerQueues) {
             ingress: dispatch_to_worker,
             egress: dispatch_egress,
             wake: None,
-            completion_fd: None,
         },
         WorkerQueues {
             ingress: worker_ingress,

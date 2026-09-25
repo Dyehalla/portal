@@ -298,8 +298,8 @@ impl Device {
         true
     }
 
-    /// Adds or replaces a peer and assigns its phase-one single tunnel to the
-    /// least-loaded worker (§5.4.5).
+    /// Adds or replaces a peer and assigns a single tunnel to the
+    /// least-loaded worker.
     pub fn add_peer(
         &mut self,
         peer: PeerKey,
@@ -435,6 +435,7 @@ impl Device {
         &self.identity.public
     }
 
+    // TODO: speedup this thing
     fn validate_routes(&self, peer: &PeerKey, routes: &[AllowedIp]) -> Result<(), ControlError> {
         for route in routes {
             AllowedIp::new(route.address, route.prefix_len)?;

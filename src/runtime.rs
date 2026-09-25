@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::device::{AllowedIp, Device};
 use crate::index_table::WorkerId;
-use crate::platform::dispatch::DispatchSource;
-use crate::platform::socket::TunSocket;
-use crate::platform::worker::Worker;
+use crate::platform::linux::dispatch::DispatchSource;
+use crate::platform::linux::socket::TunSocket;
+use crate::platform::linux::worker::WorkerSpawner;
 
 const RING_CAPACITY: usize = 1024;
 const BUFFER_COUNT: usize = 1024;
@@ -55,7 +55,6 @@ pub fn run(mut config: RuntimeConfig) -> io::Result<()> {
     }
 
     let mut device = Device::new(config.static_private);
-    config.static_private.fill(0);
     for worker in 0..config.workers {
         device.register_worker(worker as WorkerId);
     }
@@ -85,7 +84,7 @@ pub fn run(mut config: RuntimeConfig) -> io::Result<()> {
     let mut ports = HashMap::new();
     let mut worker_threads = Vec::with_capacity(config.workers);
     for (worker_id, tunnels) in tunnel_configs.into_iter().enumerate() {
-        let (port, thread) = Worker::spawn(
+        let (port, thread) = WorkerSpawner::spawn(
             worker_id,
             tunnels,
             indices.clone(),
