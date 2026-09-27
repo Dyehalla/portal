@@ -13,4 +13,4 @@ mod engine;
 pub use device::{AllowedIp, ControlError, PeerKey, PeerStats};
 
 #[cfg(target_os = "linux")]
-pub use engine::{Engine, EngineBuilder, EngineError, EngineHandle, PeerConfig};
+pub use engine::{Engine, EngineError, EngineHandle, PeerConfig};

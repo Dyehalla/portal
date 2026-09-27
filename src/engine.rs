@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::OwnedFd;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
@@ -40,97 +39,38 @@ impl Drop for PeerConfig {
     }
 }
 
-enum TunSource {
-    Name(String),
-    Descriptor(OwnedFd),
+/// Owns the engine's threads and provides a cloneable control handle.
+pub struct Engine {
+    handle: EngineHandle,
+    dispatcher_thread: Option<JoinHandle<io::Result<()>>>,
+    worker_threads: Vec<JoinHandle<io::Result<()>>>,
 }
 
-/// Builder for a running userspace WireGuard engine.
-pub struct EngineBuilder {
-    private_key: PeerKey,
-    listen: Option<SocketAddr>,
-    tun: Option<TunSource>,
-    workers: usize,
-    peers: Vec<PeerConfig>,
-}
-
-impl EngineBuilder {
-    /// Creates a builder for the device's static private key.
-    pub fn new(private_key: PeerKey) -> Self {
-        Self {
-            private_key,
-            listen: None,
-            tun: None,
-            workers: 1,
-            peers: Vec::new(),
-        }
-    }
-
-    /// Sets the local UDP bind address.
-    pub fn listen(mut self, address: SocketAddr) -> Self {
-        self.listen = Some(address);
-        self
-    }
-
-    /// Opens and attaches a Linux TUN queue with this interface name.
-    pub fn tun_name(mut self, name: impl Into<String>) -> Self {
-        self.tun = Some(TunSource::Name(name.into()));
-        self
-    }
-
-    /// Takes ownership of an already-configured TUN descriptor.
-    ///
-    /// The descriptor must refer to a TUN queue without a packet-info prefix.
-    pub fn tun_fd(mut self, descriptor: OwnedFd) -> Self {
-        self.tun = Some(TunSource::Descriptor(descriptor));
-        self
-    }
-
-    /// Sets the number of worker threads. The default is one.
-    pub fn workers(mut self, workers: usize) -> Self {
-        self.workers = workers;
-        self
-    }
-
-    /// Adds a peer that will be installed before packet processing starts.
-    pub fn peer(mut self, peer: PeerConfig) -> Self {
-        self.peers.push(peer);
-        self
-    }
-
+impl Engine {
     /// Binds resources and starts the dispatcher and worker threads.
-    pub fn start(mut self) -> Result<Engine, EngineError> {
-        if self.workers == 0 {
+    pub fn new(
+        private_key: PeerKey,
+        listen: SocketAddr,
+        tun_name: impl Into<String>,
+        workers: usize,
+    ) -> Result<Self, EngineError> {
+        if workers == 0 {
             return Err(EngineError::InvalidWorkerCount);
         }
-        let listen = self.listen.ok_or(EngineError::MissingListenAddress)?;
-        let tun = match self.tun.take().ok_or(EngineError::MissingTun)? {
-            TunSource::Name(name) => TunSocket::new(&name)?,
-            TunSource::Descriptor(descriptor) => TunSocket::from_owned_fd(descriptor)?,
-        };
+        let tun = TunSocket::new(&tun_name.into())?;
 
-        let mut device = Device::new(self.private_key);
-        let mut tunnel_configs = (0..self.workers).map(|_| Vec::new()).collect::<Vec<_>>();
-        for worker in 0..self.workers {
+        let mut device = Device::new(private_key);
+        let tunnel_configs = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
+        for worker in 0..workers {
             device.register_worker(worker as WorkerId);
-        }
-        for peer in self.peers.drain(..) {
-            let tunnel = device.add_peer(
-                peer.public_key,
-                peer.preshared_key,
-                peer.persistent_keepalive,
-                peer.endpoint,
-                peer.allowed_ips.clone(),
-            )?;
-            tunnel_configs[tunnel.assignment.worker].push(tunnel);
         }
 
         let udp = UdpSocket::bind(listen)?;
         let local_addr = udp.local_addr()?;
         let indices = device.index_table();
-        let mut ports = HashMap::with_capacity(self.workers);
-        let mut worker_controls = HashMap::with_capacity(self.workers);
-        let mut worker_threads = Vec::with_capacity(self.workers);
+        let mut ports = HashMap::with_capacity(workers);
+        let mut worker_controls = HashMap::with_capacity(workers);
+        let mut worker_threads = Vec::with_capacity(workers);
         for (worker_id, configs) in tunnel_configs.into_iter().enumerate() {
             match WorkerSpawner::spawn(
                 worker_id,
@@ -189,7 +129,7 @@ impl EngineBuilder {
             local_addr,
             running: true,
         }));
-        Ok(Engine {
+        Ok(Self {
             handle: EngineHandle { shared },
             dispatcher_thread: Some(dispatcher_thread),
             worker_threads,
@@ -197,25 +137,7 @@ impl EngineBuilder {
     }
 }
 
-impl Drop for EngineBuilder {
-    fn drop(&mut self) {
-        self.private_key.fill(0);
-    }
-}
-
-/// Owns the engine's threads and provides a cloneable control handle.
-pub struct Engine {
-    handle: EngineHandle,
-    dispatcher_thread: Option<JoinHandle<io::Result<()>>>,
-    worker_threads: Vec<JoinHandle<io::Result<()>>>,
-}
-
 impl Engine {
-    /// Creates a builder for a device's static private key.
-    pub fn builder(private_key: PeerKey) -> EngineBuilder {
-        EngineBuilder::new(private_key)
-    }
-
     /// Returns a handle for peer management and read-only device state.
     pub fn handle(&self) -> EngineHandle {
         self.handle.clone()
@@ -226,15 +148,10 @@ impl Engine {
         self.handle.local_addr()
     }
 
-    /// Requests shutdown and joins all engine threads.
-    pub fn shutdown(&mut self) -> Result<(), EngineError> {
-        self.stop_and_join()
-    }
-
     /// Waits for the dispatcher to exit, then stops and joins the workers.
     pub fn wait(mut self) -> Result<(), EngineError> {
         let dispatcher_result = self.join_dispatcher();
-        let shutdown_result = self.stop_and_join();
+        let shutdown_result = self.shutdown();
         dispatcher_result.and(shutdown_result)
     }
 
@@ -249,7 +166,7 @@ impl Engine {
         }
     }
 
-    fn stop_and_join(&mut self) -> Result<(), EngineError> {
+    pub fn shutdown(&mut self) -> Result<(), EngineError> {
         let mut first_error = None;
         {
             let mut control = match self.handle.shared.lock() {
@@ -285,7 +202,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.stop_and_join();
+        let _ = self.shutdown();
     }
 }
 
@@ -499,8 +416,6 @@ fn route(assignment: TunnelAssignment) -> Route {
 /// Errors returned while building, managing, or stopping an engine.
 #[derive(Debug)]
 pub enum EngineError {
-    MissingListenAddress,
-    MissingTun,
     InvalidWorkerCount,
     Control(ControlError),
     Io(io::Error),
@@ -515,8 +430,6 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingListenAddress => write!(formatter, "listen address is required"),
-            Self::MissingTun => write!(formatter, "a TUN interface or descriptor is required"),
             Self::InvalidWorkerCount => write!(formatter, "worker count must be nonzero"),
             Self::Control(error) => write!(formatter, "invalid peer configuration: {error}"),
             Self::Io(error) => write!(formatter, "engine I/O error: {error}"),

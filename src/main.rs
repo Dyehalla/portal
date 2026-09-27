@@ -61,16 +61,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut static_private = parse_key(&args[2])?;
-    let mut builder = Engine::builder(static_private)
-        .listen(listen)
-        .tun_name(tun_name)
-        .workers(workers);
+    let engine = Engine::new(static_private, listen, tun_name, workers)?;
     static_private.fill(0);
+    let handle = engine.handle();
     for peer in peers {
-        builder = builder.peer(peer);
+        handle.upsert_peer(peer)?;
     }
 
-    builder.start()?.wait()?;
+    engine.wait()?;
     Ok(())
 }
 
