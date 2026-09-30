@@ -1,13 +1,15 @@
 [package]
 name = "portal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Embeddable WireGuard devices for virtual networks"
 
 [dependencies]
-libc = "0.2"
-aws-lc-rs = "1"
-blake2 = "0.10"
-arc-swap = "1.9.2"
+boringtun = { version = "=0.7.1", default-features = false }
+zeroize = "1.8"
 
-[dev-dependencies]
-chacha20poly1305 = "0.10.1"
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[patch.crates-io]
+boringtun = { path = "vendor/boringtun" }

@@ -1,16 +1,13 @@
-//! Userspace WireGuard datapath with a high-level device lifecycle API.
+//! Embeddable userspace WireGuard devices.
+//!
+//! A [`Device`] owns one virtual interface, one UDP listen port, its peer
+//! registry and a configurable group of packet workers.
 
-mod datapath;
 mod device;
-mod index_table;
 mod platform;
-mod protocol;
-mod ring;
+mod runtime;
 
-#[cfg(target_os = "linux")]
-mod engine;
-
-pub use device::{AllowedIp, ControlError, PeerKey, PeerStats};
-
-#[cfg(target_os = "linux")]
-pub use engine::{Engine, EngineError, EngineHandle, PeerConfig};
+pub use device::{
+    AllowedIp, AllowedIpParseError, Device, DeviceConfig, DeviceError, DeviceStats, PeerConfig,
+    PeerKey, PeerStats,
+};
