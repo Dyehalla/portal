@@ -20,7 +20,10 @@ fn read_key(path: &str) -> Result<PeerKey, Box<dyn Error>> {
     let key = bytes.try_into().map_err(|bytes: Vec<u8>| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("key file must contain exactly 32 bytes, got {}", bytes.len()),
+            format!(
+                "key file must contain exactly 32 bytes, got {}",
+                bytes.len()
+            ),
         )
     })?;
     Ok(key)

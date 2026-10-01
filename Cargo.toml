@@ -1,15 +1,6 @@
-[package]
-name = "portal"
-version = "0.2.0"
-edition = "2024"
-description = "Embeddable WireGuard devices for virtual networks"
-
-[dependencies]
-boringtun = { version = "=0.7.1", default-features = false }
-zeroize = "1.8"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+[workspace]
+members = ["wireguard", "cli"]
+resolver = "3"
 
 [patch.crates-io]
-boringtun = { path = "vendor/boringtun" }
+boringtun = { path = "wireguard/vendor/boringtun" }

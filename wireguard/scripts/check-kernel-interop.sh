@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_dir"
 
 die() {
@@ -49,8 +49,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf 'Building the userspace WireGuard example...\n'
 portal_bin="$repo_dir/target/debug/examples/wireguard_interop"
+[[ -x "$portal_bin" ]] || die "example not found; build it with: cargo build -p portal --example wireguard_interop"
+printf 'Starting the userspace WireGuard example...\n'
 
 ip netns add "$portal_ns"
 portal_ns_created=1
