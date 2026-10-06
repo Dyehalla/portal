@@ -1,0 +1,15 @@
+[package]
+name = "portal-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Linux WireGuard runtime and local Unix control socket"
+
+[[bin]]
+name = "portal-runtime"
+path = "src/main.rs"
+
+[dependencies]
+portal = { path = "../wireguard" }
+boringtun = { version = "=0.7.1", default-features = false }
+libc = "0.2"
+zeroize = "1.8"

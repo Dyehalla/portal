@@ -84,17 +84,19 @@ cargo build -p portal --example wireguard_interop
 sudo WITH_PSK=1 ./wireguard/scripts/check-kernel-interop.sh
 ```
 
-## Linux CLI
+## Runtime и CLI
 
-Отдельный пакет `portal-cli` предоставляет бинарник `portal`. Он держит `Device`
-в foreground-процессе, настраивает TUN через `ip` и принимает команды управления
-через Unix socket с правами `0600`.
+`portal-runtime` — отдельный foreground daemon: он владеет `Device` и настраивает
+Linux TUN-интерфейс. `portal-cli` — отдельный бинарник `portal`, который управляет
+локальным runtime через Unix control socket с простым request/response протоколом.
+Этот IPC предназначен только для управления процессом на той же машине. gRPC
+предназначен для прикладного общения между пирам и не управляет локальным `Device`.
 
 ```sh
-cargo build -p portal-cli --release
+cargo build -p portal-runtime -p portal-cli --release
 sudo install -d -m 700 /etc/portal
-sudo target/release/portal keygen --private-key-file /etc/portal/device.key
-sudo target/release/portal run \
+sudo target/release/portal-runtime keygen --private-key-file /etc/portal/device.key
+sudo target/release/portal-runtime run \
   --tun portal0 \
   --private-key-file /etc/portal/device.key \
   --listen 0.0.0.0:51820 \
@@ -104,8 +106,9 @@ sudo target/release/portal run \
 ```
 
 `keygen` создаёт raw-файл приватного ключа с режимом `0600` и печатает открытый
-ключ в hex. Команда `run` настраивает MTU, адреса, состояние интерфейса и
-удерживает устройство запущенным. В другом терминале можно управлять пирами и
+ключ в hex. `portal-runtime run` поднимает устройство, настраивает MTU, адреса и
+состояние интерфейса, затем слушает Unix control socket с правами `0600`. Runtime
+остаётся отдельным процессом. В другом терминале CLI может управлять пирами и
 читать статистику:
 
 ```sh
@@ -123,15 +126,16 @@ sudo target/release/portal shutdown --socket /run/portal0.sock
 ```
 
 Также доступны `peer remove`, `endpoint set|clear`, `list`, `stats` и `health`.
-При изменении `AllowedIPs` CLI добавляет или удаляет соответствующие host-маршруты
-через TUN. Если такой точный маршрут уже существует через этот интерфейс, CLI его
+При изменении `AllowedIPs` runtime добавляет или удаляет соответствующие host-маршруты
+через TUN. Если такой точный маршрут уже существует через этот интерфейс, runtime его
 не удаляет при завершении. Конфигурация пиров хранится в памяти процесса, поэтому
 после перезапуска их нужно добавить снова. `upsert` полностью заменяет `preshared_key`
 и `persistent_keepalive`; если PSK не передан, он будет сброшен.
 
-CLI требует Linux, `iproute2` и права на создание TUN-интерфейса и настройку
+Runtime требует Linux, `iproute2` и права на создание TUN-интерфейса и настройку
 маршрутов. По умолчанию автоматическая установка маршрутов `0.0.0.0/0` и `::/0`
 отклоняется: полноценный full-tunnel требует policy routing, чтобы UDP-пакеты
 WireGuard к endpoint не попали обратно в туннель. Для такого режима используйте
 `--no-auto-routes` и настройте маршруты отдельно. CLI также не меняет системный
-IP forwarding и firewall.
+IP forwarding и firewall. CLI не содержит реализацию `Device` или команды
+настройки Linux-интерфейса.
