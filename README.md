@@ -88,9 +88,9 @@ sudo WITH_PSK=1 ./wireguard/scripts/check-kernel-interop.sh
 
 `portal-runtime` — отдельный foreground daemon: он владеет `Device` и настраивает
 Linux TUN-интерфейс. `portal-cli` — отдельный бинарник `portal`, который управляет
-локальным runtime через Unix control socket с простым request/response протоколом.
-Этот IPC предназначен только для управления процессом на той же машине. gRPC
-предназначен для прикладного общения между пирам и не управляет локальным `Device`.
+локальным runtime через HTTP API на loopback-адресе. API предназначен для CLI и
+веб-клиента; gRPC остаётся для прикладного общения между пирам и не управляет
+локальным `Device`.
 
 ```sh
 cargo build -p portal-runtime -p portal-cli --release
@@ -100,30 +100,61 @@ sudo target/release/portal-runtime run \
   --tun portal0 \
   --private-key-file /etc/portal/device.key \
   --listen 0.0.0.0:51820 \
-  --socket /run/portal0.sock \
+  --api-listen 127.0.0.1:51821 \
+  --api-token-file /run/portal.token \
   --address 10.20.0.1/24 \
   --mtu 1420
 ```
 
 `keygen` создаёт raw-файл приватного ключа с режимом `0600` и печатает открытый
 ключ в hex. `portal-runtime run` поднимает устройство, настраивает MTU, адреса и
-состояние интерфейса, затем слушает Unix control socket с правами `0600`. Runtime
-остаётся отдельным процессом. В другом терминале CLI может управлять пирами и
-читать статистику:
+состояние интерфейса, затем слушает HTTP API только на loopback. Случайный bearer-
+токен записывается в файл с режимом `0600` и удаляется при штатной остановке.
+Для веб-клиента токен можно прочитать с правами владельца runtime и передать в
+`Authorization: Bearer ...`; не встраивайте его в общедоступные frontend-файлы.
+Runtime остаётся отдельным процессом. CLI обращается к тому же API, что и веб-клиент:
 
 ```sh
 sudo target/release/portal peer upsert \
-  --socket /run/portal0.sock \
+  --api 127.0.0.1:51821 \
+  --token-file /run/portal.token \
   --public-key PUBLIC_KEY_HEX \
   --endpoint 198.51.100.10:51820 \
   --keepalive 25 \
   --allowed-ip 10.20.0.2/32
-sudo target/release/portal status --socket /run/portal0.sock
+sudo target/release/portal status --api 127.0.0.1:51821 --token-file /run/portal.token
 sudo target/release/portal peer-stats \
-  --socket /run/portal0.sock \
+  --api 127.0.0.1:51821 \
+  --token-file /run/portal.token \
   --public-key PUBLIC_KEY_HEX
-sudo target/release/portal shutdown --socket /run/portal0.sock
+sudo target/release/portal shutdown --api 127.0.0.1:51821 --token-file /run/portal.token
 ```
+
+API v1 принимает `POST /api/v1/command` с JSON-телом `{"operation":"status"}` и
+заголовком `Authorization: Bearer <token>`. Доступны операции `peer_upsert`,
+`peer_remove`, `endpoint_set`, `endpoint_clear`, `status`, `health`, `stats`,
+`peer_stats`, `list` и `shutdown`. Например, веб-клиент может отправить ту же
+команду через `fetch` с bearer-токеном:
+
+```js
+const response = await fetch("http://127.0.0.1:51821/api/v1/command", {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ operation: "status" }),
+});
+const result = await response.json();
+```
+
+Для `peer_upsert` тело содержит `public_key`, необязательные `preshared_key`,
+`endpoint`, `keepalive_seconds` и массив строк `allowed_ips`. Другие операции:
+`peer_remove`, `endpoint_set`, `endpoint_clear`, `peer_stats`, `status`, `health`,
+`stats`, `list` и `shutdown`; ключи задаются 64 символами hex.
+Ошибки возвращают HTTP-статус и JSON `{"message":"..."}`. Браузерный клиент
+должен работать с того же origin; listener нельзя переносить на публичный или
+туннельный интерфейс.
 
 Также доступны `peer remove`, `endpoint set|clear`, `list`, `stats` и `health`.
 При изменении `AllowedIPs` runtime добавляет или удаляет соответствующие host-маршруты
@@ -139,3 +170,192 @@ WireGuard к endpoint не попали обратно в туннель. Для
 `--no-auto-routes` и настройте маршруты отдельно. CLI также не меняет системный
 IP forwarding и firewall. CLI не содержит реализацию `Device` или команды
 настройки Linux-интерфейса.
+
+## Передача файлов между пирами
+
+`portal-files` — отдельный прикладной сервис, который работает поверх уже
+настроенной WireGuard-сети. gRPC проверяет право пира на скачивание и выдаёт
+короткоживущий одноразовый билет; HTTP передаёт байты файла. Оба соединения
+должны идти на туннельные IP. HTTP не добавляет отдельное шифрование: трафик
+защищает WireGuard.
+
+Общий gRPC-сервер находится в `runtime/src/grpc.rs`: runtime собирает
+обработчики прикладных сервисов на одном listener. Контракт FileTransfer
+принадлежит `portal-files` и хранится в `files/proto/file_transfer.proto`.
+
+Для сборки нужен `protoc`. Соберите бинарник:
+
+```sh
+cargo build -p portal-runtime -p portal-files --release
+```
+
+Файловый сервис запускает `portal-runtime` вместе с Device. На пире `10.20.0.1`
+добавьте параметры gRPC и файлового сервиса к обычной команде запуска runtime:
+
+```sh
+sudo target/release/portal-runtime run \
+  --tun portal0 \
+  --private-key-file /etc/portal/device.key \
+  --listen 0.0.0.0:51820 \
+  --address 10.20.0.1/24 \
+  --grpc-listen 10.20.0.1:50051 \
+  --files-root /srv/portal-share \
+  --files-http-listen 10.20.0.1:8080 \
+  --files-allow-download 10.20.0.2
+```
+
+С другого разрешённого пира запросите файл по относительному пути внутри
+`/srv/portal-share` и укажите локальное имя для результата:
+
+```sh
+target/release/portal-files download \
+  --grpc http://10.20.0.1:50051 \
+  --path documents/report.pdf \
+  --output ./report.pdf
+```
+
+Сервис отклоняет абсолютные пути и `..`, а также проверяет, что разрешённый
+симлинк остаётся внутри корневой папки.
+TODO: устранить гонку между проверкой пути и открытием файла кроссплатформенным
+способом: подмена файла или родительской директории симлинком в этот промежуток
+может привести к чтению вне общей папки.
+
+Билеты действуют пять минут и очищаются раз в секунду. Одновременно допускается
+128 билетов и активных скачиваний в сумме. Клиент ограничивает подключение десятью
+секундами, RPC и ожидание HTTP-ответа — тридцатью; скачивание прерывается после
+тридцати секунд без новых данных, а частичный файл удаляется. При остановке runtime
+даёт серверам пять секунд на завершение, затем отменяет оставшиеся соединения.
+
+Разрешение пока задаётся целиком на
+скачивание по туннельному IP; адрес пира должен быть закреплён за его WireGuard
+ключом через `AllowedIPs`. Порталы gRPC и HTTP следует открывать только на
+туннельном интерфейсе. В этой версии реализовано скачивание; загрузка и права
+на отдельные файлы пока не входят в контракт.
+
+
+## Пробная интеграция SMB (Linux)
+
+Runtime может поднять одну общую папку только для чтения через отдельный процесс
+Samba. Нужны `smbd` и `testparm` из пакета Samba. По умолчанию Samba работает
+от текущего пользователя; если runtime запущен через `sudo`, выбирается пользователь,
+вызвавший `sudo`. `--smb-user USER` задаёт другой существующий Linux-аккаунт;
+непривилегированный runtime может использовать только собственный аккаунт.
+При запуске runtime от root без информации о sudo нужно явно указать
+непривилегированный `--smb-user` или включить `--smb-as-root`.
+
+Runtime перед запуском Samba снимает root-права с дочернего процесса, назначает UID,
+GID и группы выбранного пользователя. Учётная запись должна иметь право читать
+папку и проходить по её родительским директориям. Runtime не создаёт системных
+пользователей. Его настройка WireGuard по-прежнему требует соответствующих прав.
+SMB-пароль задаётся отдельно от пароля Linux; файл пароля должен принадлежать
+пользователю runtime или выбранному пользователю Samba и иметь режим `0600`.
+Одна строка содержит пароль. База SMB-паролей создаётся напрямую в приватной
+папке процесса; запуск `smbpasswd` с root-правами не требуется.
+
+Например, сохраните пароль без отображения в терминале:
+
+```sh
+sudo bash -c 'umask 077; read -r -s -p "SMB password: " smb_password; printf "\n" >&2; printf "%s\n" "$smb_password" > /etc/portal/smb.password'
+```
+
+Добавьте параметры к обычному запуску runtime. Замените `reader` существующим
+непривилегированным Linux-пользователем, которому доступен `/srv/portal-share`:
+
+```sh
+sudo target/release/portal-runtime run \
+  --tun portal0 \
+  --private-key-file /etc/portal/device.key \
+  --listen 0.0.0.0:51820 \
+  --address 10.20.0.1/24 \
+  --grpc-listen 10.20.0.1:50051 \
+  --smb-root /srv/portal-share \
+  --smb-name documents \
+  --smb-listen 10.20.0.1 \
+  --smb-user reader \
+  --smb-password-file /etc/portal/smb.password \
+  --smb-allow-peer 10.20.0.2
+```
+
+Добавьте пир `10.20.0.2` через `portal peer upsert` с его ключом, endpoint и
+`--allowed-ip 10.20.0.2/32`. `--smb-allow-peer` можно повторять; IP разрешённого пира
+должен быть закреплён за его ключом через AllowedIPs. Listener использует только
+IP, назначенный TUN через `--address`. По умолчанию используется TCP 1445;
+`--smb-port PORT` задаёт другой порт. Уже занятый порт отклоняется.
+Если firewall блокирует соединение, разрешите выбранный TCP-порт на TUN от выбранных пиров;
+runtime не меняет firewall.
+
+Для проверки непривилегированной Samba на Linux:
+
+```sh
+smbclient //10.20.0.1/documents -p 1445 -U reader
+```
+
+Нестандартный порт должен поддерживаться SMB-клиентом. Некоторые стандартные
+файловые клиенты требуют порт 445. Для запуска на нём можно использовать
+`--smb-port 445`, если у процесса Samba уже есть право привязки к этому порту.
+Runtime не выдаёт дополнительные capabilities и не перенаправляет порты автоматически.
+
+Опциональный запуск Samba от root: добавьте `--smb-as-root` к запуску привилегированного
+runtime. Тогда порт по умолчанию — 445, если `--smb-port` не указан. Этот флаг сам
+не вызывает `sudo` и не повышает права непривилегированного runtime. На стандартном
+порту адрес подключения — `smb://10.20.0.1/documents` (macOS/iOS)
+или `\\10.20.0.1\documents` (Windows). Логин и пароль остаются отдельными от режима запуска.
+
+Каждый запуск создаёт отдельные конфигурацию, базу паролей и состояние Samba в
+приватной временной директории; системный `smb.conf` и системная база Samba не меняются.
+При завершении runtime останавливает собственный процесс Samba и удаляет временное
+состояние. При аварийном SIGKILL автоматическая очистка не гарантируется.
+SMB1, гостевой доступ, запись и переход по симлинкам выключены. Для этой первой
+версии используется одна учётная запись для всех разрешённых пиров; динамическое
+управление шарами, отдельные учётные записи на пир и автоматический маунт ещё не реализованы.
+SMB управляется `portal-files::FileService` и согласуется через тот же gRPC
+`FileTransfer`, что и HTTP-загрузки. `--smb-root` требует `--grpc-listen`; HTTP-сервис
+можно не включать. gRPC и HTTP listeners должны использовать адреса туннельного интерфейса.
+
+Клиент сначала вызывает `ListShares`: сервер возвращает только разрешённые этому
+туннельному IP шары (имя, IP, порт, read-only). `PrepareSmbConnection` повторно
+проверяет разрешение и возвращает параметры и SMB-учётные данные выбранной шары.
+IP берётся из TCP-соединения, а не из полей запроса. Разрешения на SMB и HTTP-загрузки
+независимы. gRPC работает внутри WireGuard; пароль нельзя логировать или передавать
+через незашифрованную внешнюю сеть.
+
+```sh
+cargo run -p portal-files -- smb-list --grpc http://10.20.0.1:50051
+cargo run -p portal-files -- smb-connect --grpc http://10.20.0.1:50051 --share documents
+```
+
+`smb-connect` на Unix открывает интерактивный `smbclient` с согласованными параметрами.
+Пароль не выводится и не попадает в аргументы процесса: используется временный файл
+0600 в каталоге 0700, который удаляется при обычном завершении клиента. Требуется установленный
+`smbclient`. Это открытие клиентской сессии, а не системный маунт. Для интеграции
+с нативным клиентом доступны библиотечные функции `list_shares` и
+`prepare_smb_connection`; автоматический маунт для каждой ОС пока не реализован.
+Клиент ожидает числовой туннельный IP в gRPC URL и проверяет совпадение с SMB-хостом.
+
+Учётные данные общие для разрешённых пиров и действуют до изменения пароля
+сервера; этот RPC не выдаёт одноразовый билет. TODO: отдельные учётные записи на пир,
+ротация паролей и отзыв активных SMB-сессий. Linux-код сервера изолирован в
+`files/src/platform/linux/smb.rs`.
+
+Для end-to-end проверки в отдельных network namespace:
+
+```sh
+cargo build -p portal-runtime -p portal-cli
+# Непривилегированная Samba, привилегированная настройка WireGuard:
+sudo env SMB_TEST_USER=reader bash runtime/scripts/check-smb.sh
+# Samba от root:
+sudo env SMB_TEST_USER=reader SMB_AS_ROOT=1 bash runtime/scripts/check-smb.sh
+```
+
+Тест требует `/dev/net/tun`, kernel WireGuard, `ip`, `wg`, Samba и `smbclient`.
+Он проверяет чтение файла через WireGuard, запрет записи, симлинков и гостевого
+доступа, запрет доступа пира без SMB-разрешения, привязку listener к туннельному
+адресу и завершение runtime.
+
+Проверка Samba без root и без WireGuard на loopback (запускается от обычного пользователя):
+
+```sh
+cargo test -p portal-files rootless_samba_serves_files -- --ignored
+```
+
+Она проверяет gRPC-обнаружение и выдачу учётных данных, UID процесса Samba, чтение файла с полученными учётными данными, запрет записи и симлинков и остановку.

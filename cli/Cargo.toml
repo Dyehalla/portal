@@ -2,11 +2,13 @@
 name = "portal-cli"
 version = "0.1.0"
 edition = "2024"
-description = "CLI client for the portal runtime Unix control socket"
+description = "CLI client for the portal runtime HTTP management API"
 
 [[bin]]
 name = "portal"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 zeroize = "1.8"

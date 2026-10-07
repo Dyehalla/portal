@@ -15,7 +15,11 @@ pub struct RuntimeConfig {
     pub handshake_rate_limit: Option<u64>,
     pub dual_stack: bool,
     pub auto_routes: bool,
-    pub control_socket: PathBuf,
+    pub api_listen: SocketAddr,
+    pub api_token_file: PathBuf,
+    pub grpc_listen: Option<SocketAddr>,
+    pub file_service: Option<portal_files::FileServiceConfig>,
+    pub smb: Option<SmbConfig>,
 }
 
 /// Secret device key that is cleared from memory when its owner is dropped.
@@ -62,3 +66,5 @@ impl std::fmt::Display for InterfaceAddress {
         write!(f, "{}/{}", self.address, self.prefix_len)
     }
 }
+
+pub use portal_files::SmbConfig;

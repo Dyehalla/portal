@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::api::LocalApi;
+use crate::api::ManagementRequest;
+use crate::peer_services::PeerServices;
 use crate::platform::{HostPlatform, LinuxPlatform};
 use crate::{InterfaceAddress, RuntimeConfig, SecretKey};
 use portal::{AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
@@ -32,8 +33,29 @@ pub(crate) struct Runtime {
     platform: Arc<dyn HostPlatform>,
 }
 
-/// Create the WireGuard device, configure its host interface, serve local commands, and clean up.
+/// Create the WireGuard device, configure its host interface, serve the local API, and clean up.
 pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
+    if let Some(smb) = options.smb.as_ref()
+        && !options
+            .addresses
+            .iter()
+            .any(|address| address.address == smb.listen)
+    {
+        return Err("SMB listener must use an IP assigned to the tunnel".into());
+    }
+    for listener in options
+        .grpc_listen
+        .into_iter()
+        .chain(options.file_service.as_ref().map(|files| files.http_listen))
+    {
+        if !options
+            .addresses
+            .iter()
+            .any(|address| address.address == listener.ip())
+        {
+            return Err("peer gRPC/HTTP listeners must use an IP assigned to the tunnel".into());
+        }
+    }
     let platform: Arc<dyn HostPlatform> = Arc::new(LinuxPlatform);
     platform.install_signal_handlers();
     platform.ensure_interface_absent(&options.tun_name)?;
@@ -76,8 +98,12 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
         return Err(error);
     }
 
-    let listener = match crate::platform::linux::control_socket::bind(&options.control_socket) {
-        Ok(listener) => listener,
+    let mut peer_services = match start_peer_services(
+        options.grpc_listen,
+        options.file_service.take(),
+        options.smb.take(),
+    ) {
+        Ok(services) => services,
         Err(error) => {
             let _ = platform.cleanup_interface(&options.tun_name, &configured_addresses, link_up);
             let mut device = device;
@@ -85,17 +111,16 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             return Err(error);
         }
     };
+    if let Some(services) = peer_services.as_ref() {
+        let (grpc_address, http_address) = services.addresses();
+        println!("peer gRPC listening on {grpc_address}");
+        if let Some(http_address) = http_address {
+            println!("file HTTP listening on {http_address}");
+        }
+    }
 
     let tun_name = options.tun_name.clone();
-    println!(
-        "READY tun={} listen={} public_key={} socket={}",
-        tun_name,
-        device.listen_addr(),
-        encode_hex(&device.public_key()),
-        options.control_socket.display()
-    );
-
-    let mut runtime = Runtime {
+    let runtime = Runtime {
         device: Some(device),
         tun_name: options.tun_name,
         addresses: configured_addresses,
@@ -106,73 +131,146 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
         shutdown_requested: false,
         platform: Arc::clone(&platform),
     };
+    let listen_address = runtime
+        .device
+        .as_ref()
+        .expect("device was just created")
+        .listen_addr();
+    let public_key = encode_hex(
+        &runtime
+            .device
+            .as_ref()
+            .expect("device was just created")
+            .public_key(),
+    );
+    let runtime = Arc::new(Mutex::new(runtime));
+    let api = match LocalApi::start(
+        options.api_listen,
+        options.api_token_file.clone(),
+        Arc::clone(&runtime),
+    ) {
+        Ok(api) => api,
+        Err(error) => {
+            if let Some(services) = peer_services.take() {
+                let _ = services.stop();
+            }
+            let cleanup = runtime
+                .lock()
+                .map_err(|_| "runtime state is unavailable during cleanup".to_owned())
+                .and_then(|mut runtime| runtime.cleanup());
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!("{error}; cleanup failed: {cleanup_error}")),
+            };
+        }
+    };
+
+    println!(
+        "READY tun={} listen={} public_key={} api={} token_file={}",
+        tun_name,
+        listen_address,
+        public_key,
+        api.local_addr(),
+        options.api_token_file.display()
+    );
 
     let mut serve_result = Ok(());
     loop {
         if platform.stop_requested() {
             break;
         }
-        if let Some(device) = runtime.device.as_ref()
-            && let Err(error) = device.health()
         {
-            serve_result = Err(format!("WireGuard device failed: {error}"));
+            let runtime = match runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    serve_result = Err("runtime state became unavailable".into());
+                    break;
+                }
+            };
+            if let Some(device) = runtime.device.as_ref()
+                && let Err(error) = device.health()
+            {
+                serve_result = Err(format!("WireGuard device failed: {error}"));
+                break;
+            }
+            if runtime.shutdown_requested {
+                break;
+            }
+        }
+        if api.has_exited() {
+            serve_result = Err("local HTTP API exited unexpectedly".into());
             break;
         }
-        if runtime.shutdown_requested {
-            break;
-        }
-        if let Err(error) =
-            crate::platform::linux::control_socket::process_one(&listener, |stream| {
-                crate::control::handle_stream(stream, &mut runtime)
-            })
-        {
-            serve_result = Err(error);
+        if peer_services.as_ref().is_some_and(PeerServices::has_exited) {
+            serve_result = match peer_services
+                .take()
+                .expect("peer server was present")
+                .stop()
+            {
+                Ok(()) => Err("peer-facing gRPC or HTTP server exited unexpectedly".into()),
+                Err(error) => Err(error),
+            };
             break;
         }
         thread::sleep(LOOP_INTERVAL);
     }
 
-    let cleanup_result = runtime.cleanup();
-    if let Err(error) = fs::remove_file(&options.control_socket) {
-        if error.kind() != io::ErrorKind::NotFound {
-            eprintln!("portal: could not remove runtime control socket: {error}");
+    let api_result = api.stop();
+    if serve_result.is_ok() {
+        serve_result = api_result;
+    }
+    if let Some(services) = peer_services.take() {
+        let peer_service_result = services.stop();
+        if serve_result.is_ok() {
+            serve_result = peer_service_result;
         }
     }
+
+    let cleanup_result = runtime
+        .lock()
+        .map_err(|_| "runtime state became unavailable during cleanup".to_owned())
+        .and_then(|mut runtime| runtime.cleanup());
     serve_result?;
     cleanup_result
 }
 
-impl Runtime {
-    /// Parse one local command and dispatch it to the matching Device or host-network operation.
-    pub(crate) fn handle_request(&mut self, request: &str) -> Result<String, String> {
-        let fields = request.split_whitespace().collect::<Vec<_>>();
-        let Some(command) = fields.first().copied() else {
-            return Err("empty control request".into());
+/// Start the configured peer services or reject incomplete listener configuration.
+fn start_peer_services(
+    grpc_address: Option<SocketAddr>,
+    file_service: Option<portal_files::FileServiceConfig>,
+    smb: Option<portal_files::SmbConfig>,
+) -> Result<Option<PeerServices>, String> {
+    if file_service.is_none() && smb.is_none() {
+        return if grpc_address.is_none() {
+            Ok(None)
+        } else {
+            Err("--grpc-listen requires at least one configured gRPC service".into())
         };
-        match command {
-            "peer-upsert" => {
-                if fields.len() != 6 {
-                    return Err(
-                        "peer-upsert expects key, psk, endpoint, keepalive and allowed IPs".into(),
-                    );
-                }
-                let public_key = parse_key_hex(fields[1])?;
-                let preshared_key = parse_optional(fields[2])
-                    .map(parse_key_hex)
-                    .transpose()?
-                    .map(SecretKey);
-                let endpoint = parse_optional(fields[3])
-                    .map(|value| {
-                        value
-                            .parse::<SocketAddr>()
-                            .map_err(|error| format!("invalid endpoint: {error}"))
-                    })
+    }
+    let address = grpc_address.ok_or("file sharing requires --grpc-listen")?;
+    PeerServices::start(address, file_service, smb).map(Some)
+}
+
+impl Runtime {
+    /// Dispatch one authenticated JSON API operation to its Device or host-network operation.
+    pub(crate) fn handle_api_request(
+        &mut self,
+        request: ManagementRequest,
+    ) -> Result<String, String> {
+        match request {
+            ManagementRequest::PeerUpsert {
+                public_key,
+                preshared_key,
+                endpoint,
+                keepalive_seconds,
+                allowed_ips,
+            } => {
+                let preshared_key = preshared_key
+                    .map(|value| parse_key_hex(&value.0).map(SecretKey))
                     .transpose()?;
-                let keepalive = parse_optional(fields[4])
-                    .map(|value| {
-                        let seconds = value
-                            .parse::<u64>()
-                            .map_err(|error| format!("invalid keepalive: {error}"))?;
+                let public_key = parse_key_hex(&public_key)?;
+                let keepalive = keepalive_seconds
+                    .map(|seconds| {
                         if seconds == 0 || seconds > u16::MAX as u64 {
                             return Err(String::from(
                                 "keepalive must be between 1 and 65535 seconds",
@@ -181,33 +279,27 @@ impl Runtime {
                         Ok(Duration::from_secs(seconds))
                     })
                     .transpose()?;
-                let allowed_ips = if fields[5] == "-" {
-                    Vec::new()
-                } else {
-                    fields[5]
-                        .split(',')
-                        .map(|value| {
-                            value
-                                .parse::<AllowedIp>()
-                                .map_err(|error| format!("invalid allowed IP `{value}`: {error}"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                };
+                let allowed_ips = allowed_ips
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .parse::<AllowedIp>()
+                            .map_err(|error| format!("invalid allowed IP `{value}`: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.upsert_peer(public_key, preshared_key, endpoint, keepalive, allowed_ips)
             }
-            "peer-remove" if fields.len() == 2 => self.remove_peer(parse_key_hex(fields[1])?),
-            "peer-remove" => Err("peer-remove expects one public key".into()),
-            "endpoint-set" if fields.len() == 3 => {
-                let public_key = parse_key_hex(fields[1])?;
-                let endpoint = fields[2]
-                    .parse::<SocketAddr>()
-                    .map_err(|error| format!("invalid endpoint: {error}"))?;
-                self.set_endpoint(public_key, endpoint)
+            ManagementRequest::PeerRemove { public_key } => {
+                self.remove_peer(parse_key_hex(&public_key)?)
             }
-            "endpoint-set" => Err("endpoint-set expects a key and socket address".into()),
-            "endpoint-clear" if fields.len() == 2 => self.clear_endpoint(parse_key_hex(fields[1])?),
-            "endpoint-clear" => Err("endpoint-clear expects one public key".into()),
-            "stats" if fields.len() == 1 => {
+            ManagementRequest::EndpointSet {
+                public_key,
+                endpoint,
+            } => self.set_endpoint(parse_key_hex(&public_key)?, endpoint),
+            ManagementRequest::EndpointClear { public_key } => {
+                self.clear_endpoint(parse_key_hex(&public_key)?)
+            }
+            ManagementRequest::Stats => {
                 let stats = self.device.as_ref().expect("running device").stats();
                 Ok(format!(
                     "received_udp={} received_tun={} dropped={} timer_send_errors={} udp_send_errors={}",
@@ -218,8 +310,8 @@ impl Runtime {
                     stats.udp_send_errors
                 ))
             }
-            "peer-stats" if fields.len() == 2 => {
-                let key = parse_key_hex(fields[1])?;
+            ManagementRequest::PeerStats { public_key } => {
+                let key = parse_key_hex(&public_key)?;
                 let stats = self
                     .device
                     .as_ref()
@@ -235,8 +327,7 @@ impl Runtime {
                     stats.rx_bytes
                 ))
             }
-            "peer-stats" => Err("peer-stats expects one public key".into()),
-            "health" if fields.len() == 1 => {
+            ManagementRequest::Health => {
                 self.device
                     .as_ref()
                     .expect("running device")
@@ -244,7 +335,7 @@ impl Runtime {
                     .map_err(|error| error.to_string())?;
                 Ok("healthy".into())
             }
-            "status" if fields.len() == 1 => {
+            ManagementRequest::Status => {
                 let device = self.device.as_ref().expect("running device");
                 device.health().map_err(|error| error.to_string())?;
                 Ok(format!(
@@ -255,7 +346,7 @@ impl Runtime {
                     self.peers.len()
                 ))
             }
-            "list" if fields.len() == 1 => {
+            ManagementRequest::List => {
                 let mut peers = self
                     .peers
                     .iter()
@@ -289,12 +380,10 @@ impl Runtime {
                     peers.join("; ")
                 })
             }
-            "shutdown" if fields.len() == 1 => {
+            ManagementRequest::Shutdown => {
                 self.shutdown_requested = true;
                 Ok("shutdown requested".into())
             }
-            "shutdown" => Err("shutdown takes no arguments".into()),
-            _ => Err(format!("unknown control request `{command}`")),
         }
     }
 
@@ -490,7 +579,8 @@ impl Runtime {
     // Release runtime-owned routes, restore interface state, and stop the WireGuard Device.
     fn cleanup(&mut self) -> Result<(), String> {
         let desired = HashSet::new();
-        let mut errors = self.remove_stale_routes(&desired);
+        let mut errors = Vec::new();
+        errors.extend(self.remove_stale_routes(&desired));
         if let Err(error) =
             self.platform
                 .cleanup_interface(&self.tun_name, &self.addresses, self.link_up)
@@ -508,11 +598,6 @@ impl Runtime {
             Err(errors.join("; "))
         }
     }
-}
-
-// Interpret the dash marker used by the local command format as an absent value.
-fn parse_optional(value: &str) -> Option<&str> {
-    (value != "-").then_some(value)
 }
 
 // Decode a 64-character WireGuard key and clear the partially decoded bytes on failure.

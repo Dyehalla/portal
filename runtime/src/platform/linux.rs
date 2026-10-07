@@ -14,7 +14,7 @@ use portal::PeerKey;
 
 use super::HostPlatform;
 
-pub(crate) mod control_socket;
+pub(crate) mod api_token;
 
 pub(crate) struct LinuxPlatform;
 

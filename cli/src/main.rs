@@ -1,7 +1,5 @@
-#[cfg(target_os = "linux")]
-mod local_control;
+mod http_api;
 
-#[cfg(target_os = "linux")]
 mod cli {
     use std::collections::HashMap;
     use std::env;
@@ -36,33 +34,32 @@ mod cli {
 portal — control CLI for a running portal runtime
 
 Commands:
-  portal-runtime run --tun NAME --private-key-file PATH --listen ADDR --socket PATH [options]
+  portal-runtime run --tun NAME --private-key-file PATH --listen ADDR [options]
   portal-runtime keygen --private-key-file PATH
-  portal peer upsert --socket PATH --public-key HEX [--preshared-key-file PATH]
+  portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--preshared-key-file PATH]
       [--endpoint ADDR] [--keepalive SECONDS] [--allowed-ip PREFIX ...]
-  portal peer remove --socket PATH --public-key HEX
-  portal endpoint set --socket PATH --public-key HEX --endpoint ADDR
-  portal endpoint clear --socket PATH --public-key HEX
-  portal status|health|stats|list|shutdown --socket PATH
-  portal peer-stats --socket PATH --public-key HEX
+  portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
+  portal endpoint set|clear [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
+  portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
+  portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
 
-Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately;
-portal only sends management requests to its Unix control socket."
+Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
+The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
         );
     }
 
     fn peer_command(args: &[String]) -> Result<(), String> {
         let Some(action) = args.first().map(String::as_str) else {
-            return Err("usage: portal peer <upsert|remove> --socket PATH ...".into());
+            return Err("usage: portal peer <upsert|remove> [--api IP:PORT] ...".into());
         };
         let options = parse_options(&args[1..], &[])?;
         match action {
             "upsert" => {
-                let socket_path = required(&options, "socket")?;
                 validate_options(
                     &options,
                     &[
-                        "socket",
+                        "api",
+                        "token-file",
                         "public-key",
                         "preshared-key-file",
                         "endpoint",
@@ -99,31 +96,30 @@ portal only sends management requests to its Unix control socket."
                         .map(|key| encode_hex(key.as_ref()))
                         .unwrap_or_else(|| "-".into()),
                 );
-                let endpoint = endpoint
-                    .map(|address| address.to_string())
-                    .unwrap_or_else(|| "-".into());
-                let keepalive = keepalive
-                    .map(|seconds| seconds.to_string())
-                    .unwrap_or_else(|| "-".into());
                 let allowed_ips = options
                     .get("allowed-ip")
                     .filter(|ips| !ips.is_empty())
-                    .map(|ips| ips.join(","))
-                    .unwrap_or_else(|| "-".into());
-                let mut request = format!(
-                    "peer-upsert {} {} {endpoint} {keepalive} {allowed_ips}",
-                    encode_hex(&public_key),
-                    psk.as_str()
-                );
-                let result = crate::local_control::send(socket_path, &mut request)?;
+                    .map(|ips| ips.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let public_key = encode_hex(&public_key);
+                let command = crate::http_api::ManagementRequest::PeerUpsert {
+                    public_key: &public_key,
+                    preshared_key: (psk.as_str() != "-").then_some(psk.as_str()),
+                    endpoint,
+                    keepalive_seconds: keepalive,
+                    allowed_ips,
+                };
+                let result = send_command(&options, &command)?;
                 print_operation(result)
             }
             "remove" => {
-                validate_options(&options, &["socket", "public-key"], &[])?;
+                validate_options(&options, &["api", "token-file", "public-key"], &[])?;
                 let key = parse_key_hex(required(&options, "public-key")?)?;
-                let mut request = format!("peer-remove {}", encode_hex(&key));
-                let result =
-                    crate::local_control::send(required(&options, "socket")?, &mut request)?;
+                let public_key = encode_hex(&key);
+                let command = crate::http_api::ManagementRequest::PeerRemove {
+                    public_key: &public_key,
+                };
+                let result = send_command(&options, &command)?;
                 print_operation(result)
             }
             _ => Err(format!("unknown peer action `{action}`")),
@@ -132,12 +128,18 @@ portal only sends management requests to its Unix control socket."
 
     fn endpoint_command(args: &[String]) -> Result<(), String> {
         let Some(action) = args.first().map(String::as_str) else {
-            return Err("usage: portal endpoint <set|clear> --socket PATH --public-key HEX".into());
+            return Err(
+                "usage: portal endpoint <set|clear> [--api IP:PORT] --public-key HEX".into(),
+            );
         };
         let options = parse_options(&args[1..], &[])?;
         match action {
-            "set" => validate_options(&options, &["socket", "public-key", "endpoint"], &[])?,
-            "clear" => validate_options(&options, &["socket", "public-key"], &[])?,
+            "set" => validate_options(
+                &options,
+                &["api", "token-file", "public-key", "endpoint"],
+                &[],
+            )?,
+            "clear" => validate_options(&options, &["api", "token-file", "public-key"], &[])?,
             _ => {}
         }
         let key = parse_key_hex(required(&options, "public-key")?)?;
@@ -146,15 +148,20 @@ portal only sends management requests to its Unix control socket."
                 let endpoint = required(&options, "endpoint")?
                     .parse::<SocketAddr>()
                     .map_err(|error| format!("invalid --endpoint: {error}"))?;
-                let mut request = format!("endpoint-set {} {endpoint}", encode_hex(&key));
-                let result =
-                    crate::local_control::send(required(&options, "socket")?, &mut request)?;
+                let public_key = encode_hex(&key);
+                let command = crate::http_api::ManagementRequest::EndpointSet {
+                    public_key: &public_key,
+                    endpoint,
+                };
+                let result = send_command(&options, &command)?;
                 print_operation(result)
             }
             "clear" => {
-                let mut request = format!("endpoint-clear {}", encode_hex(&key));
-                let result =
-                    crate::local_control::send(required(&options, "socket")?, &mut request)?;
+                let public_key = encode_hex(&key);
+                let command = crate::http_api::ManagementRequest::EndpointClear {
+                    public_key: &public_key,
+                };
+                let result = send_command(&options, &command)?;
                 print_operation(result)
             }
             _ => Err(format!("unknown endpoint action `{action}`")),
@@ -164,18 +171,49 @@ portal only sends management requests to its Unix control socket."
     fn control_command(command: &str, args: &[String]) -> Result<(), String> {
         let options = parse_options(args, &[])?;
         if command == "peer-stats" {
-            validate_options(&options, &["socket", "public-key"], &[])?;
+            validate_options(&options, &["api", "token-file", "public-key"], &[])?;
         } else {
-            validate_options(&options, &["socket"], &[])?;
+            validate_options(&options, &["api", "token-file"], &[])?;
         }
-        let mut request = if command == "peer-stats" {
+        let response = if command == "peer-stats" {
             let key = parse_key_hex(required(&options, "public-key")?)?;
-            format!("peer-stats {}", encode_hex(&key))
+            let public_key = encode_hex(&key);
+            let request = crate::http_api::ManagementRequest::PeerStats {
+                public_key: &public_key,
+            };
+            send_command(&options, &request)?
         } else {
-            command.to_owned()
+            let request = match command {
+                "status" => crate::http_api::ManagementRequest::Status,
+                "health" => crate::http_api::ManagementRequest::Health,
+                "stats" => crate::http_api::ManagementRequest::Stats,
+                "list" => crate::http_api::ManagementRequest::List,
+                "shutdown" => crate::http_api::ManagementRequest::Shutdown,
+                _ => unreachable!("control_command is only called for known operations"),
+            };
+            send_command(&options, &request)?
         };
-        let response = crate::local_control::send(required(&options, "socket")?, &mut request)?;
         print_operation(response)
+    }
+
+    /// Send a command to the local HTTP API using its address and bearer-token file.
+    fn send_command(
+        options: &HashMap<String, Vec<String>>,
+        command: &crate::http_api::ManagementRequest<'_>,
+    ) -> Result<String, String> {
+        let address = options
+            .get("api")
+            .and_then(first)
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:51821");
+        let token_file = options
+            .get("token-file")
+            .and_then(first)
+            .map(String::as_str)
+            .unwrap_or("/run/portal.token");
+        let mut request = serde_json::to_string(command)
+            .map_err(|error| format!("could not encode API request: {error}"))?;
+        crate::http_api::send(address, token_file, &mut request)
     }
 
     fn print_operation(message: String) -> Result<(), String> {
@@ -333,16 +371,9 @@ portal only sends management requests to its Unix control socket."
     }
 }
 
-#[cfg(target_os = "linux")]
 fn main() {
     if let Err(error) = cli::entry() {
         eprintln!("portal: {error}");
         std::process::exit(1);
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!("portal CLI currently supports Linux only");
-    std::process::exit(1);
 }

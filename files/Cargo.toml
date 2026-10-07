@@ -1,0 +1,48 @@
+[package]
+name = "portal-files"
+version = "0.1.0"
+edition = "2024"
+description = "Peer-to-peer file transfers negotiated over gRPC and streamed over HTTP"
+build = "build.rs"
+
+[features]
+default = ["client"]
+client = [
+    "dep:futures-util",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "tokio/process",
+]
+
+[[bin]]
+name = "portal-files"
+path = "src/main.rs"
+required-features = ["client"]
+
+[dependencies]
+axum = "0.7"
+bytes = "1"
+futures-util = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+prost = "0.13"
+rand = "0.8"
+zeroize = "1.8"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tonic = { version = "0.12", features = ["transport"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+md4 = "0.10"
