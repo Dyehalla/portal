@@ -5,12 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -22,7 +20,6 @@ const MAX_OPEN_DOWNLOADS: usize = 128;
 /// Settings for the peer-facing file service.
 pub struct FileServiceConfig {
     pub root: PathBuf,
-    pub http_listen: SocketAddr,
     pub allowed_downloaders: HashSet<IpAddr>,
 }
 
@@ -43,113 +40,89 @@ pub(super) struct DownloadTicket {
     pub(super) permit: OwnedSemaphorePermit,
 }
 
-/// File-transfer feature state registered by the runtime in its shared gRPC server.
+/// Peer HTTP routes, download state, and managed Samba lifecycle.
 pub struct FileService {
     state: Option<SharedState>,
-    http_listener: Option<TcpListener>,
-    http_address: Option<SocketAddr>,
+    http_listener: TcpListener,
+    http_address: SocketAddr,
     #[cfg(target_os = "linux")]
     smb: Option<crate::platform::SmbService>,
 }
 
 impl FileService {
-    /// Validate the shared directory and bind its HTTP listener before runtime startup completes.
-    pub async fn new(config: FileServiceConfig) -> Result<Self, String> {
-        let root = tokio::fs::canonicalize(&config.root)
-            .await
-            .map_err(|error| {
-                format!(
-                    "could not resolve file root {}: {error}",
-                    config.root.display()
-                )
-            })?;
-        if !tokio::fs::metadata(&root)
-            .await
-            .map_err(|error| format!("could not inspect file root: {error}"))?
-            .is_dir()
-        {
-            return Err(format!("file root {} is not a directory", root.display()));
-        }
-        if config.allowed_downloaders.is_empty() {
-            return Err("at least one --allow-download peer IP is required".into());
-        }
-
-        let http_listener = TcpListener::bind(config.http_listen)
-            .await
-            .map_err(|error| {
-                format!(
-                    "could not bind HTTP listener {}: {error}",
-                    config.http_listen
-                )
-            })?;
-        let http_address = http_listener
-            .local_addr()
-            .map_err(|error| format!("could not inspect HTTP listener: {error}"))?;
-        let state = SharedState {
-            root: Arc::new(root),
-            download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
-            http_advertise: Arc::from(format!("http://{http_address}")),
-            allowed_downloaders: Arc::new(config.allowed_downloaders),
-            tickets: Arc::new(Mutex::new(HashMap::new())),
-        };
-        Ok(Self {
-            state: Some(state),
-            http_listener: Some(http_listener),
-            http_address: Some(http_address),
-            #[cfg(target_os = "linux")]
-            smb: None,
-        })
-    }
-
-    /// Host downloads, SMB, or both under the same FileTransfer service.
-    pub async fn new_with_smb(
+    /// Bind one HTTP listener for negotiation and downloads, and optionally start Samba.
+    pub async fn new(
+        http_listen: SocketAddr,
         downloads: Option<FileServiceConfig>,
         smb: Option<crate::SmbConfig>,
     ) -> Result<Self, String> {
         if downloads.is_none() && smb.is_none() {
             return Err("at least one file sharing backend is required".into());
         }
-        let mut service = match downloads {
-            Some(config) => Self::new(config).await?,
-            None => Self {
-                state: None,
-                http_listener: None,
-                http_address: None,
-                #[cfg(target_os = "linux")]
-                smb: None,
-            },
+        let http_listener = TcpListener::bind(http_listen)
+            .await
+            .map_err(|e| format!("could not bind peer HTTP listener {http_listen}: {e}"))?;
+        let http_address = http_listener.local_addr().map_err(|e| e.to_string())?;
+        let state = if let Some(config) = downloads {
+            let root = tokio::fs::canonicalize(&config.root).await.map_err(|e| {
+                format!("could not resolve file root {}: {e}", config.root.display())
+            })?;
+            if !tokio::fs::metadata(&root)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_dir()
+            {
+                return Err("file root must be a directory".into());
+            }
+            if config.allowed_downloaders.is_empty() {
+                return Err("at least one allowed downloader IP is required".into());
+            }
+            Some(SharedState {
+                root: Arc::new(root),
+                download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
+                http_advertise: Arc::from(format!("http://{http_address}")),
+                allowed_downloaders: Arc::new(config.allowed_downloaders),
+                tickets: Arc::new(Mutex::new(HashMap::new())),
+            })
+        } else {
+            None
         };
-        if let Some(config) = smb {
-            #[cfg(target_os = "linux")]
-            {
-                service.smb = Some(
-                    tokio::task::spawn_blocking(move || crate::platform::SmbService::start(config))
-                        .await
-                        .map_err(|e| format!("Samba startup task failed: {e}"))??,
-                );
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = config;
-                return Err("managed Samba currently supports Linux only".into());
-            }
+        #[cfg(target_os = "linux")]
+        let smb = match smb {
+            Some(config) => Some(
+                tokio::task::spawn_blocking(move || crate::platform::SmbService::start(config))
+                    .await
+                    .map_err(|e| format!("Samba startup task failed: {e}"))??,
+            ),
+            None => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        if smb.is_some() {
+            return Err("managed Samba currently supports Linux only".into());
         }
-        Ok(service)
+        Ok(Self {
+            state,
+            http_listener,
+            http_address,
+            #[cfg(target_os = "linux")]
+            smb,
+        })
     }
 
-    /// Return the file-transfer RPC handler for registration in the runtime's shared server.
-    pub fn grpc_service(
-        &self,
-    ) -> crate::rpc::file_transfer_server::FileTransferServer<crate::FileTransferRpc> {
+    /// Routes reusable by a peer HTTP server; callers must provide TCP ConnectInfo.
+    pub fn router(&self) -> axum::Router {
         #[cfg(target_os = "linux")]
         let smb = self.smb.as_ref().map(|smb| smb.access());
         #[cfg(not(target_os = "linux"))]
         let smb = None;
-        crate::grpc::server(self.state.clone(), smb)
+        crate::api::router(crate::api::ApiState {
+            downloads: self.state.clone(),
+            smb,
+        })
     }
 
     /// Return the address chosen for the HTTP byte-stream endpoint.
-    pub fn http_addr(&self) -> Option<SocketAddr> {
+    pub fn http_addr(&self) -> SocketAddr {
         self.http_address
     }
 
@@ -166,33 +139,21 @@ impl FileService {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let app = self.router();
         let state = self.state.clone();
-        let has_http = self.http_listener.is_some();
         let (http_shutdown, mut http_stopped) = tokio::sync::watch::channel(false);
-        let http = async move {
-            match (self.http_listener, self.state) {
-                (Some(listener), Some(state)) => {
-                    let app = Router::new()
-                        .route("/v1/download/:ticket", get(http_download))
-                        .with_state(state);
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async move {
-                        while !*http_stopped.borrow() {
-                            if http_stopped.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                    .into_future()
-                    .await
-                    .map_err(|error| format!("file HTTP server failed: {error}"))
+        let http = axum::serve(
+            self.http_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            while !*http_stopped.borrow() {
+                if http_stopped.changed().await.is_err() {
+                    break;
                 }
-                _ => std::future::pending().await,
             }
-        };
+        })
+        .into_future();
         tokio::pin!(http);
         tokio::pin!(shutdown);
         let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -200,14 +161,12 @@ impl FileService {
         let mut smb = self.smb;
         let result = loop {
             tokio::select! {
-                result = &mut http => break result,
+                result = &mut http => break result.map_err(|e| format!("peer HTTP server failed: {e}")),
                 _ = &mut shutdown => {
                     let _ = http_shutdown.send(true);
-                    break if has_http {
-                        tokio::time::timeout(std::time::Duration::from_secs(5), &mut http).await
-                            .map_err(|_| "file HTTP connections exceeded shutdown grace period".to_owned())
-                            .and_then(|result| result)
-                    } else { Ok(()) };
+                    break tokio::time::timeout(std::time::Duration::from_secs(5), &mut http).await
+                        .map_err(|_| "file HTTP connections exceeded shutdown grace period".to_owned())
+                        .and_then(|result| result.map_err(|e| format!("peer HTTP server failed: {e}")));
                 },
                 _ = cleanup.tick() => {
                     if let Some(state) = &state { state.prune_expired().await; }
@@ -229,11 +188,14 @@ impl FileService {
 }
 
 /// Consume a valid ticket only when its HTTP caller matches the peer that requested it.
-async fn http_download(
-    State(state): State<SharedState>,
+pub(crate) async fn http_download(
+    State(api): State<crate::api::ApiState>,
     ConnectInfo(requester): ConnectInfo<SocketAddr>,
     AxumPath(ticket_id): AxumPath<String>,
 ) -> Response {
+    let Some(state) = api.downloads else {
+        return http_error(StatusCode::NOT_IMPLEMENTED, "HTTP downloads are disabled");
+    };
     let requester = requester.ip();
     let mut tickets = state.tickets.lock().await;
     let Some(ticket) = tickets.get(&ticket_id) else {
@@ -296,7 +258,7 @@ struct DownloadStream {
     _permit: OwnedSemaphorePermit,
 }
 
-impl tokio_stream::Stream for DownloadStream {
+impl futures_core::Stream for DownloadStream {
     type Item = Result<bytes::Bytes, std::io::Error>;
 
     fn poll_next(
@@ -358,7 +320,10 @@ mod tests {
         let state = state();
         insert_ticket(&state, Instant::now() + std::time::Duration::from_secs(300)).await;
         let wrong = http_download(
-            State(state.clone()),
+            State(crate::api::ApiState {
+                downloads: Some(state.clone()),
+                smb: None,
+            }),
             ConnectInfo("127.0.0.2:1234".parse().unwrap()),
             AxumPath("ticket".into()),
         )
@@ -366,7 +331,10 @@ mod tests {
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
         assert_eq!(state.tickets.lock().await.len(), 1);
         let response = http_download(
-            State(state.clone()),
+            State(crate::api::ApiState {
+                downloads: Some(state.clone()),
+                smb: None,
+            }),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             AxumPath("ticket".into()),
         )
@@ -375,7 +343,10 @@ mod tests {
         assert!(state.tickets.lock().await.is_empty());
         assert!(state.download_slots.clone().try_acquire_owned().is_err());
         let reused = http_download(
-            State(state.clone()),
+            State(crate::api::ApiState {
+                downloads: Some(state.clone()),
+                smb: None,
+            }),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             AxumPath("ticket".into()),
         )

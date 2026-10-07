@@ -102,7 +102,7 @@ ip -n "$client_ns" link set wg-client up
 ip netns exec "$server_ns" "$runtime_bin" run \
     --tun portal0 --private-key-file "$tmp_dir/server.raw" --listen 192.0.2.1:51820 \
     --no-dual-stack --address 10.200.0.1/24 --api-token-file "$tmp_dir/api.token" \
-    --grpc-listen 10.200.0.1:50051 \
+    --peer-http-listen 10.200.0.1:8080 \
     --smb-root "$tmp_dir/share" --smb-listen 10.200.0.1 \
     --smb-user "$SMB_TEST_USER" --smb-password-file "$tmp_dir/password" \
     --smb-allow-peer 10.200.0.2 --smb-port "$smb_port" "${smb_args[@]}" > "$tmp_dir/runtime.log" 2>&1 &

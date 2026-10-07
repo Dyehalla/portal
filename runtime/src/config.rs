@@ -17,7 +17,7 @@ pub struct RuntimeConfig {
     pub auto_routes: bool,
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
-    pub grpc_listen: Option<SocketAddr>,
+    pub peer_http_listen: Option<SocketAddr>,
     pub file_service: Option<portal_files::FileServiceConfig>,
     pub smb: Option<SmbConfig>,
 }

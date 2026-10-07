@@ -18,7 +18,7 @@ pub struct SmbConfig {
 
 /// Connection metadata and credentials shared only with authorized tunnel peers.
 pub(crate) struct SmbAccess {
-    pub share: crate::rpc::SmbShare,
+    pub share: crate::models::SmbShare,
     pub username: String,
     pub password: zeroize::Zeroizing<String>,
     pub allowed_peers: Vec<IpAddr>,

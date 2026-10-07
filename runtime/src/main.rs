@@ -55,11 +55,10 @@ Run options:
   --handshake-rate-limit N  Handshakes per second (Device default if omitted)
   --no-dual-stack           Bind only the address family of --listen
   --no-auto-routes          Leave host routes to the administrator
-  --grpc-listen IP:PORT     Shared peer-to-peer gRPC listener (requires a service)
+  --peer-http-listen IP:PORT     Shared peer-to-peer HTTP listener (requires a service)
   --files-root DIR          Enable the file download service with this shared root
-  --files-http-listen IP:PORT HTTP listener for file contents
   --files-allow-download IP  Grant file downloads to this tunnel IP; repeatable
-  --smb-root DIR            Read-only Samba share (requires Samba and --grpc-listen)
+  --smb-root DIR            Read-only Samba share (requires Samba and --peer-http-listen)
   --smb-name NAME           Share name (default: documents)
   --smb-listen IP           Tunnel IP assigned with --address
   --smb-user USER           Unix/SMB account (default: current user or sudo caller)
@@ -87,9 +86,8 @@ fn run_command(args: &[String]) -> Result<(), String> {
             "handshake-rate-limit",
             "api-listen",
             "api-token-file",
-            "grpc-listen",
+            "peer-http-listen",
             "files-root",
-            "files-http-listen",
             "files-allow-download",
             "smb-root",
             "smb-name",
@@ -152,26 +150,20 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .and_then(first)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/portal.token"));
-    let grpc_listen = options
-        .get("grpc-listen")
+    let peer_http_listen = options
+        .get("peer-http-listen")
         .and_then(first)
         .map(|value| {
             value
                 .parse::<SocketAddr>()
-                .map_err(|error| format!("invalid --grpc-listen address: {error}"))
+                .map_err(|error| format!("invalid --peer-http-listen address: {error}"))
         })
         .transpose()?;
-    if grpc_listen.is_some_and(|address| address.ip().is_unspecified()) {
-        return Err("bind --grpc-listen to a specific tunnel address".into());
+    if peer_http_listen.is_some_and(|address| address.ip().is_unspecified()) {
+        return Err("bind --peer-http-listen to a specific tunnel address".into());
     }
     let file_service = match options.get("files-root").and_then(first) {
         Some(root) => {
-            let http_listen = required(&options, "files-http-listen")?
-                .parse::<SocketAddr>()
-                .map_err(|error| format!("invalid --files-http-listen address: {error}"))?;
-            if http_listen.ip().is_unspecified() {
-                return Err("bind --files-http-listen to a specific tunnel address".into());
-            }
             let allowed_downloaders = options
                 .get("files-allow-download")
                 .into_iter()
@@ -187,14 +179,11 @@ fn run_command(args: &[String]) -> Result<(), String> {
             }
             Some(FileServiceConfig {
                 root: PathBuf::from(root),
-                http_listen,
                 allowed_downloaders,
             })
         }
         None => {
-            if options.contains_key("files-http-listen")
-                || options.contains_key("files-allow-download")
-            {
+            if options.contains_key("files-allow-download") {
                 return Err("file service options require --files-root".into());
             }
             None
@@ -255,11 +244,11 @@ fn run_command(args: &[String]) -> Result<(), String> {
             None
         }
     };
-    match (grpc_listen, (file_service.is_some() || smb.is_some())) {
+    match (peer_http_listen, (file_service.is_some() || smb.is_some())) {
         (Some(_), false) => {
-            return Err("--grpc-listen requires at least one configured gRPC service".into());
+            return Err("--peer-http-listen requires at least one configured HTTP service".into());
         }
-        (None, true) => return Err("file sharing requires --grpc-listen".into()),
+        (None, true) => return Err("file sharing requires --peer-http-listen".into()),
         _ => {}
     }
     portal_runtime::run(RuntimeConfig {
@@ -274,7 +263,7 @@ fn run_command(args: &[String]) -> Result<(), String> {
         auto_routes: !options.contains_key("no-auto-routes"),
         api_listen,
         api_token_file,
-        grpc_listen,
+        peer_http_listen,
         file_service,
         smb,
     })

@@ -43,17 +43,13 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
     {
         return Err("SMB listener must use an IP assigned to the tunnel".into());
     }
-    for listener in options
-        .grpc_listen
-        .into_iter()
-        .chain(options.file_service.as_ref().map(|files| files.http_listen))
-    {
+    for listener in options.peer_http_listen.into_iter() {
         if !options
             .addresses
             .iter()
             .any(|address| address.address == listener.ip())
         {
-            return Err("peer gRPC/HTTP listeners must use an IP assigned to the tunnel".into());
+            return Err("peer HTTP listener must use an IP assigned to the tunnel".into());
         }
     }
     let platform: Arc<dyn HostPlatform> = Arc::new(LinuxPlatform);
@@ -99,7 +95,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
     }
 
     let mut peer_services = match start_peer_services(
-        options.grpc_listen,
+        options.peer_http_listen,
         options.file_service.take(),
         options.smb.take(),
     ) {
@@ -112,11 +108,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
         }
     };
     if let Some(services) = peer_services.as_ref() {
-        let (grpc_address, http_address) = services.addresses();
-        println!("peer gRPC listening on {grpc_address}");
-        if let Some(http_address) = http_address {
-            println!("file HTTP listening on {http_address}");
-        }
+        println!("peer HTTP listening on {}", services.address());
     }
 
     let tun_name = options.tun_name.clone();
@@ -207,7 +199,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
                 .expect("peer server was present")
                 .stop()
             {
-                Ok(()) => Err("peer-facing gRPC or HTTP server exited unexpectedly".into()),
+                Ok(()) => Err("peer-facing HTTP or HTTP server exited unexpectedly".into()),
                 Err(error) => Err(error),
             };
             break;
@@ -236,18 +228,18 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
 
 /// Start the configured peer services or reject incomplete listener configuration.
 fn start_peer_services(
-    grpc_address: Option<SocketAddr>,
+    http_address: Option<SocketAddr>,
     file_service: Option<portal_files::FileServiceConfig>,
     smb: Option<portal_files::SmbConfig>,
 ) -> Result<Option<PeerServices>, String> {
     if file_service.is_none() && smb.is_none() {
-        return if grpc_address.is_none() {
+        return if http_address.is_none() {
             Ok(None)
         } else {
-            Err("--grpc-listen requires at least one configured gRPC service".into())
+            Err("--peer-http-listen requires at least one configured HTTP service".into())
         };
     }
-    let address = grpc_address.ok_or("file sharing requires --grpc-listen")?;
+    let address = http_address.ok_or("file sharing requires --peer-http-listen")?;
     PeerServices::start(address, file_service, smb).map(Some)
 }
 

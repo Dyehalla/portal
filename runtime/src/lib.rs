@@ -2,8 +2,6 @@
 mod api;
 mod config;
 #[cfg(target_os = "linux")]
-mod grpc;
-#[cfg(target_os = "linux")]
 mod peer_services;
 mod platform;
 #[cfg(target_os = "linux")]

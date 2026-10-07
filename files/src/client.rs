@@ -4,15 +4,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::{Request as HttpRequest, StatusCode, Uri, header};
-use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use tokio::io::AsyncWriteExt;
-use tonic::transport::Endpoint;
 
-use crate::rpc::PrepareDownloadRequest;
-use crate::rpc::file_transfer_client::FileTransferClient;
+use crate::models::{PrepareDownloadRequest, PrepareDownloadResponse};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,17 +21,16 @@ async fn network_wait<T>(future: impl Future<Output = T>, operation: &str) -> Re
         .map_err(|_| format!("{operation} timed out after 30 seconds"))
 }
 
-/// Negotiate a download over gRPC, stream it over HTTP, then atomically publish the completed file.
-pub async fn download(grpc_url: &str, remote_path: &str, output: &Path) -> Result<(), String> {
-    let mut grpc = connect(grpc_url).await?;
-    let mut request = tonic::Request::new(PrepareDownloadRequest {
-        path: remote_path.to_owned(),
-    });
-    request.set_timeout(NETWORK_TIMEOUT);
-    let response = network_wait(grpc.prepare_download(request), "gRPC download negotiation")
-        .await?
-        .map_err(|error| format!("file service rejected download request: {error}"))?
-        .into_inner();
+/// Negotiate a download over HTTP, stream it over HTTP, then atomically publish the completed file.
+pub async fn download(peer_url: &str, remote_path: &str, output: &Path) -> Result<(), String> {
+    let response: PrepareDownloadResponse = json_request(
+        peer_url,
+        "/v1/downloads",
+        Some(&PrepareDownloadRequest {
+            path: remote_path.to_owned(),
+        }),
+    )
+    .await?;
 
     let uri = response
         .download_url
@@ -42,9 +39,13 @@ pub async fn download(grpc_url: &str, remote_path: &str, output: &Path) -> Resul
     if uri.scheme_str() != Some("http") || uri.authority().is_none() {
         return Err("file service returned a URL that is not an absolute HTTP URL".into());
     }
-    let client = Client::builder(TokioExecutor::new()).build_http();
+    let peer = peer_uri(peer_url)?;
+    if uri.scheme() != peer.scheme() || uri.authority() != peer.authority() {
+        return Err("download URL must belong to the requested peer".into());
+    }
+    let client = http_client();
     let request = HttpRequest::get(uri)
-        .body(Empty::<Bytes>::new())
+        .body(Full::new(Bytes::new()))
         .map_err(|error| format!("could not create HTTP request: {error}"))?;
     let response_body = network_wait(client.request(request), "HTTP response")
         .await?
@@ -63,7 +64,7 @@ pub async fn download(grpc_url: &str, remote_path: &str, output: &Path) -> Resul
             .ok_or_else(|| "file service returned an invalid Content-Length".to_owned())?;
         if content_length != response.size_bytes {
             return Err(format!(
-                "file size changed during negotiation: gRPC reported {} bytes, HTTP reported {content_length}",
+                "file size changed during negotiation: HTTP reported {} bytes, HTTP reported {content_length}",
                 response.size_bytes
             ));
         }
@@ -85,7 +86,7 @@ pub async fn download(grpc_url: &str, remote_path: &str, output: &Path) -> Resul
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| "downloaded file size overflowed".to_owned())?;
             if received_bytes > response.size_bytes {
-                return Err("HTTP file body exceeded the size announced over gRPC".into());
+                return Err("HTTP file body exceeded the size announced over HTTP".into());
             }
             file.write_all(&chunk).await.map_err(|error| {
                 format!("could not write {}: {error}", temporary_path.display())
@@ -175,66 +176,119 @@ mod tests {
     }
 }
 
-async fn connect(grpc_url: &str) -> Result<FileTransferClient<tonic::transport::Channel>, String> {
-    let endpoint = Endpoint::from_shared(grpc_url.to_owned())
-        .map_err(|error| format!("invalid --grpc URL: {error}"))?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(NETWORK_TIMEOUT);
-    let channel = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect())
-        .await
-        .map_err(|_| "gRPC connection timed out after 10 seconds".to_owned())?
-        .map_err(|error| format!("could not connect to file service gRPC endpoint: {error}"))?;
-    Ok(FileTransferClient::new(channel))
+type HttpClient = Client<HttpConnector, Full<Bytes>>;
+fn http_client() -> HttpClient {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+fn peer_uri(peer_url: &str) -> Result<Uri, String> {
+    let uri = peer_url
+        .parse::<Uri>()
+        .map_err(|e| format!("invalid --peer URL: {e}"))?;
+    if uri.scheme_str() != Some("http")
+        || uri.authority().is_none()
+        || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        || uri.path() != "/"
+        || uri.query().is_some()
+    {
+        return Err("--peer must be an HTTP origin, such as http://10.20.0.1:8080".into());
+    }
+    Ok(uri)
+}
+
+async fn json_request<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+    peer_url: &str,
+    path: &str,
+    body: Option<&B>,
+) -> Result<T, String> {
+    let origin = peer_uri(peer_url)?;
+    let url = format!(
+        "http://{}{path}",
+        origin.authority().expect("validated authority")
+    );
+    let bytes = match body {
+        Some(body) => serde_json::to_vec(body).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let request = HttpRequest::builder()
+        .method(if body.is_some() { "POST" } else { "GET" })
+        .uri(url)
+        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(bytes)))
+        .map_err(|e| e.to_string())?;
+    let client = http_client();
+    network_wait(
+        async {
+            let response = client
+                .request(request)
+                .await
+                .map_err(|e| format!("peer HTTP request failed: {e}"))?;
+            if response.status() != StatusCode::OK {
+                return Err(format!(
+                    "peer HTTP request rejected with status {}",
+                    response.status()
+                ));
+            }
+            let mut body = response.into_body();
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| format!("could not read peer HTTP response: {e}"))?;
+                if let Some(chunk) = frame.data_ref() {
+                    if bytes.len() + chunk.len() > 64 * 1024 {
+                        return Err("peer JSON response exceeds 64 KiB".into());
+                    }
+                    bytes.extend_from_slice(chunk);
+                }
+            }
+            serde_json::from_slice(&bytes).map_err(|_| "peer returned invalid JSON".to_owned())
+        },
+        "HTTP negotiation",
+    )
+    .await?
 }
 
 /// Discover only the SMB shares that this tunnel peer is allowed to access.
-pub async fn list_shares(grpc_url: &str) -> Result<Vec<crate::rpc::SmbShare>, String> {
-    let mut grpc = connect(grpc_url).await?;
-    let mut request = tonic::Request::new(crate::rpc::ListSharesRequest {});
-    request.set_timeout(NETWORK_TIMEOUT);
-    Ok(
-        network_wait(grpc.list_shares(request), "gRPC share discovery")
-            .await?
-            .map_err(|e| format!("share discovery failed: {e}"))?
-            .into_inner()
-            .shares,
-    )
+pub async fn list_shares(peer_url: &str) -> Result<Vec<crate::models::SmbShare>, String> {
+    let response: crate::models::ListSharesResponse =
+        json_request::<_, ()>(peer_url, "/v1/shares", None).await?;
+    Ok(response.shares)
 }
 
 /// Keep credentials out of Debug output and clear the client copy on drop.
 pub struct SmbConnection {
-    pub share: crate::rpc::SmbShare,
+    pub share: crate::models::SmbShare,
     pub username: String,
     pub password: zeroize::Zeroizing<String>,
 }
 
 /// Authorize a share and obtain its native SMB connection parameters over the tunnel.
 pub async fn prepare_smb_connection(
-    grpc_url: &str,
+    peer_url: &str,
     share_name: &str,
 ) -> Result<SmbConnection, String> {
-    let mut grpc = connect(grpc_url).await?;
-    let mut request = tonic::Request::new(crate::rpc::PrepareSmbConnectionRequest {
-        share_name: share_name.to_owned(),
-    });
-    request.set_timeout(NETWORK_TIMEOUT);
-    let response = network_wait(grpc.prepare_smb_connection(request), "gRPC SMB negotiation")
-        .await?
-        .map_err(|e| format!("SMB access rejected: {e}"))?
-        .into_inner();
+    let response: crate::models::PrepareSmbConnectionResponse = json_request(
+        peer_url,
+        "/v1/smb/connections",
+        Some(&crate::models::PrepareSmbConnectionRequest {
+            share_name: share_name.to_owned(),
+        }),
+    )
+    .await?;
     let password = zeroize::Zeroizing::new(response.password);
-    let share = response.share.ok_or("file service returned no SMB share")?;
-    let endpoint = grpc_url.parse::<Uri>().map_err(|_| "invalid gRPC URL")?;
+    let share = response.share;
+    let endpoint = peer_url.parse::<Uri>().map_err(|_| "invalid HTTP URL")?;
     let host = share
         .host
         .parse::<std::net::IpAddr>()
         .map_err(|_| "invalid SMB host")?;
-    let grpc_host = endpoint
+    let peer_host = endpoint
         .host()
-        .ok_or("gRPC URL has no host")?
+        .ok_or("HTTP URL has no host")?
         .trim_matches(['[', ']']);
-    if grpc_host.parse::<std::net::IpAddr>().ok() != Some(host) {
-        return Err("SMB host must match the requested peer's gRPC IP".into());
+    if peer_host.parse::<std::net::IpAddr>().ok() != Some(host) {
+        return Err("SMB host must match the requested peer's HTTP IP".into());
     }
     if share.name != share_name
         || share.port == 0
@@ -262,7 +316,7 @@ pub async fn prepare_smb_connection(
 }
 
 /// Open an interactive SMB client after negotiating credentials with the peer.
-pub async fn open_smb(grpc_url: &str, share_name: &str) -> Result<(), String> {
-    let connection = prepare_smb_connection(grpc_url, share_name).await?;
+pub async fn open_smb(peer_url: &str, share_name: &str) -> Result<(), String> {
+    let connection = prepare_smb_connection(peer_url, share_name).await?;
     crate::platform::open_smb(connection).await
 }

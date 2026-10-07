@@ -278,7 +278,7 @@ impl SmbService {
             _directory: directory,
             log,
             access: Some(std::sync::Arc::new(crate::smb::SmbAccess {
-                share: crate::rpc::SmbShare {
+                share: crate::models::SmbShare {
                     name: config.name.clone(),
                     host: config.listen.to_string(),
                     port: u32::from(port),
@@ -550,6 +550,7 @@ fn run_setup(mut command: Command, log: &File) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "client")]
     #[tokio::test]
     #[ignore = "requires Samba binaries and local TCP sockets; run as a non-root user"]
     async fn rootless_samba_serves_files() {
@@ -588,64 +589,37 @@ mod tests {
             allowed_peers: vec!["127.0.0.1".parse().unwrap()],
         };
         let mut service = SmbService::start_impl(config, true).unwrap();
-        // Exercise actual protobuf transport before authenticating with the returned credentials.
+        // Exercise the HTTP API before authenticating with the returned credentials.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let grpc_address = listener.local_addr().unwrap();
-        let rpc = crate::grpc::server(None, Some(service.access()));
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let grpc_task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(rpc)
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-                .unwrap();
+        let http_address = listener.local_addr().unwrap();
+        let router = crate::api::router(crate::api::ApiState {
+            downloads: None,
+            smb: Some(service.access()),
         });
-        let mut grpc = crate::rpc::file_transfer_client::FileTransferClient::connect(format!(
-            "http://{grpc_address}"
-        ))
-        .await
-        .unwrap();
-        let shares = grpc
-            .list_shares(crate::rpc::ListSharesRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .shares;
-        assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0].port, u32::from(port));
-        let connection = grpc
-            .prepare_smb_connection(crate::rpc::PrepareSmbConnectionRequest {
-                share_name: "documents".into(),
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let http_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
             })
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(connection.share.unwrap().host, "127.0.0.1");
+            .unwrap();
+        });
+        let peer_url = format!("http://{http_address}");
+        let shares = crate::list_shares(&peer_url).await.unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].port, u32::from(port));
+        let connection = crate::prepare_smb_connection(&peer_url, "documents")
+            .await
+            .unwrap();
+        assert_eq!(connection.share.host, "127.0.0.1");
         assert_eq!(connection.username, identity.name);
-        assert_eq!(connection.password, password);
-        #[cfg(feature = "client")]
-        {
-            let prepared =
-                crate::prepare_smb_connection(&format!("http://{grpc_address}"), "documents")
-                    .await
-                    .unwrap();
-            assert_eq!(prepared.password.as_str(), password);
-            assert_eq!(
-                crate::list_shares(&format!("http://{grpc_address}"))
-                    .await
-                    .unwrap()
-                    .len(),
-                1
-            );
-        }
-        drop(grpc);
+        assert_eq!(connection.password.as_str(), password);
         stop.send(()).unwrap();
-        grpc_task.await.unwrap();
+        http_task.await.unwrap();
         let pid = service.child.as_ref().unwrap().id();
         let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let uids = status
@@ -666,7 +640,8 @@ mod tests {
         write!(
             file,
             "username = {}\npassword = {}\n",
-            connection.username, connection.password
+            connection.username,
+            connection.password.as_str()
         )
         .unwrap();
         drop(file);

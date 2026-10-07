@@ -38,24 +38,24 @@ async fn entry() -> Result<(), String> {
 fn print_usage() {
     println!(
         "\
-portal-files — peer file sharing over gRPC, HTTP and SMB
+portal-files — peer file sharing over HTTP and SMB
 
 Commands:
-  portal-files download --grpc http://PEER_IP:PORT --path RELATIVE_PATH --output FILE
-  portal-files smb-list --grpc http://PEER_IP:PORT
-  portal-files smb-connect --grpc http://PEER_IP:PORT --share NAME
+  portal-files download --peer http://PEER_IP:PORT --path RELATIVE_PATH --output FILE
+  portal-files smb-list --peer http://PEER_IP:PORT
+  portal-files smb-connect --peer http://PEER_IP:PORT --share NAME
 
 File sharing is hosted by portal-runtime. Authorization uses the caller's
 WireGuard tunnel IP; HTTP tickets are short-lived and single-use."
     );
 }
 
-// Request a download ticket over gRPC and save the HTTP stream to the requested destination.
+// Request a download ticket over HTTP and save the HTTP stream to the requested destination.
 async fn download_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    validate_options(&options, &["grpc", "path", "output"], &[])?;
+    validate_options(&options, &["peer", "path", "output"], &[])?;
     download(
-        required(&options, "grpc")?,
+        required(&options, "peer")?,
         required(&options, "path")?,
         &PathBuf::from(required(&options, "output")?),
     )
@@ -116,14 +116,14 @@ async fn smb_command(args: &[String], open: bool) -> Result<(), String> {
     let options = parse_options(args)?;
     validate_options(
         &options,
-        if open { &["grpc", "share"] } else { &["grpc"] },
+        if open { &["peer", "share"] } else { &["peer"] },
         &[],
     )?;
-    let grpc = required(&options, "grpc")?;
+    let peer = required(&options, "peer")?;
     if open {
-        return portal_files::open_smb(grpc, required(&options, "share")?).await;
+        return portal_files::open_smb(peer, required(&options, "share")?).await;
     }
-    for share in portal_files::list_shares(grpc).await? {
+    for share in portal_files::list_shares(peer).await? {
         let host = share
             .host
             .parse::<std::net::IpAddr>()
