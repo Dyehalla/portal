@@ -1,4 +1,5 @@
 mod http_api;
+mod keys;
 
 mod cli {
     use std::collections::HashMap;
@@ -19,6 +20,7 @@ mod cli {
                 print_usage();
                 Ok(())
             }
+            "keygen" => keygen_command(&args[1..]),
             "peer" => peer_command(&args[1..]),
             "endpoint" => endpoint_command(&args[1..]),
             "stats" | "status" | "health" | "list" | "peer-stats" | "shutdown" => {
@@ -34,8 +36,7 @@ mod cli {
 portal — control CLI for a running portal runtime
 
 Commands:
-  portal-runtime run --tun NAME --private-key-file PATH --listen ADDR [options]
-  portal-runtime keygen --private-key-file PATH
+  portal keygen --private-key-file PATH
   portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--preshared-key-file PATH]
       [--endpoint ADDR] [--keepalive SECONDS] [--allowed-ip PREFIX ...]
   portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
@@ -44,8 +45,21 @@ Commands:
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
 
 Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
-The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
+The default API is 127.0.0.1:51821; its token file is per-user in the temporary directory."
         );
+    }
+
+    fn keygen_command(args: &[String]) -> Result<(), String> {
+        let options = parse_options(args, &[])?;
+        validate_options(&options, &["private-key-file"], &[])?;
+        let path = std::path::Path::new(required(&options, "private-key-file")?);
+        let public_key = crate::keys::create_key_file(path)?;
+        println!(
+            "private key saved to {} (raw 32-byte format)",
+            path.display()
+        );
+        println!("public key: {}", encode_hex(&public_key));
+        Ok(())
     }
 
     fn peer_command(args: &[String]) -> Result<(), String> {
@@ -196,6 +210,14 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
         print_operation(response)
     }
 
+    fn default_token_file() -> std::path::PathBuf {
+        #[cfg(unix)]
+        let name = format!("portal-{}.token", unsafe { libc::geteuid() });
+        #[cfg(not(unix))]
+        let name = "portal.token";
+        std::env::temp_dir().join(name)
+    }
+
     /// Send a command to the local HTTP API using its address and bearer-token file.
     fn send_command(
         options: &HashMap<String, Vec<String>>,
@@ -206,11 +228,12 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
             .and_then(first)
             .map(String::as_str)
             .unwrap_or("127.0.0.1:51821");
+        let default_token = default_token_file();
         let token_file = options
             .get("token-file")
             .and_then(first)
             .map(String::as_str)
-            .unwrap_or("/run/portal.token");
+            .unwrap_or(default_token.to_str().ok_or("token path is not UTF-8")?);
         let mut request = serde_json::to_string(command)
             .map_err(|error| format!("could not encode API request: {error}"))?;
         crate::http_api::send(address, token_file, &mut request)

@@ -2,7 +2,7 @@
 name = "portal-files"
 version = "0.1.0"
 edition = "2024"
-description = "Peer-to-peer file transfers over HTTP and SMB"
+description = "Peer-to-peer file transfers over HTTP"
 
 [features]
 default = ["client"]
@@ -12,7 +12,6 @@ client = [
     "dep:http-body-util",
     "dep:hyper",
     "dep:hyper-util",
-    "tokio/process",
 ]
 
 [[bin]]
@@ -21,6 +20,7 @@ path = "src/main.rs"
 required-features = ["client"]
 
 [dependencies]
+portal-net = { path = "../net" }
 axum = "0.7"
 bytes = "1"
 futures-core = "0.3"
@@ -37,8 +37,8 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
+portal = { path = "../wireguard" }
 tokio = { version = "1", features = ["test-util"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
-md4 = "0.10"

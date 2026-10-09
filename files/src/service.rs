@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,84 +40,91 @@ pub(super) struct DownloadTicket {
     pub(super) permit: OwnedSemaphorePermit,
 }
 
-/// Peer HTTP routes, download state, and managed Samba lifecycle.
+/// Peer HTTP routes and file browser state.
 pub struct FileService {
-    state: Option<SharedState>,
-    http_listener: TcpListener,
+    state: SharedState,
+    http_listener: Listener,
     http_address: SocketAddr,
-    #[cfg(target_os = "linux")]
-    smb: Option<crate::platform::SmbService>,
+}
+
+enum Listener {
+    System(TcpListener),
+    Virtual(portal_net::TcpListener),
 }
 
 impl FileService {
-    /// Bind one HTTP listener for negotiation and downloads, and optionally start Samba.
-    pub async fn new(
-        http_listen: SocketAddr,
-        downloads: Option<FileServiceConfig>,
-        smb: Option<crate::SmbConfig>,
-    ) -> Result<Self, String> {
-        if downloads.is_none() && smb.is_none() {
-            return Err("at least one file sharing backend is required".into());
+    /// Bind one HTTP listener for file browsing, negotiation, and downloads.
+    pub async fn new(http_listen: SocketAddr, config: FileServiceConfig) -> Result<Self, String> {
+        let root = tokio::fs::canonicalize(&config.root)
+            .await
+            .map_err(|e| format!("could not resolve file root {}: {e}", config.root.display()))?;
+        if !tokio::fs::metadata(&root)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_dir()
+        {
+            return Err("file root must be a directory".into());
+        }
+        if config.allowed_downloaders.is_empty() {
+            return Err("at least one allowed downloader IP is required".into());
         }
         let http_listener = TcpListener::bind(http_listen)
             .await
             .map_err(|e| format!("could not bind peer HTTP listener {http_listen}: {e}"))?;
         let http_address = http_listener.local_addr().map_err(|e| e.to_string())?;
-        let state = if let Some(config) = downloads {
-            let root = tokio::fs::canonicalize(&config.root).await.map_err(|e| {
-                format!("could not resolve file root {}: {e}", config.root.display())
-            })?;
-            if !tokio::fs::metadata(&root)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_dir()
-            {
-                return Err("file root must be a directory".into());
-            }
-            if config.allowed_downloaders.is_empty() {
-                return Err("at least one allowed downloader IP is required".into());
-            }
-            Some(SharedState {
-                root: Arc::new(root),
-                download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
-                http_advertise: Arc::from(format!("http://{http_address}")),
-                allowed_downloaders: Arc::new(config.allowed_downloaders),
-                tickets: Arc::new(Mutex::new(HashMap::new())),
-            })
-        } else {
-            None
+        let state = SharedState {
+            root: Arc::new(root),
+            download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
+            http_advertise: Arc::from(format!("http://{http_address}")),
+            allowed_downloaders: Arc::new(config.allowed_downloaders),
+            tickets: Arc::new(Mutex::new(HashMap::new())),
         };
-        #[cfg(target_os = "linux")]
-        let smb = match smb {
-            Some(config) => Some(
-                tokio::task::spawn_blocking(move || crate::platform::SmbService::start(config))
-                    .await
-                    .map_err(|e| format!("Samba startup task failed: {e}"))??,
-            ),
-            None => None,
-        };
-        #[cfg(not(target_os = "linux"))]
-        if smb.is_some() {
-            return Err("managed Samba currently supports Linux only".into());
-        }
         Ok(Self {
             state,
-            http_listener,
+            http_listener: Listener::System(http_listener),
             http_address,
-            #[cfg(target_os = "linux")]
-            smb,
+        })
+    }
+
+    /// Bind a service inside the userspace stack; no system TCP listener is opened.
+    pub async fn new_virtual(
+        network: portal_net::Net,
+        address: SocketAddr,
+        config: FileServiceConfig,
+    ) -> Result<Self, String> {
+        let root = tokio::fs::canonicalize(&config.root)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !tokio::fs::metadata(&root)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_dir()
+            || config.allowed_downloaders.is_empty()
+        {
+            return Err(
+                "file root must be a directory and at least one reader must be allowed".into(),
+            );
+        }
+        let listener = network.listen(address).map_err(|e| e.to_string())?;
+        let address = listener.local_addr();
+        let state = SharedState {
+            root: Arc::new(root),
+            download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
+            http_advertise: Arc::from(format!("http://{address}")),
+            allowed_downloaders: Arc::new(config.allowed_downloaders),
+            tickets: Arc::new(Mutex::new(HashMap::new())),
+        };
+        Ok(Self {
+            state,
+            http_listener: Listener::Virtual(listener),
+            http_address: address,
         })
     }
 
     /// Routes reusable by a peer HTTP server; callers must provide TCP ConnectInfo.
     pub fn router(&self) -> axum::Router {
-        #[cfg(target_os = "linux")]
-        let smb = self.smb.as_ref().map(|smb| smb.access());
-        #[cfg(not(target_os = "linux"))]
-        let smb = None;
         crate::api::router(crate::api::ApiState {
-            downloads: self.state.clone(),
-            smb,
+            files: self.state.clone(),
         })
     }
 
@@ -126,7 +133,7 @@ impl FileService {
         self.http_address
     }
 
-    /// Compatibility entry point; also supervises SMB when configured.
+    /// Compatibility entry point; serves all file browser routes.
     pub async fn serve_http<F>(self, shutdown: F) -> Result<(), String>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -134,55 +141,45 @@ impl FileService {
         self.serve(shutdown).await
     }
 
-    /// Serve file bytes and supervise Samba until the runtime signals shutdown.
+    /// Serve file browsing and downloads until the runtime signals shutdown.
     pub async fn serve<F>(self, shutdown: F) -> Result<(), String>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let app = self.router();
         let state = self.state.clone();
-        let (http_shutdown, mut http_stopped) = tokio::sync::watch::channel(false);
-        let http = axum::serve(
-            self.http_listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            while !*http_stopped.borrow() {
-                if http_stopped.changed().await.is_err() {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let wait = async move {
+            while !*stopped.borrow() {
+                if stopped.changed().await.is_err() {
                     break;
                 }
             }
-        })
-        .into_future();
+        };
+        let http = async move {
+            match self.http_listener {
+                Listener::System(listener) => {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(wait)
+                    .await
+                }
+                Listener::Virtual(listener) => portal_net::serve_http(listener, app, wait).await,
+            }
+            .map_err(|e| format!("file HTTP server failed: {e}"))
+        };
         tokio::pin!(http);
         tokio::pin!(shutdown);
         let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
-        #[cfg(target_os = "linux")]
-        let mut smb = self.smb;
         let result = loop {
             tokio::select! {
-                result = &mut http => break result.map_err(|e| format!("peer HTTP server failed: {e}")),
-                _ = &mut shutdown => {
-                    let _ = http_shutdown.send(true);
-                    break tokio::time::timeout(std::time::Duration::from_secs(5), &mut http).await
-                        .map_err(|_| "file HTTP connections exceeded shutdown grace period".to_owned())
-                        .and_then(|result| result.map_err(|e| format!("peer HTTP server failed: {e}")));
-                },
-                _ = cleanup.tick() => {
-                    if let Some(state) = &state { state.prune_expired().await; }
-                    #[cfg(target_os = "linux")]
-                    if let Some(smb) = &mut smb {
-                        if let Err(error) = smb.health() { break Err(error); }
-                    }
-                },
+                result = &mut http => break result,
+                _ = &mut shutdown => {let _=stop.send(true);break tokio::time::timeout(std::time::Duration::from_secs(5),&mut http).await.map_err(|_|"file service exceeded shutdown grace period".to_owned()).and_then(|result|result);},
+                _ = cleanup.tick() => state.prune_expired().await,
             }
         };
-        #[cfg(target_os = "linux")]
-        if let Some(mut smb) = smb {
-            tokio::task::spawn_blocking(move || smb.stop())
-                .await
-                .map_err(|e| format!("Samba shutdown task failed: {e}"))??;
-        }
         result
     }
 }
@@ -193,9 +190,7 @@ pub(crate) async fn http_download(
     ConnectInfo(requester): ConnectInfo<SocketAddr>,
     AxumPath(ticket_id): AxumPath<String>,
 ) -> Response {
-    let Some(state) = api.downloads else {
-        return http_error(StatusCode::NOT_IMPLEMENTED, "HTTP downloads are disabled");
-    };
+    let state = api.files;
     let requester = requester.ip();
     let mut tickets = state.tickets.lock().await;
     let Some(ticket) = tickets.get(&ticket_id) else {
@@ -321,8 +316,7 @@ mod tests {
         insert_ticket(&state, Instant::now() + std::time::Duration::from_secs(300)).await;
         let wrong = http_download(
             State(crate::api::ApiState {
-                downloads: Some(state.clone()),
-                smb: None,
+                files: state.clone(),
             }),
             ConnectInfo("127.0.0.2:1234".parse().unwrap()),
             AxumPath("ticket".into()),
@@ -332,8 +326,7 @@ mod tests {
         assert_eq!(state.tickets.lock().await.len(), 1);
         let response = http_download(
             State(crate::api::ApiState {
-                downloads: Some(state.clone()),
-                smb: None,
+                files: state.clone(),
             }),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             AxumPath("ticket".into()),
@@ -344,8 +337,7 @@ mod tests {
         assert!(state.download_slots.clone().try_acquire_owned().is_err());
         let reused = http_download(
             State(crate::api::ApiState {
-                downloads: Some(state.clone()),
-                smb: None,
+                files: state.clone(),
             }),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             AxumPath("ticket".into()),

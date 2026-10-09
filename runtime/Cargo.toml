@@ -9,10 +9,10 @@ name = "portal-runtime"
 path = "src/main.rs"
 
 [dependencies]
+portal-net = { path = "../net" }
 portal = { path = "../wireguard" }
-portal-files = { path = "../files", default-features = false }
+portal-files = { path = "../files" }
 axum = "0.7"
-boringtun = { version = "=0.7.1", default-features = false }
 libc = "0.2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

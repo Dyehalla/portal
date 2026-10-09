@@ -13,14 +13,14 @@ const TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 pub(crate) struct ApiState {
-    pub downloads: Option<SharedState>,
-    pub smb: Option<std::sync::Arc<crate::smb::SmbAccess>>,
+    pub files: SharedState,
 }
 
 pub(crate) fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/v1/shares", get(list_shares))
-        .route("/v1/smb/connections", post(prepare_smb_connection))
+        .route("/v1/resources", get(list_resources))
+        .route("/v1/files/list", post(list_directory))
+        .route("/v1/files/metadata", post(file_metadata))
         .route("/v1/downloads", post(prepare_download))
         .route("/v1/download/:ticket", get(crate::service::http_download))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -54,9 +54,6 @@ impl ApiError {
     fn internal(message: &'static str) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
-    fn disabled(message: &'static str) -> Self {
-        Self(StatusCode::NOT_IMPLEMENTED, message)
-    }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -64,41 +61,141 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn list_shares(
+async fn list_resources(
     State(api): State<ApiState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Json<ListSharesResponse> {
-    let shares = api
-        .smb
-        .as_ref()
-        .filter(|smb| smb.allowed_peers.contains(&peer.ip()))
-        .map(|smb| vec![smb.share.clone()])
-        .unwrap_or_default();
-    Json(ListSharesResponse { shares })
+) -> Json<ListResourcesResponse> {
+    let resources = if api.files.allowed_downloaders.contains(&peer.ip()) {
+        vec![FileResource {
+            id: "files".into(),
+            name: "Files".into(),
+            read_only: true,
+        }]
+    } else {
+        Vec::new()
+    };
+    Json(ListResourcesResponse { resources })
 }
 
-async fn prepare_smb_connection(
-    State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<PrepareSmbConnectionRequest>,
-) -> Result<Json<PrepareSmbConnectionResponse>, ApiError> {
-    let smb = api
-        .smb
-        .as_ref()
-        .ok_or_else(|| ApiError::disabled("SMB sharing is disabled"))?;
-    if !smb.allowed_peers.contains(&peer.ip()) {
-        return Err(ApiError::forbidden(
-            "this peer does not have SMB permission",
+fn authorize(state: &SharedState, peer: SocketAddr) -> Result<(), ApiError> {
+    if state.allowed_downloaders.contains(&peer.ip()) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "this peer does not have file access permission",
+        ))
+    }
+}
+
+async fn resolve(state: &SharedState, path: &str) -> Result<std::path::PathBuf, ApiError> {
+    if !path.is_empty() && !is_safe_relative_path(Path::new(path)) {
+        return Err(ApiError::bad_request(
+            "path must be relative and may not contain parent components",
         ));
     }
-    if request.share_name != smb.share.name {
-        return Err(ApiError::not_found("SMB share does not exist"));
+    let canonical = tokio::fs::canonicalize(state.root.join(path))
+        .await
+        .map_err(|_| ApiError::not_found("path does not exist or cannot be accessed"))?;
+    if !canonical.starts_with(state.root.as_path()) {
+        return Err(ApiError::forbidden("path resolves outside the shared root"));
     }
-    Ok(Json(PrepareSmbConnectionResponse {
-        share: smb.share.clone(),
-        username: smb.username.clone(),
-        password: smb.password.to_string(),
+    // TODO: Directory traversal/metadata also need a cross-platform, race-safe relative open.
+    // Canonicalize followed by filesystem access can race with symlink replacement.
+    Ok(canonical)
+}
+
+fn entry(path: String, name: String, metadata: std::fs::Metadata) -> FileEntry {
+    let kind = if metadata.file_type().is_symlink() {
+        FileKind::Symlink
+    } else if metadata.is_dir() {
+        FileKind::Directory
+    } else if metadata.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Other
+    };
+    FileEntry {
+        name,
+        path,
+        size_bytes: metadata.is_file().then_some(metadata.len()),
+        kind,
+        modified_at_unix_seconds: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+    }
+}
+
+async fn list_directory(
+    State(api): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<ListDirectoryRequest>,
+) -> Result<Json<ListDirectoryResponse>, ApiError> {
+    authorize(&api.files, peer)?;
+    if request.limit == 0 || request.limit > 1000 {
+        return Err(ApiError::bad_request("limit must be between 1 and 1000"));
+    }
+    let path = resolve(&api.files, &request.path).await?;
+    let mut directory = tokio::fs::read_dir(path)
+        .await
+        .map_err(|_| ApiError::bad_request("path is not an accessible directory"))?;
+    let mut entries = Vec::new();
+    while let Some(item) = directory
+        .next_entry()
+        .await
+        .map_err(|_| ApiError::internal("could not read directory"))?
+    {
+        if entries.len() >= 10000 {
+            return Err(ApiError::busy(
+                "directory exceeds the 10000-entry browsing limit",
+            ));
+        }
+        let name = item.file_name().into_string().map_err(|_| {
+            ApiError::bad_request("directory contains a filename that is not UTF-8")
+        })?;
+        let relative = if request.path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{name}", request.path.trim_end_matches('/'))
+        };
+        // symlink_metadata does not follow the final link or expose its target metadata.
+        let metadata = tokio::fs::symlink_metadata(item.path())
+            .await
+            .map_err(|_| ApiError::not_found("directory entry changed or cannot be accessed"))?;
+        entries.push(entry(relative, name, metadata));
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let next = request.offset.saturating_add(request.limit);
+    let next_offset = (next < entries.len()).then_some(next);
+    let entries = entries
+        .into_iter()
+        .skip(request.offset)
+        .take(request.limit)
+        .collect();
+    Ok(Json(ListDirectoryResponse {
+        path: request.path,
+        entries,
+        next_offset,
     }))
+}
+
+async fn file_metadata(
+    State(api): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<FilePathRequest>,
+) -> Result<Json<FileEntry>, ApiError> {
+    authorize(&api.files, peer)?;
+    let path = resolve(&api.files, &request.path).await?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| ApiError::not_found("path cannot be accessed"))?;
+    let name = Path::new(&request.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Files")
+        .to_owned();
+    Ok(Json(entry(request.path, name, metadata)))
 }
 
 async fn prepare_download(
@@ -107,15 +204,8 @@ async fn prepare_download(
     Json(request): Json<PrepareDownloadRequest>,
 ) -> Result<Json<PrepareDownloadResponse>, ApiError> {
     let requester = peer.ip();
-    let state = api
-        .downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::disabled("HTTP downloads are disabled"))?;
-    if !state.allowed_downloaders.contains(&requester) {
-        return Err(ApiError::forbidden(
-            "this peer does not have file download permission",
-        ));
-    }
+    let state = &api.files;
+    authorize(state, peer)?;
     let relative_path = Path::new(&request.path);
     if !is_safe_relative_path(relative_path) {
         return Err(ApiError::bad_request(
@@ -206,119 +296,4 @@ fn create_ticket_id() -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
     }
     encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn state() -> ApiState {
-        ApiState {
-            downloads: None,
-            smb: Some(std::sync::Arc::new(crate::smb::SmbAccess {
-                share: SmbShare {
-                    name: "documents".into(),
-                    host: "10.20.0.1".into(),
-                    port: 1445,
-                    read_only: true,
-                },
-                username: "reader".into(),
-                password: zeroize::Zeroizing::new("secret".into()),
-                allowed_peers: vec!["10.20.0.2".parse().unwrap()],
-            })),
-        }
-    }
-    fn peer(ip: &str) -> ConnectInfo<SocketAddr> {
-        ConnectInfo(ip.parse().unwrap())
-    }
-    #[tokio::test]
-    async fn smb_permissions_use_transport_ip_and_are_independent_of_downloads() {
-        let api = state();
-        assert_eq!(
-            list_shares(State(api.clone()), peer("10.20.0.2:1234"))
-                .await
-                .0
-                .shares
-                .len(),
-            1
-        );
-        assert!(
-            list_shares(State(api.clone()), peer("10.20.0.3:1234"))
-                .await
-                .0
-                .shares
-                .is_empty()
-        );
-        let body = || {
-            Json(PrepareSmbConnectionRequest {
-                share_name: "documents".into(),
-            })
-        };
-        let granted = prepare_smb_connection(State(api.clone()), peer("10.20.0.2:1234"), body())
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(granted.password, "secret");
-        assert_eq!(granted.share.port, 1445);
-        let denied = prepare_smb_connection(State(api.clone()), peer("10.20.0.3:1234"), body())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(denied.0, StatusCode::FORBIDDEN);
-        assert_eq!(
-            prepare_smb_connection(
-                State(api.clone()),
-                peer("10.20.0.2:1234"),
-                Json(PrepareSmbConnectionRequest {
-                    share_name: "hidden".into()
-                })
-            )
-            .await
-            .err()
-            .unwrap()
-            .0,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            prepare_download(
-                State(api),
-                peer("10.20.0.2:1234"),
-                Json(PrepareDownloadRequest {
-                    path: "file".into()
-                })
-            )
-            .await
-            .err()
-            .unwrap()
-            .0,
-            StatusCode::NOT_IMPLEMENTED
-        );
-    }
-    #[tokio::test]
-    async fn disabled_smb_returns_no_shares_or_credentials() {
-        let api = ApiState {
-            downloads: None,
-            smb: None,
-        };
-        assert!(
-            list_shares(State(api.clone()), peer("10.20.0.2:1234"))
-                .await
-                .0
-                .shares
-                .is_empty()
-        );
-        assert_eq!(
-            prepare_smb_connection(
-                State(api),
-                peer("10.20.0.2:1234"),
-                Json(PrepareSmbConnectionRequest {
-                    share_name: "documents".into()
-                })
-            )
-            .await
-            .err()
-            .unwrap()
-            .0,
-            StatusCode::NOT_IMPLEMENTED
-        );
-    }
 }

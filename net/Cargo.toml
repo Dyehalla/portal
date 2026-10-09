@@ -1,0 +1,18 @@
+[package]
+name = "portal-net"
+version = "0.1.0"
+edition = "2024"
+description = "Userspace TCP/IP networking for Portal services"
+
+[dependencies]
+portal = { path = "../wireguard" }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "async"] }
+tokio = { version = "1", features = ["io-util", "net", "sync", "rt", "time"] }
+rand = "0.8"
+axum = "0.7"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

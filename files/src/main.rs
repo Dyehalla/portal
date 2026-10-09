@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
-use portal_files::download;
-
 // Run the selected file-service command and return failures with a nonzero exit status.
 #[tokio::main]
 async fn main() {
@@ -26,8 +24,7 @@ async fn entry() -> Result<(), String> {
             Ok(())
         }
         "download" => download_command(&args[1..]).await,
-        "smb-list" => smb_command(&args[1..], false).await,
-        "smb-connect" => smb_command(&args[1..], true).await,
+        "resources" | "ls" | "stat" => browse_command(command, &args[1..]).await,
         other => Err(format!(
             "unknown command `{other}`; use `portal-files help`"
         )),
@@ -38,25 +35,80 @@ async fn entry() -> Result<(), String> {
 fn print_usage() {
     println!(
         "\
-portal-files — peer file sharing over HTTP and SMB
+portal-files — peer file sharing over HTTP
 
 Commands:
-  portal-files download --peer http://PEER_IP:PORT --path RELATIVE_PATH --output FILE
-  portal-files smb-list --peer http://PEER_IP:PORT
-  portal-files smb-connect --peer http://PEER_IP:PORT --share NAME
+  portal-files download --peer PUBLIC_KEY_HEX [--port 8080] --path RELATIVE_PATH --output FILE
+  portal-files resources --peer PUBLIC_KEY_HEX [--port 8080]
+  portal-files ls --peer PUBLIC_KEY_HEX [--port 8080] [--path DIR] [--offset N] [--limit N]
+  portal-files stat --peer PUBLIC_KEY_HEX [--port 8080] --path PATH
 
-File sharing is hosted by portal-runtime. Authorization uses the caller's
-WireGuard tunnel IP; HTTP tickets are short-lived and single-use."
+Requests go through the local runtime (--api http://127.0.0.1:51821, --api-token-file PATH).
+Peer IPs are virtual addresses inside its userspace stack; HTTP tickets are short-lived and single-use."
     );
 }
 
-// Request a download ticket over HTTP and save the HTTP stream to the requested destination.
+fn default_token_file() -> std::path::PathBuf {
+    #[cfg(unix)]
+    let name = format!("portal-{}.token", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let name = "portal.token";
+    std::env::temp_dir().join(name)
+}
+
+fn api_options(
+    options: &HashMap<String, Vec<String>>,
+) -> Result<(String, zeroize::Zeroizing<String>, serde_json::Value), String> {
+    let api = options
+        .get("api")
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_else(|| "http://127.0.0.1:51821".into());
+    let token_path = options
+        .get("api-token-file")
+        .and_then(|v| v.first())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_token_file());
+    let token = zeroize::Zeroizing::new(
+        std::fs::read_to_string(&token_path)
+            .map_err(|e| format!("could not read {}: {e}", token_path.display()))?
+            .trim()
+            .to_owned(),
+    );
+    let port: u16 = options
+        .get("port")
+        .and_then(|v| v.first())
+        .map(|v| v.parse().map_err(|_| "invalid --port".to_owned()))
+        .unwrap_or(Ok(8080))?;
+    let mut request = serde_json::json!({"peer":required(options,"peer")?,"port":port});
+    if let Some(ip) = options.get("tunnel-ip").and_then(|v| v.first()) {
+        request["tunnel_ip"] = serde_json::Value::String(ip.clone());
+    }
+    Ok((api, token, request))
+}
 async fn download_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    validate_options(&options, &["peer", "path", "output"], &[])?;
-    download(
-        required(&options, "peer")?,
-        required(&options, "path")?,
+    validate_options(
+        &options,
+        &[
+            "api",
+            "api-token-file",
+            "peer",
+            "port",
+            "tunnel-ip",
+            "path",
+            "output",
+        ],
+        &[],
+    )?;
+    let (api, token, mut request) = api_options(&options)?;
+    let path = required(&options, "path")?;
+    request["path"] = path.into();
+    portal_files::local_download(
+        &api,
+        &token,
+        &request,
+        path,
         &PathBuf::from(required(&options, "output")?),
     )
     .await
@@ -112,37 +164,52 @@ fn required<'a>(options: &'a HashMap<String, Vec<String>>, name: &str) -> Result
         .ok_or_else(|| format!("missing required option --{name}"))
 }
 
-async fn smb_command(args: &[String], open: bool) -> Result<(), String> {
+async fn browse_command(command: &str, args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    validate_options(
-        &options,
-        if open { &["peer", "share"] } else { &["peer"] },
-        &[],
-    )?;
-    let peer = required(&options, "peer")?;
-    if open {
-        return portal_files::open_smb(peer, required(&options, "share")?).await;
+    let allowed: &[&str] = match command {
+        "resources" => &["api", "api-token-file", "peer", "port", "tunnel-ip"],
+        "stat" => &["api", "api-token-file", "peer", "port", "tunnel-ip", "path"],
+        _ => &[
+            "api",
+            "api-token-file",
+            "peer",
+            "port",
+            "tunnel-ip",
+            "path",
+            "offset",
+            "limit",
+        ],
+    };
+    validate_options(&options, allowed, &[])?;
+    let (api, token, mut request) = api_options(&options)?;
+    let operation = match command {
+        "resources" => "resources",
+        "stat" => "metadata",
+        _ => "list",
+    };
+    if operation != "resources" {
+        request["path"] = options
+            .get("path")
+            .and_then(|v| v.first())
+            .map(String::as_str)
+            .unwrap_or("")
+            .into();
     }
-    for share in portal_files::list_shares(peer).await? {
-        let host = share
-            .host
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| "invalid advertised SMB host")?;
-        let address = std::net::SocketAddr::new(
-            host,
-            u16::try_from(share.port).map_err(|_| "invalid advertised SMB port")?,
-        );
-        println!(
-            "{} smb://{}/{} {}",
-            share.name,
-            address,
-            share.name,
-            if share.read_only {
-                "read-only"
-            } else {
-                "read-write"
-            }
-        );
+    if operation == "list" {
+        for (name, default) in [("offset", 0usize), ("limit", 100usize)] {
+            let number = options
+                .get(name)
+                .and_then(|v| v.first())
+                .map(|v| v.parse::<usize>().map_err(|_| format!("invalid --{name}")))
+                .unwrap_or(Ok(default))?;
+            request[name] = number.into();
+        }
     }
+    let value: serde_json::Value =
+        portal_files::local_json(&api, &token, operation, &request).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+    );
     Ok(())
 }

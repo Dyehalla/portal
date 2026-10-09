@@ -228,7 +228,7 @@ impl Peer {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    /// Count an authenticated inner packet after it has been written to TUN.
+    /// Count an authenticated inner packet after it has been passed to the userspace stack.
     pub fn count_rx(&self, bytes: usize) {
         self.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.counters

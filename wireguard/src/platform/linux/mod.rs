@@ -1,8 +1,9 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -11,18 +12,28 @@ use super::{PacketSource, ReceivedPacket};
 
 const EVENT_UDP4: u64 = 1;
 const EVENT_UDP6: u64 = 2;
-const EVENT_TUN: u64 = 3;
+const EVENT_IP: u64 = 3;
 const EVENT_WAKE: u64 = 4;
-const IFNAMSIZ: usize = 16;
-const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-const IFF_TUN: libc::c_short = 0x0001;
-const IFF_NO_PI: libc::c_short = 0x1000;
+/// Bounded datagram link carrying plaintext IP packets between WireGuard and a userspace stack.
+#[derive(Clone)]
+pub struct PacketPort {
+    socket: Arc<UnixDatagram>,
+}
+impl PacketPort {
+    pub fn send(&self, packet: &[u8]) -> io::Result<usize> {
+        self.socket.send(packet)
+    }
+    pub fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.socket.recv(buffer)
+    }
+}
 
 pub(crate) struct PacketIo {
     udp_v4: Option<UdpSocket>,
     udp_v6: Option<UdpSocket>,
     listen_addr: SocketAddr,
-    tun: File,
+    ip: UnixDatagram,
+    port: PacketPort,
     wakes: Mutex<Vec<Weak<File>>>,
     stopped: AtomicBool,
 }
@@ -31,28 +42,27 @@ pub(crate) struct WorkerIo {
     epoll: OwnedFd,
     udp_v4: Option<UdpSocket>,
     udp_v6: Option<UdpSocket>,
-    tun: File,
+    ip: UnixDatagram,
     wake: Arc<File>,
     next_poll_index: usize,
 }
 
-#[repr(C)]
-struct TunIfReq {
-    name: [libc::c_char; IFNAMSIZ],
-    flags: libc::c_short,
-    padding: [u8; 22],
-}
-
 impl PacketIo {
-    /// Bind the requested family and optionally its wildcard counterpart, then open TUN.
-    pub(crate) fn open(listen: SocketAddr, tun_name: &str, dual_stack: bool) -> io::Result<Self> {
+    /// Bind the requested family and optionally its wildcard counterpart, create an internal IP packet channel.
+    pub(crate) fn open(listen: SocketAddr, dual_stack: bool) -> io::Result<Self> {
         let (udp_v4, udp_v6, listen_addr) = bind_udp_pair(listen, dual_stack)?;
-        let tun = open_tun(tun_name)?;
+        let (ip, socket) = UnixDatagram::pair()?;
+        ip.set_nonblocking(true)?;
+        socket.set_nonblocking(true)?;
+        let port = PacketPort {
+            socket: Arc::new(socket),
+        };
         Ok(Self {
             udp_v4,
             udp_v6,
             listen_addr,
-            tun,
+            ip,
+            port,
             wakes: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
         })
@@ -66,7 +76,7 @@ impl PacketIo {
     pub(crate) fn create_worker(&self) -> io::Result<WorkerIo> {
         let udp_v4 = self.udp_v4.as_ref().map(UdpSocket::try_clone).transpose()?;
         let udp_v6 = self.udp_v6.as_ref().map(UdpSocket::try_clone).transpose()?;
-        let tun = self.tun.try_clone()?;
+        let ip = self.ip.try_clone()?;
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
             return Err(io::Error::last_os_error());
@@ -84,7 +94,7 @@ impl PacketIo {
         if let Some(udp_v6) = &udp_v6 {
             add_epoll_fd(epoll.as_raw_fd(), udp_v6.as_raw_fd(), EVENT_UDP6)?;
         }
-        add_epoll_fd(epoll.as_raw_fd(), tun.as_raw_fd(), EVENT_TUN)?;
+        add_epoll_fd(epoll.as_raw_fd(), ip.as_raw_fd(), EVENT_IP)?;
         add_epoll_fd(epoll.as_raw_fd(), wake.as_raw_fd(), EVENT_WAKE)?;
         self.wakes
             .lock()
@@ -95,13 +105,13 @@ impl PacketIo {
             epoll,
             udp_v4,
             udp_v6,
-            tun,
+            ip,
             wake,
             next_poll_index: 0,
         })
     }
 
-    /// Wait for one ready UDP or TUN packet, respecting the optional timer timeout.
+    /// Wait for one ready UDP or internal IP packet, respecting the optional timer timeout.
     pub(crate) fn wait_packet(
         &self,
         worker: &mut WorkerIo,
@@ -142,7 +152,7 @@ impl PacketIo {
                     drain_eventfd(worker.wake.as_raw_fd());
                     return Ok(None);
                 }
-                EVENT_UDP4 | EVENT_UDP6 | EVENT_TUN => {
+                EVENT_UDP4 | EVENT_UDP6 | EVENT_IP => {
                     if let Some(packet) = read_event(worker, event.u64, buffer)? {
                         return Ok(Some(packet));
                     }
@@ -168,7 +178,7 @@ impl PacketIo {
             let token = match index {
                 0 => EVENT_UDP4,
                 1 => EVENT_UDP6,
-                _ => EVENT_TUN,
+                _ => EVENT_IP,
             };
             if let Some(packet) = read_event(worker, token, buffer)? {
                 return Ok(Some(packet));
@@ -199,20 +209,18 @@ impl PacketIo {
         Ok(())
     }
 
-    /// Write one complete IP packet to the TUN device.
-    pub(crate) fn write_tun(&self, packet: &[u8]) -> io::Result<()> {
-        let written =
-            unsafe { libc::write(self.tun.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
-        if written < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if written as usize != packet.len() {
+    /// Deliver an authenticated IP packet to the userspace stack.
+    pub(crate) fn write_ip(&self, packet: &[u8]) -> io::Result<()> {
+        if self.ip.send(packet)? != packet.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "TUN accepted only part of an IP packet",
+                "partial IP packet",
             ));
         }
         Ok(())
+    }
+    pub(crate) fn packet_port(&self) -> PacketPort {
+        self.port.clone()
     }
 
     /// Mark the backend stopped and wake every worker blocked in epoll.
@@ -355,17 +363,14 @@ fn read_event(
                 Err(error) => return classify_read_error(error),
             }
         }
-        EVENT_TUN => {
-            let mut tun = &worker.tun;
-            match tun.read(buffer) {
-                Ok(0) => None,
-                Ok(len) => Some(ReceivedPacket {
-                    source: PacketSource::Tun,
-                    len,
-                }),
-                Err(error) => return classify_read_error(error),
-            }
-        }
+        EVENT_IP => match worker.ip.recv(buffer) {
+            Ok(0) => None,
+            Ok(len) => Some(ReceivedPacket {
+                source: PacketSource::Ip,
+                len,
+            }),
+            Err(error) => return classify_read_error(error),
+        },
         _ => None,
     };
     if received.is_some() {
@@ -385,40 +390,6 @@ fn classify_read_error(error: io::Error) -> io::Result<Option<ReceivedPacket>> {
     } else {
         Err(error)
     }
-}
-
-// Open or create the named Linux TUN interface without packet-information headers.
-fn open_tun(name: &str) -> io::Result<File> {
-    let name_bytes = name.as_bytes();
-    if name_bytes.is_empty() || name_bytes.len() >= IFNAMSIZ || name_bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "TUN name must contain 1 to 15 non-NUL bytes",
-        ));
-    }
-    let fd = unsafe {
-        libc::open(
-            c"/dev/net/tun".as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let tun = unsafe { File::from_raw_fd(fd) };
-    let mut request = TunIfReq {
-        name: [0; IFNAMSIZ],
-        flags: IFF_TUN | IFF_NO_PI,
-        padding: [0; 22],
-    };
-    for (to, from) in request.name.iter_mut().zip(name_bytes) {
-        *to = *from as libc::c_char;
-    }
-    let result = unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &mut request) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(tun)
 }
 
 // Register a descriptor with a stable event token in one worker's epoll set.

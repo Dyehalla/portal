@@ -6,13 +6,12 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request as HttpRequest, StatusCode, Uri, header};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::io::AsyncWriteExt;
 
 use crate::models::{PrepareDownloadRequest, PrepareDownloadResponse};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn network_wait<T>(future: impl Future<Output = T>, operation: &str) -> Result<T, String> {
@@ -70,6 +69,21 @@ pub async fn download(peer_url: &str, remote_path: &str, output: &Path) -> Resul
         }
     }
 
+    save_download(
+        response_body,
+        output,
+        response.size_bytes,
+        response.file_name,
+    )
+    .await
+}
+
+async fn save_download(
+    response_body: hyper::Response<hyper::body::Incoming>,
+    output: &Path,
+    size_bytes: u64,
+    file_name: String,
+) -> Result<(), String> {
     let (temporary_path, mut file) = create_temporary_file(output).await?;
     let result = async {
         let mut received_bytes = 0_u64;
@@ -85,17 +99,17 @@ pub async fn download(peer_url: &str, remote_path: &str, output: &Path) -> Resul
             received_bytes = received_bytes
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| "downloaded file size overflowed".to_owned())?;
-            if received_bytes > response.size_bytes {
+            if received_bytes > size_bytes {
                 return Err("HTTP file body exceeded the size announced over HTTP".into());
             }
             file.write_all(&chunk).await.map_err(|error| {
                 format!("could not write {}: {error}", temporary_path.display())
             })?;
         }
-        if received_bytes != response.size_bytes {
+        if received_bytes != size_bytes {
             return Err(format!(
                 "incomplete download: received {received_bytes} of {} bytes",
-                response.size_bytes
+                size_bytes
             ));
         }
         file.sync_all()
@@ -120,8 +134,8 @@ pub async fn download(peer_url: &str, remote_path: &str, output: &Path) -> Resul
 
     println!(
         "downloaded {} ({} bytes) to {}",
-        response.file_name,
-        response.size_bytes,
+        file_name,
+        size_bytes,
         output.display()
     );
     Ok(())
@@ -176,11 +190,9 @@ mod tests {
     }
 }
 
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
+type HttpClient = Client<portal_net::Connector, Full<Bytes>>;
 fn http_client() -> HttpClient {
-    let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
-    Client::builder(TokioExecutor::new()).build(connector)
+    Client::builder(TokioExecutor::new()).build(portal_net::Connector::default())
 }
 fn peer_uri(peer_url: &str) -> Result<Uri, String> {
     let uri = peer_url
@@ -236,8 +248,8 @@ async fn json_request<T: serde::de::DeserializeOwned, B: serde::Serialize>(
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| format!("could not read peer HTTP response: {e}"))?;
                 if let Some(chunk) = frame.data_ref() {
-                    if bytes.len() + chunk.len() > 64 * 1024 {
-                        return Err("peer JSON response exceeds 64 KiB".into());
+                    if bytes.len() + chunk.len() > 1024 * 1024 {
+                        return Err("peer JSON response exceeds 1 MiB".into());
                     }
                     bytes.extend_from_slice(chunk);
                 }
@@ -249,74 +261,248 @@ async fn json_request<T: serde::de::DeserializeOwned, B: serde::Serialize>(
     .await?
 }
 
-/// Discover only the SMB shares that this tunnel peer is allowed to access.
-pub async fn list_shares(peer_url: &str) -> Result<Vec<crate::models::SmbShare>, String> {
-    let response: crate::models::ListSharesResponse =
-        json_request::<_, ()>(peer_url, "/v1/shares", None).await?;
-    Ok(response.shares)
-}
-
-/// Keep credentials out of Debug output and clear the client copy on drop.
-pub struct SmbConnection {
-    pub share: crate::models::SmbShare,
-    pub username: String,
-    pub password: zeroize::Zeroizing<String>,
-}
-
-/// Authorize a share and obtain its native SMB connection parameters over the tunnel.
-pub async fn prepare_smb_connection(
+/// Discover resources visible to this tunnel peer.
+pub async fn list_resources(
     peer_url: &str,
-    share_name: &str,
-) -> Result<SmbConnection, String> {
-    let response: crate::models::PrepareSmbConnectionResponse = json_request(
+) -> Result<crate::models::ListResourcesResponse, String> {
+    json_request::<_, ()>(peer_url, "/v1/resources", None).await
+}
+pub async fn list_directory(
+    peer_url: &str,
+    request: &crate::models::ListDirectoryRequest,
+) -> Result<crate::models::ListDirectoryResponse, String> {
+    json_request(peer_url, "/v1/files/list", Some(request)).await
+}
+pub async fn file_metadata(peer_url: &str, path: &str) -> Result<crate::models::FileEntry, String> {
+    json_request(
         peer_url,
-        "/v1/smb/connections",
-        Some(&crate::models::PrepareSmbConnectionRequest {
-            share_name: share_name.to_owned(),
+        "/v1/files/metadata",
+        Some(&crate::models::FilePathRequest {
+            path: path.to_owned(),
         }),
     )
-    .await?;
-    let password = zeroize::Zeroizing::new(response.password);
-    let share = response.share;
-    let endpoint = peer_url.parse::<Uri>().map_err(|_| "invalid HTTP URL")?;
-    let host = share
-        .host
-        .parse::<std::net::IpAddr>()
-        .map_err(|_| "invalid SMB host")?;
-    let peer_host = endpoint
-        .host()
-        .ok_or("HTTP URL has no host")?
-        .trim_matches(['[', ']']);
-    if peer_host.parse::<std::net::IpAddr>().ok() != Some(host) {
-        return Err("SMB host must match the requested peer's HTTP IP".into());
-    }
-    if share.name != share_name
-        || share.port == 0
-        || share.port > u32::from(u16::MAX)
-        || !share
-            .name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        || response.username.is_empty()
-        || response.username.len() > 64
-        || !response
-            .username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
-        || password.is_empty()
-        || password.chars().any(|c| c.is_control())
-    {
-        return Err("file service returned invalid SMB connection parameters".into());
-    }
-    Ok(SmbConnection {
-        share,
-        username: response.username,
-        password,
-    })
+    .await
 }
 
-/// Open an interactive SMB client after negotiating credentials with the peer.
-pub async fn open_smb(peer_url: &str, share_name: &str) -> Result<(), String> {
-    let connection = prepare_smb_connection(peer_url, share_name).await?;
-    crate::platform::open_smb(connection).await
+/// Forward a local browser operation to a registered peer. No arbitrary URL/route is accepted.
+/// Downloads are streamed through the runtime, keeping peer tickets out of browser requests.
+pub async fn proxy_request(
+    peer: std::net::SocketAddr,
+    route: &str,
+    body: &[u8],
+) -> Result<axum::response::Response, String> {
+    proxy_request_with_net(None, peer, route, body).await
+}
+
+pub async fn proxy_request_with_net(
+    network: Option<portal_net::Net>,
+    peer: std::net::SocketAddr,
+    route: &str,
+    body: &[u8],
+) -> Result<axum::response::Response, String> {
+    let origin = format!("http://{peer}");
+    let path = match route {
+        "resources" => "/v1/resources",
+        "list" => "/v1/files/list",
+        "metadata" => "/v1/files/metadata",
+        "download" => "/v1/downloads",
+        _ => return Err("unknown file operation".into()),
+    };
+    let request = HttpRequest::builder()
+        .method(if route == "resources" { "GET" } else { "POST" })
+        .uri(format!("{origin}{path}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .map_err(|e| e.to_string())?;
+    let client = Client::builder(TokioExecutor::new()).build(portal_net::Connector { network });
+    let response = network_wait(client.request(request), "peer HTTP response")
+        .await?
+        .map_err(|e| format!("peer HTTP request failed: {e}"))?;
+    if route != "download" || response.status() != StatusCode::OK {
+        return bounded_proxy_response(response).await;
+    }
+    let bytes = read_json_body(response.into_body()).await?;
+    let ticket: PrepareDownloadResponse =
+        serde_json::from_slice(&bytes).map_err(|_| "peer returned invalid download parameters")?;
+    let url = ticket
+        .download_url
+        .parse::<Uri>()
+        .map_err(|_| "invalid peer download URL")?;
+    if url.scheme_str() != Some("http") || url.authority() != peer_uri(&origin)?.authority() {
+        return Err("download URL must belong to the requested peer".into());
+    }
+    let request = HttpRequest::get(url)
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| e.to_string())?;
+    let response = network_wait(client.request(request), "peer download response")
+        .await?
+        .map_err(|e| e.to_string())?;
+    if response.status() != StatusCode::OK {
+        return bounded_proxy_response(response).await;
+    }
+    let expected = ticket.size_bytes;
+    let stream = futures_util::stream::unfold(
+        (response.into_body().into_data_stream(), 0_u64, false),
+        move |(mut body, received, done)| async move {
+            if done {
+                return None;
+            }
+            let result = network_wait(body.next(), "peer download progress").await;
+            let (chunk, received, done) = match result {
+                Ok(Some(Ok(chunk))) => {
+                    let total = received.saturating_add(chunk.len() as u64);
+                    if total > expected {
+                        (
+                            Err(std::io::Error::other("peer body exceeded advertised size")),
+                            total,
+                            true,
+                        )
+                    } else {
+                        (Ok(chunk), total, false)
+                    }
+                }
+                Ok(None) if received == expected => return None,
+                Ok(None) => (
+                    Err(std::io::Error::other("incomplete peer download")),
+                    received,
+                    true,
+                ),
+                Ok(Some(Err(error))) => (Err(std::io::Error::other(error)), received, true),
+                Err(error) => (Err(std::io::Error::other(error)), received, true),
+            };
+            Some((chunk, (body, received, done)))
+        },
+    );
+    let mut result = axum::response::Response::new(axum::body::Body::from_stream(stream));
+    result.headers_mut().insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/octet-stream"),
+    );
+    result.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&expected.to_string()).map_err(|e| e.to_string())?,
+    );
+    // Encode UTF-8 filenames rather than interpolating untrusted characters into a header.
+    let encoded: String = ticket
+        .file_name
+        .bytes()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect();
+    result.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        http::HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}"))
+            .map_err(|e| e.to_string())?,
+    );
+    result.headers_mut().insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    Ok(result)
+}
+
+async fn read_json_body(mut body: hyper::body::Incoming) -> Result<Vec<u8>, String> {
+    network_wait(
+        async {
+            let mut bytes = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| e.to_string())?;
+                if let Some(chunk) = frame.data_ref() {
+                    if bytes.len() + chunk.len() > 1024 * 1024 {
+                        return Err("peer JSON response exceeds 1 MiB".into());
+                    }
+                    bytes.extend_from_slice(chunk);
+                }
+            }
+            Ok(bytes)
+        },
+        "peer JSON body",
+    )
+    .await?
+}
+async fn bounded_proxy_response(
+    response: hyper::Response<hyper::body::Incoming>,
+) -> Result<axum::response::Response, String> {
+    let status = response.status();
+    let bytes = read_json_body(response.into_body()).await?;
+    let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// Call the authenticated loopback API. Remote file requests are forwarded by the runtime's stack.
+pub async fn local_request<B: serde::Serialize>(
+    api: &str,
+    token: &str,
+    operation: &str,
+    request: &B,
+) -> Result<hyper::Response<hyper::body::Incoming>, String> {
+    let origin = peer_uri(api)?;
+    let host = origin
+        .host()
+        .ok_or("local API URL has no host")?
+        .trim_matches(['[', ']']);
+    if host != "localhost"
+        && !host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Err("--api must target loopback".into());
+    }
+    if !["resources", "list", "metadata", "download"].contains(&operation) {
+        return Err("unknown file operation".into());
+    }
+    let request = HttpRequest::post(format!(
+        "http://{}/api/v1/files/{operation}",
+        origin.authority().unwrap()
+    ))
+    .header(header::CONTENT_TYPE, "application/json")
+    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+    .body(Full::new(Bytes::from(
+        serde_json::to_vec(request).map_err(|e| e.to_string())?,
+    )))
+    .map_err(|e| e.to_string())?;
+    let response = network_wait(http_client().request(request), "local API response")
+        .await?
+        .map_err(|e| e.to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!(
+            "file request rejected with status {}",
+            response.status()
+        ));
+    }
+    Ok(response)
+}
+pub async fn local_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    api: &str,
+    token: &str,
+    operation: &str,
+    request: &B,
+) -> Result<T, String> {
+    let response = local_request(api, token, operation, request).await?;
+    let body = read_json_body(response.into_body()).await?;
+    serde_json::from_slice(&body).map_err(|e| format!("local API returned invalid JSON: {e}"))
+}
+pub async fn local_download<B: serde::Serialize>(
+    api: &str,
+    token: &str,
+    request: &B,
+    path: &str,
+    output: &Path,
+) -> Result<(), String> {
+    let response = local_request(api, token, "download", request).await?;
+    let size = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse().ok())
+        .ok_or("local API returned no valid Content-Length")?;
+    save_download(response, output, size, path.to_owned()).await
 }

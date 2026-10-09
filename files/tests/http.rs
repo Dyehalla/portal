@@ -43,11 +43,10 @@ async fn http_download_negotiation_authorization_and_single_use() {
     std::fs::write(root.join("hello.txt"), b"HTTP peer download\n").unwrap();
     let service = FileService::new(
         "127.0.0.1:0".parse().unwrap(),
-        Some(FileServiceConfig {
-            root,
+        FileServiceConfig {
+            root: root.clone(),
             allowed_downloaders: HashSet::from(["127.0.0.1".parse().unwrap()]),
-        }),
-        None,
+        },
     )
     .await
     .unwrap();
@@ -123,14 +122,145 @@ async fn http_download_negotiation_authorization_and_single_use() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(output).unwrap(), b"HTTP peer download\n");
-    assert!(portal_files::list_shares(&origin).await.unwrap().is_empty());
-    assert!(
-        portal_files::prepare_smb_connection(&origin, "documents")
+    let resources = portal_files::list_resources(&origin).await.unwrap();
+    assert_eq!(resources.resources.len(), 1);
+    assert!(resources.resources[0].read_only);
+    let page = portal_files::list_directory(
+        &origin,
+        &portal_files::models::ListDirectoryRequest {
+            path: String::new(),
+            offset: 0,
+            limit: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, "hello.txt");
+    assert_eq!(page.entries[0].kind, portal_files::models::FileKind::File);
+    let metadata = portal_files::file_metadata(&origin, "hello.txt")
+        .await
+        .unwrap();
+    assert_eq!(metadata.size_bytes, Some(19));
+    let response = denied
+        .request(request(&format!("{origin}/v1/resources"), "GET", ""))
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let resources: portal_files::models::ListResourcesResponse =
+        serde_json::from_slice(&body).unwrap();
+    assert!(resources.resources.is_empty());
+    let response = denied
+        .request(request(
+            &format!("{origin}/v1/files/list"),
+            "POST",
+            r#"{"path":""}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = allowed
+        .request(request(
+            &format!("{origin}/v1/files/metadata"),
+            "POST",
+            r#"{"path":"../hello.txt"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response =
+        portal_files::proxy_request(address, "list", br#"{"path":"","limit":100,"offset":0}"#)
             .await
-            .err()
-            .unwrap()
-            .contains("501")
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = portal_files::proxy_request(address, "download", br#"{"path":"hello.txt"}"#)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
     );
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    assert_eq!(
+        &response.into_body().collect().await.unwrap().to_bytes()[..],
+        b"HTTP peer download\n"
+    );
+    let response = portal_files::proxy_request(address, "metadata", br#"{"path":"missing"}"#)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // Pagination, UTF-8 paths, and confinement are shared by direct and web-proxy clients.
+    std::fs::create_dir(root.join("alpha")).unwrap();
+    std::fs::write(root.join("пример.txt"), b"unicode filename").unwrap();
+    let outside = directory.0.join("outside.txt");
+    std::fs::write(&outside, b"private").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("outside")).unwrap();
+    let first = portal_files::list_directory(
+        &origin,
+        &portal_files::models::ListDirectoryRequest {
+            path: String::new(),
+            offset: 0,
+            limit: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.next_offset, Some(2));
+    assert_eq!(
+        first.entries[0].kind,
+        portal_files::models::FileKind::Directory
+    );
+    let second = portal_files::list_directory(
+        &origin,
+        &portal_files::models::ListDirectoryRequest {
+            path: String::new(),
+            offset: first.next_offset.unwrap(),
+            limit: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.next_offset, None);
+    assert_eq!(
+        second.entries[0].kind,
+        portal_files::models::FileKind::Symlink
+    );
+    assert_eq!(second.entries[1].name, "пример.txt");
+    for route in ["/v1/files/metadata", "/v1/files/list", "/v1/downloads"] {
+        let response = allowed
+            .request(request(
+                &format!("{origin}{route}"),
+                "POST",
+                r#"{"path":"outside"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let big = vec![42u8; 300000];
+    std::fs::write(root.join("big.bin"), &big).unwrap();
+    let response = portal_files::proxy_request(address, "download", br#"{"path":"big.bin"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        &response.into_body().collect().await.unwrap().to_bytes()[..],
+        &big[..]
+    );
+    let response = allowed
+        .request(request(
+            &format!("{origin}/v1/files/list"),
+            "POST",
+            r#"{"path":"","limit":0}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     drop(allowed);
     drop(denied);
     stop.send(()).unwrap();

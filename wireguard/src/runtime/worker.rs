@@ -127,9 +127,9 @@ fn process_packet(
                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
-        PacketSource::Tun => {
-            stats.received_tun_packets.fetch_add(1, Ordering::Relaxed);
-            if !handle_tun(io, state, packet, scratch) {
+        PacketSource::Ip => {
+            stats.received_ip_packets.fetch_add(1, Ordering::Relaxed);
+            if !handle_ip(io, state, packet, scratch) {
                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -246,7 +246,7 @@ fn handle_udp(
     io_success
 }
 
-// Enforce the peer's AllowedIPs source ownership before writing decrypted data to TUN.
+// Enforce the peer's AllowedIPs source ownership before passing decrypted data to the userspace stack.
 fn write_inner_packet(
     io: &PacketIo,
     state: &RwLock<DeviceState>,
@@ -260,7 +260,7 @@ fn write_inner_packet(
         return true;
     }
 
-    if io.write_tun(packet).is_ok() {
+    if io.write_ip(packet).is_ok() {
         peer.count_rx(packet.len());
         true
     } else {
@@ -286,8 +286,8 @@ enum PacketKind {
     Data,
 }
 
-// Route an outbound TUN packet and ask BoringTun to encapsulate or queue it.
-fn handle_tun(
+// Route an outbound userspace IP packet and ask BoringTun to encapsulate or queue it.
+fn handle_ip(
     io: &Arc<PacketIo>,
     state: &Arc<RwLock<DeviceState>>,
     packet: &[u8],

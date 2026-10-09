@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-// HTTP connections and Samba each have a bounded five-second shutdown budget.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(11);
+// The file server gets five seconds to drain connections before cancellation.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
 use portal_files::{FileService, FileServiceConfig};
 use tokio::runtime::{Builder, Runtime};
@@ -20,16 +20,16 @@ pub(crate) struct PeerServices {
 impl PeerServices {
     /// Bind configured peer services, and start serving in a Tokio runtime.
     pub(crate) fn start(
+        network: portal_net::Net,
         http_address: SocketAddr,
-        file_config: Option<FileServiceConfig>,
-        smb_config: Option<portal_files::SmbConfig>,
+        file_config: FileServiceConfig,
     ) -> Result<Self, String> {
         let runtime = Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("could not create peer service runtime: {error}"))?;
         let file_service =
-            runtime.block_on(FileService::new(http_address, file_config, smb_config))?;
+            runtime.block_on(FileService::new_virtual(network, http_address, file_config))?;
         let http_address = file_service.http_addr();
 
         let (shutdown, receiver) = watch::channel(false);

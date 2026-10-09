@@ -37,8 +37,6 @@ pub struct DeviceConfig {
     pub listen: SocketAddr,
     /// Bind a wildcard socket for the other IP family on the same port. Defaults to true.
     pub dual_stack: bool,
-    /// Name of the TUN interface to open or create.
-    pub tun_name: String,
     /// Number of packet workers. Zero is invalid.
     pub workers: usize,
     /// Handshakes per second allowed before cookies are required. Zero is invalid.
@@ -47,12 +45,11 @@ pub struct DeviceConfig {
 
 impl DeviceConfig {
     /// Construct a configuration using the available parallelism as its worker count.
-    pub fn new(private_key: PeerKey, listen: SocketAddr, tun_name: impl Into<String>) -> Self {
+    pub fn new(private_key: PeerKey, listen: SocketAddr) -> Self {
         Self {
             private_key,
             listen,
             dual_stack: true,
-            tun_name: tun_name.into(),
             workers: std::thread::available_parallelism()
                 .map_or(DEFAULT_WORKERS, |count| count.get().min(MAX_WORKERS)),
             handshake_rate_limit: DEFAULT_HANDSHAKE_RATE_LIMIT,
@@ -83,7 +80,7 @@ impl Drop for PeerConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceStats {
     pub received_udp_packets: u64,
-    pub received_tun_packets: u64,
+    pub received_ip_packets: u64,
     pub dropped_packets: u64,
     /// Timer-generated UDP sends that failed.
     pub timer_send_errors: u64,
@@ -93,7 +90,7 @@ pub struct DeviceStats {
 
 /// Per-peer inner-IP counters. `tx` counts packets accepted by BoringTun for
 /// transmission; it does not mean the remote peer acknowledged delivery.
-/// `rx` counts authenticated packets successfully written to TUN.
+/// `rx` counts authenticated packets successfully delivered to the packet channel.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PeerStats {
     pub tx_packets: u64,
@@ -175,7 +172,7 @@ pub struct Device {
 #[derive(Default)]
 pub(crate) struct DeviceCounters {
     pub(crate) received_udp_packets: AtomicU64,
-    pub(crate) received_tun_packets: AtomicU64,
+    pub(crate) received_ip_packets: AtomicU64,
     pub(crate) dropped_packets: AtomicU64,
     pub(crate) timer_send_errors: AtomicU64,
     pub(crate) udp_send_errors: AtomicU64,
@@ -188,7 +185,7 @@ enum WorkerFailure {
 }
 
 impl Device {
-    /// Create the interface, bind UDP and start the configured workers.
+    /// Create the packet channel, bind UDP and start the configured workers.
     pub fn new(mut config: DeviceConfig) -> Result<Self, DeviceError> {
         if config.workers == 0 || config.workers > MAX_WORKERS {
             return Err(DeviceError::InvalidWorkerCount);
@@ -204,11 +201,7 @@ impl Device {
         let public_key = *public.as_bytes();
         drop(private);
 
-        let io = Arc::new(PacketIo::open(
-            config.listen,
-            &config.tun_name,
-            config.dual_stack,
-        )?);
+        let io = Arc::new(PacketIo::open(config.listen, config.dual_stack)?);
         let listen_addr = io.local_addr()?;
         let rate_limiter = Arc::new(RateLimiter::new(&public, config.handshake_rate_limit));
         let state = Arc::new(RwLock::new(DeviceState::default()));
@@ -280,6 +273,11 @@ impl Device {
             management: Mutex::new(()),
             listen_addr,
         })
+    }
+
+    /// Plain IP packets validated/decrypted by WireGuard; no system interface is created.
+    pub fn packet_port(&self) -> crate::PacketPort {
+        self.io.as_ref().expect("running device").packet_port()
     }
 
     /// Return the UDP address selected for the device.
@@ -449,7 +447,7 @@ impl Device {
     pub fn stats(&self) -> DeviceStats {
         DeviceStats {
             received_udp_packets: self.stats.received_udp_packets.load(Ordering::Relaxed),
-            received_tun_packets: self.stats.received_tun_packets.load(Ordering::Relaxed),
+            received_ip_packets: self.stats.received_ip_packets.load(Ordering::Relaxed),
             dropped_packets: self.stats.dropped_packets.load(Ordering::Relaxed),
             timer_send_errors: self.stats.timer_send_errors.load(Ordering::Relaxed),
             udp_send_errors: self.stats.udp_send_errors.load(Ordering::Relaxed),

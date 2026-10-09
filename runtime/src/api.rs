@@ -1,12 +1,14 @@
+use std::future::IntoFuture;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::routing::post;
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,7 @@ struct ApiState {
     runtime: Arc<Mutex<Runtime>>,
     token: Arc<Zeroizing<String>>,
     listen_address: SocketAddr,
+    network: Option<portal_net::Net>,
 }
 
 /// JSON operations accepted by the local management API.
@@ -92,6 +95,7 @@ impl LocalApi {
         address: SocketAddr,
         token_file: PathBuf,
         runtime: Arc<Mutex<Runtime>>,
+        network: Option<portal_net::Net>,
     ) -> Result<Self, String> {
         if !address.ip().is_loopback() {
             return Err("--api-listen must use a loopback address".into());
@@ -119,6 +123,7 @@ impl LocalApi {
             runtime,
             token: Arc::new(Zeroizing::new(token)),
             listen_address: address,
+            network,
         };
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = match thread::Builder::new()
@@ -133,16 +138,30 @@ impl LocalApi {
                         .map_err(|error| format!("could not start local API listener: {error}"))?;
                     let app = Router::new()
                         .route("/api/v1/command", post(handle_command))
+                        .route("/api/v1/files/:operation", post(handle_files))
+                        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
                         .with_state(state);
-                    axum::serve(
+                    let (drain, mut draining) = tokio::sync::watch::channel(false);
+                    let server = axum::serve(
                         listener,
                         app.into_make_service_with_connect_info::<SocketAddr>(),
                     )
-                    .with_graceful_shutdown(async {
-                        let _ = shutdown_receiver.await;
+                    .with_graceful_shutdown(async move {
+                        while !*draining.borrow() {
+                            if draining.changed().await.is_err() { break; }
+                        }
                     })
-                    .await
-                    .map_err(|error| format!("local API server failed: {error}"))
+                    .into_future();
+                    tokio::pin!(server);
+                    tokio::select! {
+                        result = &mut server => result.map_err(|e| format!("local API server failed: {e}")),
+                        _ = shutdown_receiver => {
+                            let _ = drain.send(true);
+                            tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await
+                                .map_err(|_| "local API exceeded shutdown grace period".to_owned())?
+                                .map_err(|e| format!("local API server failed: {e}"))
+                        }
+                    }
                 })
             }) {
             Ok(task) => task,
@@ -197,6 +216,31 @@ async fn handle_command(
             "request is too large",
         ));
     }
+    authenticate(&state, remote, &headers)?;
+
+    let request: ManagementRequest = serde_json::from_slice(&body).map_err(|error| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON request: {error}"),
+        )
+    })?;
+    let mut runtime = state.runtime.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state is unavailable",
+        )
+    })?;
+    let result = runtime.handle_api_request(request);
+    result
+        .map(|message| Json(CommandResponse { message }))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+}
+
+fn authenticate(
+    state: &ApiState,
+    remote: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<CommandResponse>)> {
     if !remote.ip().is_loopback() || !valid_host(&headers, state.listen_address) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -226,22 +270,72 @@ async fn handle_command(
         ));
     }
 
-    let request: ManagementRequest = serde_json::from_slice(&body).map_err(|error| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid JSON request: {error}"),
-        )
-    })?;
-    let mut runtime = state.runtime.lock().map_err(|_| {
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRequest {
+    peer: String,
+    #[serde(default = "default_peer_port")]
+    port: u16,
+    #[serde(default)]
+    tunnel_ip: Option<std::net::IpAddr>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "portal_files::models::default_page_size")]
+    limit: usize,
+}
+fn default_peer_port() -> u16 {
+    8080
+}
+
+async fn handle_files(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Path(operation): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
+    authenticate(&state, remote, &headers)?;
+    let request: FileRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid file API request"))?;
+    // Release the runtime lock before any network IO.
+    let address = state
+        .runtime
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime state is unavailable",
+            )
+        })?
+        .file_peer_address(&request.peer, request.port, request.tunnel_ip)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
+    let payload = match operation.as_str() {
+        "resources" => serde_json::json!({}),
+        "list" => {
+            serde_json::json!({"path": request.path, "offset": request.offset, "limit": request.limit})
+        }
+        "metadata" | "download" => serde_json::json!({"path": request.path}),
+        _ => {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "unknown file API operation",
+            ));
+        }
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(|_| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime state is unavailable",
+            "could not encode peer request",
         )
     })?;
-    let result = runtime.handle_api_request(request);
-    result
-        .map(|message| Json(CommandResponse { message }))
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+    portal_files::proxy_request_with_net(state.network.clone(), address, &operation, &bytes)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, &error))
 }
 
 /// Build a JSON error response with the matching HTTP status.
@@ -301,4 +395,78 @@ fn valid_token(headers: &HeaderMap, expected: &str) -> bool {
             difference | (left ^ right)
         })
         == 0
+}
+
+#[cfg(test)]
+mod file_api_tests {
+    use super::*;
+    #[tokio::test]
+    async fn file_routes_require_local_host_origin_and_bearer_token() {
+        let state = ApiState {
+            runtime: Arc::new(Mutex::new(crate::service::file_api_test_runtime(vec![
+                "10.20.0.2/32".parse().unwrap(),
+            ]))),
+            token: Arc::new(Zeroizing::new("secret".into())),
+            listen_address: "127.0.0.1:51821".parse().unwrap(),
+            network: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "127.0.0.1:51821".parse().unwrap());
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let body = Bytes::from_static(
+            br#"{"peer":"0101010101010101010101010101010101010101010101010101010101010101"}"#,
+        );
+        let result = handle_files(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            Path("resources".into()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::UNAUTHORIZED);
+        headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
+        headers.insert(ORIGIN, "http://example.com".parse().unwrap());
+        let result = handle_files(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            Path("resources".into()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
+        headers.remove(ORIGIN);
+        headers.insert(HOST, "example.com:51821".parse().unwrap());
+        let result = handle_files(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            Path("resources".into()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
+        headers.insert(HOST, "127.0.0.1:51821".parse().unwrap());
+        let result = handle_files(
+            State(state.clone()),
+            ConnectInfo("10.20.0.3:1234".parse().unwrap()),
+            Path("resources".into()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
+        let result = handle_files(State(state.clone()), ConnectInfo("127.0.0.1:1234".parse().unwrap()), Path("resources".into()), headers.clone(), Bytes::from_static(br#"{"peer":"0101010101010101010101010101010101010101010101010101010101010101","url":"http://127.0.0.1"}"#)).await;
+        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        let result = handle_files(
+            State(state),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            Path("unknown".into()),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::NOT_FOUND);
+    }
 }
