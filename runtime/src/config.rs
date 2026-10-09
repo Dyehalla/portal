@@ -16,7 +16,7 @@ pub struct RuntimeConfig {
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
     pub peer_http_listen: Option<SocketAddr>,
-    pub file_service: Option<portal_files::FileServiceConfig>,
+    pub services: Vec<crate::ServiceRegistration>,
 }
 
 /// Secret device key that is cleared from memory when its owner is dropped.
@@ -92,20 +92,27 @@ pub fn load_config(path: &std::path::Path) -> Result<RuntimeConfig, String> {
     if !settings.api_listen.ip().is_loopback() {
         return Err("api_listen must use a loopback address".into());
     }
-    let file_service = settings
-        .files
-        .map(|files| {
-            if files.allowed_downloaders.is_empty() {
-                return Err("files.allowed_downloaders must contain at least one IP".to_owned());
+    let mut services = Vec::new();
+    for service in settings.services {
+        match service {
+            ServiceConfig::Files {
+                root,
+                allowed_downloaders,
+            } => {
+                if allowed_downloaders.is_empty() {
+                    return Err("files.allowed_downloaders must contain at least one IP".into());
+                }
+                services.push(crate::ServiceRegistration::files(
+                    portal_files::FileServiceConfig {
+                        root: resolve(root),
+                        allowed_downloaders,
+                    },
+                ));
             }
-            Ok(portal_files::FileServiceConfig {
-                root: resolve(files.root),
-                allowed_downloaders: files.allowed_downloaders,
-            })
-        })
-        .transpose()?;
-    if settings.peer_http_listen.is_some() != file_service.is_some() {
-        return Err("peer_http_listen and files must be configured together".into());
+        }
+    }
+    if settings.peer_http_listen.is_none() && !services.is_empty() {
+        return Err("configured services require peer_http_listen".into());
     }
     let private_key = SecretKey(read_key_file(&resolve(settings.private_key_file))?);
     Ok(RuntimeConfig {
@@ -122,7 +129,7 @@ pub fn load_config(path: &std::path::Path) -> Result<RuntimeConfig, String> {
             .map(resolve)
             .unwrap_or_else(default_token_file),
         peer_http_listen: settings.peer_http_listen,
-        file_service,
+        services,
     })
 }
 
@@ -147,13 +154,15 @@ struct FileConfig {
     #[serde(default)]
     peer_http_listen: Option<SocketAddr>,
     #[serde(default)]
-    files: Option<FilesConfig>,
+    services: Vec<ServiceConfig>,
 }
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesConfig {
-    root: PathBuf,
-    allowed_downloaders: std::collections::HashSet<IpAddr>,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ServiceConfig {
+    Files {
+        root: PathBuf,
+        allowed_downloaders: std::collections::HashSet<IpAddr>,
+    },
 }
 fn default_mtu() -> u32 {
     1420
@@ -250,16 +259,13 @@ mod tests {
             "addresses": ["10.20.0.1/32"],
             "api_token_file": "api.token",
             "peer_http_listen": "10.20.0.1:8080",
-            "files": {"root": "share", "allowed_downloaders": ["10.20.0.2"]}
+            "services": [{"type": "files", "root": "share", "allowed_downloaders": ["10.20.0.2"]}]
         });
         std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
         let config = load_config(&path).unwrap();
         assert_eq!(config.private_key.0, [7; 32]);
         assert_eq!(config.api_token_file, directory.join("api.token"));
-        assert_eq!(
-            config.file_service.as_ref().unwrap().root,
-            directory.join("share")
-        );
+        assert_eq!(config.services.len(), 1);
         assert_eq!(config.mtu, 1420);
         assert!(config.dual_stack);
         for (field, value) in [
@@ -267,7 +273,8 @@ mod tests {
             ("api_listen", serde_json::json!("0.0.0.0:51821")),
             ("mtu", serde_json::json!(9001)),
             ("addresses", serde_json::json!([])),
-            ("files", serde_json::Value::Null),
+            ("peer_http_listen", serde_json::Value::Null),
+            ("services", serde_json::json!([{ "type": "unknown" }])),
         ] {
             let mut invalid = settings.clone();
             invalid[field] = value;

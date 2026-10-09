@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='portal-userspace-') as temporary:
             }
             if i == 1:
                 settings['peer_http_listen'] = '10.152.0.2:8080'
-                settings['files'] = {'root': str(share), 'allowed_downloaders': ['10.152.0.1']}
+                settings['services'] = [{'type': 'files', 'root': str(share), 'allowed_downloaders': ['10.152.0.1']}]
             config = root / f'config{i}.json'
             config.write_text(json.dumps(settings))
             command = [str(BIN / 'portal-runtime')]

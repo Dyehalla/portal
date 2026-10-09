@@ -115,7 +115,7 @@ Runtime не принимает CLI-команд и аргументов. Он �
 или `portal.json` в текущем каталоге. Относительные пути разрешаются относительно
 файла конфигурации. Обязательные поля: `private_key_file`, `listen`, `addresses`.
 Дополнительно: `mtu` (1420), `workers`, `handshake_rate_limit`, `dual_stack` (true),
-`api_listen` (127.0.0.1:51821), `api_token_file`, `peer_http_listen`, `files`.
+`api_listen` (127.0.0.1:51821), `api_token_file`, `peer_http_listen`, `services`.
 Неизвестные поля отклоняются. Генерация ключа находится в отдельном CLI.
 
 `keygen` создаёт raw-файл приватного ключа с режимом `0600` и печатает открытый
@@ -194,10 +194,9 @@ cargo build -p portal-runtime -p portal-files --release
 ```json
 {
   "peer_http_listen": "10.20.0.1:8080",
-  "files": {
-    "root": "share",
-    "allowed_downloaders": ["10.20.0.2"]
-  }
+  "services": [
+    {"type": "files", "root": "share", "allowed_downloaders": ["10.20.0.2"]}
+  ]
 }
 ```
 
@@ -244,8 +243,8 @@ TODO: устранить гонку между проверкой пути и о
 ## HTTP API файлового проводника
 
 Файловый сервис работает только через HTTP поверх WireGuard. Он публикует один
-ресурс `files`, соответствующий `files.root`. Локальный путь сервера не раскрывается.
-Разрешение `files.allowed_downloaders` теперь включает просмотр и чтение файлов.
+ресурс `files`, соответствующий `root` сервиса `files`. Локальный путь сервера не раскрывается.
+Разрешение `allowed_downloaders` сервиса `files` теперь включает просмотр и чтение файлов.
 Запись, загрузка, переименование и удаление пока не реализованы.
 
 Peer API:
@@ -319,3 +318,26 @@ cargo test -p portal-files -- --include-ignored
 cargo build -p portal-runtime -p portal-cli -p portal-files
 python3 runtime/scripts/check-userspace.py
 ```
+
+## Регистрация сервисов
+
+`RuntimeConfig.services` — список `ServiceRegistration`. Регистрация получает
+`ServiceContext` с пользовательской сетью и фактическим HTTP-адресом и возвращает
+`ServiceRoutes`: Axum router и необязательную фоновую задачу. Runtime объединяет
+маршруты на одном listener, проверяет уникальность имён и останавливает задачи
+вместе с сервером. Сервисы сами проверяют права пиров; сервер передаёт достоверный
+`ConnectInfo` из виртуального TCP. Ошибка фоновой задачи останавливает runtime.
+
+Для встраивания другого сервиса зарегистрируйте его фабрику:
+
+```rust
+config.services.push(portal_runtime::ServiceRegistration::new("terminal", |context| async move {
+    // Построить router с состоянием и авторизацией терминального сервиса.
+    let router = terminal_router(context.network);
+    Ok(portal_runtime::ServiceRoutes::new(router))
+}));
+```
+
+JSON-конфигурация сейчас знает встроенный тип `files`. Новый встроенный тип
+добавляется в декодер конфигурации; общий HTTP-сервер менять не требуется.
+Это точка подключения сервисов приложения, а не загрузчик динамических плагинов.

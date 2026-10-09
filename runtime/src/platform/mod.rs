@@ -2,7 +2,7 @@
 pub(crate) mod linux;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::LinuxPlatform;
+pub(crate) use linux::LinuxPlatform as Platform;
 
 /// Host lifecycle operations required by the runtime manager.
 pub(crate) trait HostPlatform: Send + Sync + 'static {

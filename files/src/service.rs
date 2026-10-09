@@ -40,6 +40,51 @@ pub(super) struct DownloadTicket {
     pub(super) permit: OwnedSemaphorePermit,
 }
 
+/// File routes and maintenance independent of the server that hosts them.
+pub struct FileRoutes {
+    state: SharedState,
+}
+impl FileRoutes {
+    pub async fn new(address: SocketAddr, config: FileServiceConfig) -> Result<Self, String> {
+        let root = tokio::fs::canonicalize(&config.root)
+            .await
+            .map_err(|e| format!("could not resolve file root {}: {e}", config.root.display()))?;
+        if !tokio::fs::metadata(&root)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_dir()
+        {
+            return Err("file root must be a directory".into());
+        }
+        if config.allowed_downloaders.is_empty() {
+            return Err("at least one allowed downloader IP is required".into());
+        }
+        Ok(Self {
+            state: SharedState {
+                root: Arc::new(root),
+                download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
+                http_advertise: Arc::from(format!("http://{address}")),
+                allowed_downloaders: Arc::new(config.allowed_downloaders),
+                tickets: Arc::new(Mutex::new(HashMap::new())),
+            },
+        })
+    }
+    /// The hosting server must inject trusted TCP ConnectInfo for authorization.
+    pub fn router(&self) -> axum::Router {
+        crate::api::router(crate::api::ApiState {
+            files: self.state.clone(),
+        })
+    }
+    /// Run ticket expiry until the hosting server cancels this task.
+    pub async fn maintain(self) -> Result<(), String> {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            self.state.prune_expired().await;
+        }
+    }
+}
+
 /// Peer HTTP routes and file browser state.
 pub struct FileService {
     state: SharedState,
@@ -55,32 +100,13 @@ enum Listener {
 impl FileService {
     /// Bind one HTTP listener for file browsing, negotiation, and downloads.
     pub async fn new(http_listen: SocketAddr, config: FileServiceConfig) -> Result<Self, String> {
-        let root = tokio::fs::canonicalize(&config.root)
-            .await
-            .map_err(|e| format!("could not resolve file root {}: {e}", config.root.display()))?;
-        if !tokio::fs::metadata(&root)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_dir()
-        {
-            return Err("file root must be a directory".into());
-        }
-        if config.allowed_downloaders.is_empty() {
-            return Err("at least one allowed downloader IP is required".into());
-        }
         let http_listener = TcpListener::bind(http_listen)
             .await
             .map_err(|e| format!("could not bind peer HTTP listener {http_listen}: {e}"))?;
         let http_address = http_listener.local_addr().map_err(|e| e.to_string())?;
-        let state = SharedState {
-            root: Arc::new(root),
-            download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
-            http_advertise: Arc::from(format!("http://{http_address}")),
-            allowed_downloaders: Arc::new(config.allowed_downloaders),
-            tickets: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let routes = FileRoutes::new(http_address, config).await?;
         Ok(Self {
-            state,
+            state: routes.state,
             http_listener: Listener::System(http_listener),
             http_address,
         })
@@ -92,30 +118,11 @@ impl FileService {
         address: SocketAddr,
         config: FileServiceConfig,
     ) -> Result<Self, String> {
-        let root = tokio::fs::canonicalize(&config.root)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !tokio::fs::metadata(&root)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_dir()
-            || config.allowed_downloaders.is_empty()
-        {
-            return Err(
-                "file root must be a directory and at least one reader must be allowed".into(),
-            );
-        }
         let listener = network.listen(address).map_err(|e| e.to_string())?;
         let address = listener.local_addr();
-        let state = SharedState {
-            root: Arc::new(root),
-            download_slots: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
-            http_advertise: Arc::from(format!("http://{address}")),
-            allowed_downloaders: Arc::new(config.allowed_downloaders),
-            tickets: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let routes = FileRoutes::new(address, config).await?;
         Ok(Self {
-            state,
+            state: routes.state,
             http_listener: Listener::Virtual(listener),
             http_address: address,
         })

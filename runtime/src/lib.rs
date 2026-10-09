@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 mod api;
 mod config;
+mod services;
+pub use services::{ServiceContext, ServiceRegistration, ServiceRoutes};
 #[cfg(target_os = "linux")]
 mod peer_services;
 mod platform;

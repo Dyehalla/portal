@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::api::LocalApi;
 use crate::api::ManagementRequest;
 use crate::peer_services::PeerServices;
-use crate::platform::{HostPlatform, LinuxPlatform};
+use crate::platform::{HostPlatform, Platform};
 use crate::{InterfaceAddress, RuntimeConfig, SecretKey};
 use portal::{AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
 use zeroize::Zeroize;
@@ -31,16 +31,16 @@ pub(crate) struct Runtime {
 
 /// Create the WireGuard device, start its userspace stack, serve the local API, and clean up.
 pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
-    for listener in options.peer_http_listen.into_iter() {
+    if let Some(listener) = options.peer_http_listen {
         if !options
             .addresses
             .iter()
             .any(|address| address.address == listener.ip())
         {
-            return Err("peer HTTP listener must use an IP assigned to the tunnel".into());
+            return Err("peer HTTP listener must use a configured virtual IP".into());
         }
     }
-    let platform: Arc<dyn HostPlatform> = Arc::new(LinuxPlatform);
+    let platform = Platform;
     platform.install_signal_handlers();
 
     let mut device_config = DeviceConfig::new(options.private_key.0, options.listen);
@@ -73,11 +73,17 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             return Err(error.to_string());
         }
     };
-    let mut peer_services = match start_peer_services(
-        network.clone(),
+    let services_result = match (
         options.peer_http_listen,
-        options.file_service.take(),
+        std::mem::take(&mut options.services),
     ) {
+        (Some(address), services) => {
+            PeerServices::start(network.clone(), address, services).map(Some)
+        }
+        (None, services) if services.is_empty() => Ok(None),
+        _ => Err("configured services require peer_http_listen".into()),
+    };
+    let mut peer_services = match services_result {
         Ok(services) => services,
         Err(error) => {
             network.shutdown();
@@ -179,7 +185,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
                 .expect("peer server was present")
                 .stop()
             {
-                Ok(()) => Err("peer-facing HTTP or HTTP server exited unexpectedly".into()),
+                Ok(()) => Err("peer HTTP server exited unexpectedly".into()),
                 Err(error) => Err(error),
             };
             break;
@@ -204,28 +210,6 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
         .and_then(|mut runtime| runtime.cleanup());
     serve_result?;
     cleanup_result
-}
-
-/// Start the configured peer services or reject incomplete listener configuration.
-fn start_peer_services(
-    network: portal_net::Net,
-    http_address: Option<SocketAddr>,
-    file_service: Option<portal_files::FileServiceConfig>,
-) -> Result<Option<PeerServices>, String> {
-    if file_service.is_none() {
-        return if http_address.is_none() {
-            Ok(None)
-        } else {
-            Err("peer_http_listen requires at least one configured HTTP service".into())
-        };
-    }
-    let address = http_address.ok_or("file sharing requires peer_http_listen")?;
-    PeerServices::start(
-        network,
-        address,
-        file_service.ok_or("file service configuration is required")?,
-    )
-    .map(Some)
 }
 
 impl Runtime {
