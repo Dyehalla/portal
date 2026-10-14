@@ -14,10 +14,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) enum ManagementRequest<'a> {
     PeerUpsert {
         public_key: &'a str,
-        preshared_key: Option<&'a str>,
         endpoint: Option<SocketAddr>,
-        keepalive_seconds: Option<u64>,
-        allowed_ips: Vec<&'a str>,
     },
     PeerRemove {
         public_key: &'a str,
@@ -29,13 +26,14 @@ pub(crate) enum ManagementRequest<'a> {
     EndpointClear {
         public_key: &'a str,
     },
+    Stats,
     PeerStats {
         public_key: &'a str,
     },
     Status,
     Health,
-    Stats,
     List,
+    ServicesReload,
     Shutdown,
 }
 
@@ -96,10 +94,6 @@ fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, 
             .and_then(|()| stream.write_all(&body))
             .and_then(|()| stream.flush())
             .map_err(|error| format!("could not send API request: {error}"))?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(|error| format!("could not finish API request: {error}"))?;
-
         let mut response = Vec::new();
         (&mut stream)
             .take((MAX_RESPONSE_BYTES + 1) as u64)

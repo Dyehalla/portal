@@ -1,17 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrepareDownloadRequest {
-    pub path: String,
-}
-#[derive(Serialize, Deserialize)]
-pub struct PrepareDownloadResponse {
-    pub download_url: String,
-    pub file_name: String,
-    pub size_bytes: u64,
-    pub expires_at_unix_seconds: u64,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileResource {
     pub id: String,

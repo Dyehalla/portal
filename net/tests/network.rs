@@ -1,74 +1,281 @@
-use portal::{Device, DeviceConfig, PeerConfig};
-use portal_net::Net;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use portal_net::{Net, Registry, Request, Response, Service};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Notify;
 
-fn device(key: u8) -> Device {
-    let mut config = DeviceConfig::new([key; 32], "127.0.0.1:0".parse().unwrap());
-    config.dual_stack = false;
-    config.workers = 1;
-    Device::new(config).unwrap()
+fn request(operation: &str) -> Request {
+    Request {
+        service: "test".into(),
+        operation: operation.into(),
+        payload: serde_json::json!({}),
+    }
 }
-fn peer(device: &Device, other: &Device, address: &str) {
-    device
-        .upsert_peer(PeerConfig {
-            public_key: other.public_key(),
-            preshared_key: None,
-            endpoint: Some(other.listen_addr()),
-            persistent_keepalive: None,
-            allowed_ips: vec![address.parse().unwrap()],
-        })
+
+#[tokio::test]
+#[ignore = "requires local UDP sockets"]
+async fn authenticated_quic_streams_and_peer_revocation() {
+    let a = Net::new(&[1; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let b = Net::new(&[2; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
         .unwrap();
-}
-async fn round_trip(ipv6: bool) {
-    let mut a = device(1);
-    let mut b = device(2);
-    let (a_ip, b_ip, prefix) = if ipv6 {
-        ("fd00::1", "fd00::2", 128)
-    } else {
-        ("10.150.0.1", "10.150.0.2", 32)
-    };
-    peer(&a, &b, &format!("{b_ip}/{prefix}"));
-    peer(&b, &a, &format!("{a_ip}/{prefix}"));
-    let a_net = Net::new(a.packet_port(), vec![(a_ip.parse().unwrap(), prefix)], 1420).unwrap();
-    let b_net = Net::new(b.packet_port(), vec![(b_ip.parse().unwrap(), prefix)], 1420).unwrap();
-    let remote = std::net::SocketAddr::new(b_ip.parse().unwrap(), 8080);
-    let mut listener = b_net.listen(remote).unwrap();
-    assert!(b_net.listen(remote).is_err());
-    let payload = vec![42u8; 300000];
-    let expected = payload.clone();
+    b.upsert_peer(a.public_key(), None).unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut registry = Registry::default();
+    let (entry, exit) = (entered.clone(), release.clone());
+    registry
+        .register(Service::new("test", move |peer, req| {
+            let (entry, exit) = (entry.clone(), exit.clone());
+            async move {
+                if req.operation == "truncated" {
+                    return Response::stream(
+                        std::io::Cursor::new(vec![1, 2, 3]),
+                        10,
+                        "test.bin".into(),
+                    );
+                }
+                if req.operation == "slow" {
+                    entry.notify_one();
+                    exit.notified().await;
+                }
+                Response::json(&serde_json::json!({"peer": portal_net::encode_key(&peer)})).unwrap()
+            }
+        }))
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server_net = b.clone();
     let server = tokio::spawn(async move {
-        let (mut stream, source) = listener.accept().await.unwrap();
-        assert_eq!(source.ip().to_string(), a_ip);
-        let mut received = vec![0; expected.len()];
-        stream.read_exact(&mut received).await.unwrap();
-        assert_eq!(received, expected);
-        stream.write_all(b"complete").await.unwrap();
-        stream.shutdown().await.unwrap();
+        server_net
+            .serve(registry, async {
+                let _ = stopped.await;
+            })
+            .await
     });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let mut stream = a_net.connect(remote).await.unwrap();
-        stream.write_all(&payload).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut received = Vec::new();
-        stream.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, b"complete");
-        server.await.unwrap();
+    tokio::task::yield_now().await;
+    let client = a.clone();
+    let key = b.public_key();
+    let slow = tokio::spawn(async move {
+        client
+            .request(key, request("slow"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        a.request(b.public_key(), request("fast")),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .json::<serde_json::Value>()
+    .await
+    .unwrap();
+    assert_eq!(reply["peer"], portal_net::encode_key(&a.public_key()));
+    release.notify_one();
+    slow.await.unwrap().unwrap();
+    let mut truncated = a
+        .request(b.public_key(), request("truncated"))
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    assert!(
+        tokio::io::AsyncReadExt::read_to_end(&mut truncated.body, &mut bytes)
+            .await
+            .is_err()
+    );
+    // A registered endpoint must not be accepted as a different registered key.
+    let wrong = portal_net::public_key(&[3; 32]);
+    a.upsert_peer(wrong, Some(b.listen_addr())).unwrap();
+    assert!(a.request(wrong, request("fast")).await.is_err());
+    // Server rejection: unknown client identity cannot use a trusted server.
+    let outsider = Net::new(&[4; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    outsider
+        .upsert_peer(b.public_key(), Some(b.listen_addr()))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            outsider.request(b.public_key(), request("fast"))
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    // Removing a peer closes established sessions too.
+    b.remove_peer(&a.public_key()).unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            a.request(b.public_key(), request("fast"))
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    a.shutdown();
+    b.shutdown();
+    outsider.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "requires local UDP sockets"]
+async fn quic_ipv6_and_oversized_frame() {
+    let a = Net::new(&[11; 32], "[::1]:0".parse().unwrap()).unwrap();
+    let b = Net::new(&[12; 32], "[::1]:0".parse().unwrap()).unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
+        .unwrap();
+    b.upsert_peer(a.public_key(), None).unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Service::new("test", |_, _| async {
+            Response::json(&true).unwrap()
+        }))
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server_net = b.clone();
+    let server = tokio::spawn(async move {
+        server_net
+            .serve(registry, async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        a.request(b.public_key(), request("fast"))
+            .await
+            .unwrap()
+            .json::<bool>()
+            .await
+            .unwrap()
+    );
+    let mut large = request("fast");
+    large.payload = serde_json::json!("x".repeat(17000));
+    assert!(a.request(b.public_key(), large).await.is_err());
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    a.shutdown();
+    b.shutdown();
+}
+
+#[tokio::test]
+#[ignore = "requires local UDP sockets"]
+async fn concurrent_connection_attempts_share_the_queue_and_handshake_budget() {
+    // An open socket that never replies makes the handshake time out predictably.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = Net::new(&[31; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let key = portal_net::public_key(&[32; 32]);
+    client
+        .upsert_peer(key, Some(blackhole.local_addr().unwrap()))
+        .unwrap();
+
+    let net = client.clone();
+    let first = tokio::spawn(async move { net.request(key, request("fast")).await });
+    let mut packet = [0; 2048];
+    tokio::time::timeout(Duration::from_secs(2), blackhole.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut queued = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let net = client.clone();
+        queued.spawn(async move { net.request(key, request("fast")).await });
+    }
+    tokio::time::timeout(Duration::from_secs(13), async {
+        // Release the lock halfway through the queued attempts' budgets. Their
+        // handshakes must get only the remaining time, not a fresh ten seconds.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        first.abort();
+        assert!(
+            first
+                .await
+                .err()
+                .expect("attempt must be cancelled")
+                .is_cancelled()
+        );
+        while let Some(result) = queued.join_next().await {
+            let error = result.unwrap().err().expect("blackhole must not respond");
+            assert!(error.contains("timed out"), "unexpected error: {error}");
+        }
     })
     .await
-    .expect("TCP round-trip timed out");
-    a_net.shutdown();
-    b_net.shutdown();
-    a.shutdown().unwrap();
-    b.shutdown().unwrap();
+    .expect("queued connection attempts exceeded their shared ten-second budgets");
+    client.shutdown();
 }
+
 #[tokio::test]
-#[ignore = "requires local UDP sockets; no root or TUN"]
-async fn wireguard_userspace_tcp_ipv4() {
-    round_trip(false).await;
-}
-#[tokio::test]
-#[ignore = "requires local UDP sockets; no root or TUN"]
-async fn wireguard_userspace_tcp_ipv6() {
-    round_trip(true).await;
+#[ignore = "requires local UDP sockets"]
+async fn service_timeout_returns_504_and_keeps_the_connection_usable() {
+    let a = Net::new(&[33; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let b = Net::new(&[34; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
+        .unwrap();
+    b.upsert_peer(a.public_key(), None).unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Service::new("test", |_, req| async move {
+            if req.operation == "stall" {
+                std::future::pending::<()>().await;
+            }
+            Response::json(&true).unwrap()
+        }))
+        .unwrap();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let net = b.clone();
+    let server = tokio::spawn(async move {
+        net.serve_with_ready(
+            registry,
+            async {
+                let _ = stopped.await;
+            },
+            move || {
+                let _ = ready.send(());
+            },
+        )
+        .await
+    });
+    started.await.unwrap();
+
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(40),
+        a.request(b.public_key(), request("stall")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.header.status, 504);
+    let mut body = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut response.body, &mut body),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error": "service timed out"})
+    );
+    assert!(
+        a.request(b.public_key(), request("fast"))
+            .await
+            .unwrap()
+            .json::<bool>()
+            .await
+            .unwrap()
+    );
+    assert_eq!(a.stats(Some(&b.public_key())).unwrap().0, 1);
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    a.shutdown();
+    b.shutdown();
 }

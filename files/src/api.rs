@@ -1,90 +1,63 @@
-use crate::models::*;
-use crate::service::{DownloadTicket, SharedState};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use rand::RngCore;
-use std::net::SocketAddr;
-use std::path::{Component, Path};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-const TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+use crate::{models::*, service::SharedState};
+use portal_net::{PeerKey, Request, Response};
+use std::{
+    path::{Component, Path},
+    time::UNIX_EPOCH,
+};
 
-#[derive(Clone)]
-pub(crate) struct ApiState {
-    pub files: SharedState,
-}
-
-pub(crate) fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/v1/resources", get(list_resources))
-        .route("/v1/files/list", post(list_directory))
-        .route("/v1/files/metadata", post(file_metadata))
-        .route("/v1/downloads", post(prepare_download))
-        .route("/v1/download/:ticket", get(crate::service::http_download))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .layer(axum::middleware::map_response(
-            |mut response: Response| async move {
-                response.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    axum::http::HeaderValue::from_static("no-store"),
-                );
-                response
-            },
-        ))
-        .with_state(state)
-}
-
-#[derive(Debug)]
-pub(crate) struct ApiError(StatusCode, &'static str);
+struct ApiError(u16, &'static str);
 impl ApiError {
     fn forbidden(message: &'static str) -> Self {
-        Self(StatusCode::FORBIDDEN, message)
+        Self(403, message)
     }
     fn bad_request(message: &'static str) -> Self {
-        Self(StatusCode::BAD_REQUEST, message)
+        Self(400, message)
     }
     fn not_found(message: &'static str) -> Self {
-        Self(StatusCode::NOT_FOUND, message)
+        Self(404, message)
     }
     fn busy(message: &'static str) -> Self {
-        Self(StatusCode::TOO_MANY_REQUESTS, message)
+        Self(429, message)
     }
     fn internal(message: &'static str) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, message)
+        Self(500, message)
     }
 }
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
-    }
+fn parse<T: serde::de::DeserializeOwned>(payload: serde_json::Value) -> Result<T, ApiError> {
+    serde_json::from_value(payload)
+        .map_err(|_| ApiError::bad_request("invalid operation parameters"))
 }
-
-async fn list_resources(
-    State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Json<ListResourcesResponse> {
-    let resources = if api.files.allowed_downloaders.contains(&peer.ip()) {
-        vec![FileResource {
-            id: "files".into(),
-            name: "Files".into(),
-            read_only: true,
-        }]
-    } else {
-        Vec::new()
-    };
-    Json(ListResourcesResponse { resources })
-}
-
-fn authorize(state: &SharedState, peer: SocketAddr) -> Result<(), ApiError> {
-    if state.allowed_downloaders.contains(&peer.ip()) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "this peer does not have file access permission",
-        ))
+pub(crate) async fn handle(state: SharedState, peer: PeerKey, request: Request) -> Response {
+    let allowed = state.allowed_downloaders.contains(&peer);
+    if request.operation == "resources" {
+        return Response::json(&ListResourcesResponse {
+            resources: if allowed {
+                vec![FileResource {
+                    id: "files".into(),
+                    name: "Files".into(),
+                    read_only: true,
+                }]
+            } else {
+                Vec::new()
+            },
+        })
+        .unwrap_or_else(|e| Response::error(500, &e));
     }
+    if !allowed {
+        return Response::error(403, "this peer does not have file access permission");
+    }
+    let result: Result<Response, ApiError> = async {
+        match request.operation.as_str() {
+            "list" => Response::json(&list_directory(&state, parse(request.payload)?).await?)
+                .map_err(|_| ApiError::internal("could not encode directory")),
+            "metadata" => Response::json(&file_metadata(&state, parse(request.payload)?).await?)
+                .map_err(|_| ApiError::internal("could not encode metadata")),
+            "download" => download(&state, parse(request.payload)?).await,
+            _ => Err(ApiError(404, "unknown file operation")),
+        }
+    }
+    .await;
+    result.unwrap_or_else(|e| Response::error(e.0, e.1))
 }
 
 async fn resolve(state: &SharedState, path: &str) -> Result<std::path::PathBuf, ApiError> {
@@ -128,15 +101,13 @@ fn entry(path: String, name: String, metadata: std::fs::Metadata) -> FileEntry {
 }
 
 async fn list_directory(
-    State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<ListDirectoryRequest>,
-) -> Result<Json<ListDirectoryResponse>, ApiError> {
-    authorize(&api.files, peer)?;
+    state: &SharedState,
+    request: ListDirectoryRequest,
+) -> Result<ListDirectoryResponse, ApiError> {
     if request.limit == 0 || request.limit > 1000 {
         return Err(ApiError::bad_request("limit must be between 1 and 1000"));
     }
-    let path = resolve(&api.files, &request.path).await?;
+    let path = resolve(state, &request.path).await?;
     let mut directory = tokio::fs::read_dir(path)
         .await
         .map_err(|_| ApiError::bad_request("path is not an accessible directory"))?;
@@ -173,20 +144,18 @@ async fn list_directory(
         .skip(request.offset)
         .take(request.limit)
         .collect();
-    Ok(Json(ListDirectoryResponse {
+    Ok(ListDirectoryResponse {
         path: request.path,
         entries,
         next_offset,
-    }))
+    })
 }
 
 async fn file_metadata(
-    State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<FilePathRequest>,
-) -> Result<Json<FileEntry>, ApiError> {
-    authorize(&api.files, peer)?;
-    let path = resolve(&api.files, &request.path).await?;
+    state: &SharedState,
+    request: FilePathRequest,
+) -> Result<FileEntry, ApiError> {
+    let path = resolve(state, &request.path).await?;
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|_| ApiError::not_found("path cannot be accessed"))?;
@@ -195,105 +164,52 @@ async fn file_metadata(
         .and_then(|name| name.to_str())
         .unwrap_or("Files")
         .to_owned();
-    Ok(Json(entry(request.path, name, metadata)))
+    Ok(entry(request.path, name, metadata))
 }
 
-async fn prepare_download(
-    State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(request): Json<PrepareDownloadRequest>,
-) -> Result<Json<PrepareDownloadResponse>, ApiError> {
-    let requester = peer.ip();
-    let state = &api.files;
-    authorize(state, peer)?;
-    let relative_path = Path::new(&request.path);
-    if !is_safe_relative_path(relative_path) {
+async fn download(state: &SharedState, request: FilePathRequest) -> Result<Response, ApiError> {
+    if !is_safe_relative_path(Path::new(&request.path)) {
         return Err(ApiError::bad_request(
-            "path must be relative and may not contain dot or parent components",
+            "path must contain ordinary relative components",
         ));
     }
-    state.prune_expired().await;
     let permit = state
         .download_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::busy("file service has too many downloads"))?;
-    let requested_path = state.root.join(relative_path);
-    let canonical_path = tokio::fs::canonicalize(&requested_path)
+    let path = resolve(state, &request.path).await?;
+    // TODO: Use a cross-platform, race-safe relative open. Canonicalize and open
+    // can race with replacement of a file or parent directory by a symlink.
+    let file = tokio::fs::File::open(&path)
         .await
-        .map_err(|_| ApiError::not_found("file does not exist or cannot be accessed"))?;
-    if !canonical_path.starts_with(state.root.as_path()) {
-        return Err(ApiError::forbidden(
-            "file path resolves outside the shared root",
-        ));
-    }
-
-    // TODO: Use a cross-platform, race-safe directory-relative open (e.g. cap-std).
-    // A file or parent directory can be replaced with a symlink between canonicalize
-    // and open, allowing access outside the shared root. Path checks alone do not fix this.
-    let file = tokio::fs::File::open(&canonical_path)
-        .await
-        .map_err(|_| ApiError::not_found("file does not exist or cannot be accessed"))?;
+        .map_err(|_| ApiError::not_found("file cannot be opened"))?;
     let metadata = file
         .metadata()
         .await
-        .map_err(|_| ApiError::internal("could not inspect requested file"))?;
+        .map_err(|_| ApiError::internal("could not inspect file"))?;
     if !metadata.is_file() {
         return Err(ApiError::bad_request(
             "requested path is not a regular file",
         ));
     }
-    let file_name = canonical_path
+    let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .ok_or_else(|| ApiError::bad_request("requested path has no file name"))?;
-    let size_bytes = metadata.len();
-    let expires = Instant::now() + TICKET_TTL;
-    let expires_at_unix_seconds = SystemTime::now()
-        .checked_add(TICKET_TTL)
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    let ticket_id = create_ticket_id();
-    let download_url = format!("{}/v1/download/{ticket_id}", state.http_advertise);
-    {
-        let mut tickets = state.tickets.lock().await;
-        tickets.insert(
-            ticket_id,
-            DownloadTicket {
-                file,
-                size_bytes,
-                requester,
-                expires,
-                permit,
-            },
-        );
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| ApiError::bad_request("filename must be UTF-8"))?
+        .to_owned();
+    if name.len() > 1024 {
+        return Err(ApiError::bad_request("filename is too long"));
     }
-
-    Ok(Json(PrepareDownloadResponse {
-        download_url,
-        file_name,
-        size_bytes,
-        expires_at_unix_seconds,
-    }))
+    Ok(Response::stream(
+        crate::service::DownloadReader {
+            file,
+            _permit: permit,
+        },
+        metadata.len(),
+        name,
+    ))
 }
-
-/// Accept only ordinary path components so callers cannot request parent or absolute paths.
 fn is_safe_relative_path(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-/// Create an unguessable bearer ticket identifier for the one-use HTTP request.
-fn create_ticket_id() -> String {
-    let mut random = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
-    let mut encoded = String::with_capacity(random.len() * 2);
-    for byte in random {
-        use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    encoded
+    !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
 }

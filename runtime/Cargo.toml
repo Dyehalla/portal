@@ -2,7 +2,7 @@
 name = "portal-runtime"
 version = "0.1.0"
 edition = "2024"
-description = "Linux WireGuard runtime with a local HTTP management API"
+description = "QUIC service runtime with a local HTTP management API"
 
 [[bin]]
 name = "portal-runtime"
@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 portal-net = { path = "../net" }
-portal = { path = "../wireguard" }
 portal-files = { path = "../files" }
 axum = "0.7"
 libc = "0.2"

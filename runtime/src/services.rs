@@ -1,25 +1,24 @@
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{future::Future, pin::Pin};
 
 /// Context shared with each service during startup.
 #[derive(Clone)]
 pub struct ServiceContext {
     pub network: portal_net::Net,
-    pub http_address: SocketAddr,
 }
 
 pub(crate) type ServiceTask = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
-type ServiceStartup = Pin<Box<dyn Future<Output = Result<ServiceRoutes, String>> + Send>>;
+type ServiceStartup = Pin<Box<dyn Future<Output = Result<ServiceImplementation, String>> + Send>>;
 type ServiceFactory = Box<dyn FnOnce(ServiceContext) -> ServiceStartup + Send>;
 
-/// A service supplies routes; the runtime owns its listener and tasks.
-pub struct ServiceRoutes {
-    pub(crate) router: axum::Router,
+/// A service supplies a native QUIC operation handler; the runtime owns the endpoint and tasks.
+pub struct ServiceImplementation {
+    pub(crate) service: portal_net::Service,
     pub(crate) background: Option<ServiceTask>,
 }
-impl ServiceRoutes {
-    pub fn new(router: axum::Router) -> Self {
+impl ServiceImplementation {
+    pub fn new(service: portal_net::Service) -> Self {
         Self {
-            router,
+            service,
             background: None,
         }
     }
@@ -42,7 +41,7 @@ impl ServiceRegistration {
     pub fn new<F, Fut>(name: impl Into<String>, factory: F) -> Self
     where
         F: FnOnce(ServiceContext) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<ServiceRoutes, String>> + Send + 'static,
+        Fut: Future<Output = Result<ServiceImplementation, String>> + Send + 'static,
     {
         Self {
             name: name.into(),
@@ -52,8 +51,9 @@ impl ServiceRegistration {
 
     pub fn files(config: portal_files::FileServiceConfig) -> Self {
         Self::new("files", move |context| async move {
-            let files = portal_files::FileRoutes::new(context.http_address, config).await?;
-            Ok(ServiceRoutes::new(files.router()).with_background(files.maintain()))
+            let _ = context;
+            let files = portal_files::FileService::new(config).await?;
+            Ok(ServiceImplementation::new(files.service()))
         })
     }
 }

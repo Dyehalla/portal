@@ -2,17 +2,17 @@
 name = "portal-net"
 version = "0.1.0"
 edition = "2024"
-description = "Userspace TCP/IP networking for Portal services"
+description = "Authenticated QUIC transport for Portal services"
 
 [dependencies]
-portal = { path = "../wireguard" }
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "async"] }
-tokio = { version = "1", features = ["io-util", "net", "sync", "rt", "time"] }
-rand = "0.8"
-axum = "0.7"
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
-tower = { version = "0.5", features = ["util"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+x509-parser = "0.16"
+tokio = { version = "1", features = ["macros", "io-util", "net", "sync", "rt", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

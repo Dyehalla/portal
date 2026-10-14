@@ -2,43 +2,18 @@
 name = "portal-files"
 version = "0.1.0"
 edition = "2024"
-description = "Peer-to-peer file transfers over HTTP"
-
-[features]
-default = ["client"]
-client = [
-    "dep:futures-util",
-    "dep:http",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-util",
-]
-
-[[bin]]
-name = "portal-files"
-path = "src/main.rs"
-required-features = ["client"]
+description = "Peer-to-peer file transfers over authenticated QUIC"
 
 [dependencies]
 portal-net = { path = "../net" }
-axum = "0.7"
 bytes = "1"
 futures-core = "0.3"
-futures-util = { version = "0.3", optional = true }
-http = { version = "1", optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
-rand = "0.8"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-zeroize = "1.8"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
-portal = { path = "../wireguard" }
-tokio = { version = "1", features = ["test-util"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+rand = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

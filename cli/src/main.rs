@@ -4,9 +4,8 @@ mod keys;
 mod cli {
     use std::collections::HashMap;
     use std::env;
-    use std::fs;
     use std::net::SocketAddr;
-    use zeroize::{Zeroize, Zeroizing};
+    use zeroize::Zeroize;
 
     pub(super) fn entry() -> Result<(), String> {
         let args = env::args().skip(1).collect::<Vec<_>>();
@@ -23,9 +22,8 @@ mod cli {
             "keygen" => keygen_command(&args[1..]),
             "peer" => peer_command(&args[1..]),
             "endpoint" => endpoint_command(&args[1..]),
-            "stats" | "status" | "health" | "list" | "peer-stats" | "shutdown" => {
-                control_command(command, &args[1..])
-            }
+            "status" | "health" | "list" | "shutdown" | "services-reload" | "stats"
+            | "peer-stats" => control_command(command, &args[1..]),
             other => Err(format!("unknown command `{other}`; use `portal help`")),
         }
     }
@@ -37,12 +35,11 @@ portal — control CLI for a running portal runtime
 
 Commands:
   portal keygen --private-key-file PATH
-  portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--preshared-key-file PATH]
-      [--endpoint ADDR] [--keepalive SECONDS] [--allowed-ip PREFIX ...]
+  portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
   portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
   portal endpoint set|clear [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
-  portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
+  portal status|health|stats|list|shutdown|services-reload [--api IP:PORT] [--token-file PATH]
 
 Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
 The default API is 127.0.0.1:51821; its token file is per-user in the temporary directory."
@@ -71,23 +68,10 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
             "upsert" => {
                 validate_options(
                     &options,
-                    &[
-                        "api",
-                        "token-file",
-                        "public-key",
-                        "preshared-key-file",
-                        "endpoint",
-                        "keepalive",
-                        "allowed-ip",
-                    ],
-                    &["allowed-ip"],
+                    &["api", "token-file", "public-key", "endpoint"],
+                    &[],
                 )?;
-                let public_key = parse_key_hex(required(&options, "public-key")?)?;
-                let psk = options
-                    .get("preshared-key-file")
-                    .and_then(first)
-                    .map(|path| read_key_file(path).map(Zeroizing::new))
-                    .transpose()?;
+                let public_key = encode_hex(&parse_key_hex(required(&options, "public-key")?)?);
                 let endpoint = options
                     .get("endpoint")
                     .and_then(first)
@@ -97,31 +81,9 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
                             .map_err(|error| format!("invalid --endpoint: {error}"))
                     })
                     .transpose()?;
-                let keepalive = options
-                    .get("keepalive")
-                    .and_then(first)
-                    .map(|value| parse_number(Some(value), 1_u64, "--keepalive"))
-                    .transpose()?;
-                if keepalive.is_some_and(|seconds| seconds == 0 || seconds > u16::MAX as u64) {
-                    return Err("--keepalive must be between 1 and 65535 seconds".into());
-                }
-                let psk = Zeroizing::new(
-                    psk.as_ref()
-                        .map(|key| encode_hex(key.as_ref()))
-                        .unwrap_or_else(|| "-".into()),
-                );
-                let allowed_ips = options
-                    .get("allowed-ip")
-                    .filter(|ips| !ips.is_empty())
-                    .map(|ips| ips.iter().map(String::as_str).collect())
-                    .unwrap_or_default();
-                let public_key = encode_hex(&public_key);
                 let command = crate::http_api::ManagementRequest::PeerUpsert {
                     public_key: &public_key,
-                    preshared_key: (psk.as_str() != "-").then_some(psk.as_str()),
                     endpoint,
-                    keepalive_seconds: keepalive,
-                    allowed_ips,
                 };
                 let result = send_command(&options, &command)?;
                 print_operation(result)
@@ -189,24 +151,25 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
         } else {
             validate_options(&options, &["api", "token-file"], &[])?;
         }
-        let response = if command == "peer-stats" {
-            let key = parse_key_hex(required(&options, "public-key")?)?;
-            let public_key = encode_hex(&key);
-            let request = crate::http_api::ManagementRequest::PeerStats {
-                public_key: &public_key,
-            };
-            send_command(&options, &request)?
-        } else {
-            let request = match command {
-                "status" => crate::http_api::ManagementRequest::Status,
-                "health" => crate::http_api::ManagementRequest::Health,
-                "stats" => crate::http_api::ManagementRequest::Stats,
-                "list" => crate::http_api::ManagementRequest::List,
-                "shutdown" => crate::http_api::ManagementRequest::Shutdown,
-                _ => unreachable!("control_command is only called for known operations"),
-            };
-            send_command(&options, &request)?
+        if command == "peer-stats" {
+            let public_key = encode_hex(&parse_key_hex(required(&options, "public-key")?)?);
+            return print_operation(send_command(
+                &options,
+                &crate::http_api::ManagementRequest::PeerStats {
+                    public_key: &public_key,
+                },
+            )?);
+        }
+        let request = match command {
+            "stats" => crate::http_api::ManagementRequest::Stats,
+            "status" => crate::http_api::ManagementRequest::Status,
+            "health" => crate::http_api::ManagementRequest::Health,
+            "list" => crate::http_api::ManagementRequest::List,
+            "services-reload" => crate::http_api::ManagementRequest::ServicesReload,
+            "shutdown" => crate::http_api::ManagementRequest::Shutdown,
+            _ => unreachable!("known command"),
         };
+        let response = send_command(&options, &request)?;
         print_operation(response)
     }
 
@@ -309,39 +272,6 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
 
     fn first(values: &Vec<String>) -> Option<&String> {
         values.first()
-    }
-
-    fn parse_number<T>(value: Option<&String>, default: T, option: &str) -> Result<T, String>
-    where
-        T: std::str::FromStr,
-        T::Err: std::fmt::Display,
-    {
-        value.map_or(Ok(default), |value| {
-            value
-                .parse::<T>()
-                .map_err(|error| format!("invalid {option} value `{value}`: {error}"))
-        })
-    }
-
-    fn read_key_file(path: &str) -> Result<[u8; 32], String> {
-        let mut bytes =
-            fs::read(path).map_err(|error| format!("could not read key file {path}: {error}"))?;
-        if bytes.len() == 32 {
-            let key = bytes.as_slice().try_into().expect("length checked");
-            bytes.zeroize();
-            return Ok(key);
-        }
-        let mut start = 0;
-        let mut end = bytes.len();
-        while start < end && bytes[start].is_ascii_whitespace() {
-            start += 1;
-        }
-        while end > start && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        let key = parse_key_hex_bytes(&bytes[start..end]);
-        bytes.zeroize();
-        key
     }
 
     pub(crate) fn parse_key_hex(value: &str) -> Result<[u8; 32], String> {

@@ -1,125 +1,107 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-
-use crate::api::LocalApi;
-use crate::api::ManagementRequest;
-use crate::peer_services::PeerServices;
-use crate::platform::{HostPlatform, Platform};
-use crate::{InterfaceAddress, RuntimeConfig, SecretKey};
-use portal::{AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
+use crate::{
+    RuntimeConfig,
+    api::{LocalApi, ManagementRequest},
+    peer_services::PeerServices,
+    platform::{HostPlatform, Platform},
+};
+use portal_net::{Net, PeerKey};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 use zeroize::Zeroize;
 
 const LOOP_INTERVAL: Duration = Duration::from_millis(100);
-
-#[derive(Clone)]
-struct PeerRecord {
-    endpoint: Option<SocketAddr>,
-    keepalive: Option<Duration>,
-    allowed_ips: Vec<AllowedIp>,
-}
-
 pub(crate) struct Runtime {
-    device: Option<Device>,
-    addresses: Vec<InterfaceAddress>,
-    peers: HashMap<PeerKey, PeerRecord>,
+    network: Option<Net>,
     shutdown_requested: bool,
-    network: Option<portal_net::Net>,
+    pub(crate) reload: Option<std::sync::mpsc::SyncSender<ReloadRequest>>,
+}
+pub(crate) struct ReloadRequest {
+    pub(crate) response: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
-/// Create the WireGuard device, start its userspace stack, serve the local API, and clean up.
-pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
-    if let Some(listener) = options.peer_http_listen {
-        if !options
-            .addresses
-            .iter()
-            .any(|address| address.address == listener.ip())
-        {
-            return Err("peer HTTP listener must use a configured virtual IP".into());
-        }
-    }
+fn start_services(
+    executor: &tokio::runtime::Handle,
+    network: Net,
+    services: Vec<crate::ServiceRegistration>,
+) -> Result<PeerServices, String> {
+    PeerServices::start(executor, network, services)
+}
+fn reload_services(
+    executor: &tokio::runtime::Handle,
+    network: &Net,
+    path: &std::path::Path,
+    current: &mut Option<PeerServices>,
+) -> Result<String, String> {
+    let services = crate::config::load_services(path)?;
+    let context = crate::ServiceContext {
+        network: network.clone(),
+    };
+    let (registry, background) = executor.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::peer_services::prepare_services(context, services),
+        )
+        .await
+        .map_err(|_| "service preparation timed out".to_owned())?
+    })?;
+    let stop_result = current.take().map(PeerServices::stop).unwrap_or(Ok(()));
+    *current = Some(PeerServices::from_prepared(
+        executor,
+        network.clone(),
+        registry,
+        background,
+    )?);
+    stop_result
+        .map_err(|e| format!("new services started, but stopping previous services failed: {e}"))?;
+    Ok("services reloaded".into())
+}
+pub(crate) fn run_device(options: RuntimeConfig) -> Result<(), String> {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("portal-async")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let result = run_with_executor(options, executor.handle());
+    executor.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+fn run_with_executor(
+    mut options: RuntimeConfig,
+    executor: &tokio::runtime::Handle,
+) -> Result<(), String> {
     let platform = Platform;
     platform.install_signal_handlers();
-
-    let mut device_config = DeviceConfig::new(options.private_key.0, options.listen);
-    device_config.dual_stack = options.dual_stack;
-    if let Some(workers) = options.workers {
-        device_config.workers = workers;
-    }
-    if let Some(rate_limit) = options.handshake_rate_limit {
-        device_config.handshake_rate_limit = rate_limit;
-    }
-    let device = match Device::new(device_config) {
-        Ok(device) => device,
-        Err(error) => return Err(error.to_string()),
+    let network = {
+        let _guard = executor.enter();
+        Net::new(&options.private_key.0, options.listen)?
     };
     options.private_key.0.zeroize();
-
-    let network = match portal_net::Net::new(
-        device.packet_port(),
-        options
-            .addresses
-            .iter()
-            .map(|address| (address.address, address.prefix_len))
-            .collect(),
-        options.mtu as usize,
-    ) {
-        Ok(network) => network,
-        Err(error) => {
-            let mut device = device;
-            let _ = device.shutdown();
-            return Err(error.to_string());
-        }
-    };
-    let services_result = match (
-        options.peer_http_listen,
+    let mut peer_services = match start_services(
+        executor,
+        network.clone(),
         std::mem::take(&mut options.services),
     ) {
-        (Some(address), services) => {
-            PeerServices::start(network.clone(), address, services).map(Some)
-        }
-        (None, services) if services.is_empty() => Ok(None),
-        _ => Err("configured services require peer_http_listen".into()),
-    };
-    let mut peer_services = match services_result {
-        Ok(services) => services,
+        Ok(services) => Some(services),
         Err(error) => {
             network.shutdown();
-            let mut device = device;
-            let _ = device.shutdown();
             return Err(error);
         }
     };
-    if let Some(services) = peer_services.as_ref() {
-        println!("peer HTTP listening on {}", services.address());
-    }
-
-    let runtime = Runtime {
-        device: Some(device),
-        addresses: options.addresses,
-        peers: HashMap::new(),
-        shutdown_requested: false,
+    let config_path = options.config_path.take();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let runtime = Arc::new(Mutex::new(Runtime {
         network: Some(network.clone()),
-    };
-    let listen_address = runtime
-        .device
-        .as_ref()
-        .expect("device was just created")
-        .listen_addr();
-    let public_key = encode_hex(
-        &runtime
-            .device
-            .as_ref()
-            .expect("device was just created")
-            .public_key(),
-    );
-    let runtime = Arc::new(Mutex::new(runtime));
+        shutdown_requested: false,
+        reload: config_path.as_ref().map(|_| sender),
+    }));
     let api = match LocalApi::start(
+        executor,
         options.api_listen,
         options.api_token_file.clone(),
-        Arc::clone(&runtime),
+        runtime.clone(),
         Some(network.clone()),
     ) {
         Ok(api) => api,
@@ -127,254 +109,154 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             if let Some(services) = peer_services.take() {
                 let _ = services.stop();
             }
-            let cleanup = runtime
-                .lock()
-                .map_err(|_| "runtime state is unavailable during cleanup".to_owned())
-                .and_then(|mut runtime| runtime.cleanup());
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(format!("{error}; cleanup failed: {cleanup_error}")),
-            };
+            network.shutdown();
+            return Err(error);
         }
     };
-
     println!(
-        "READY net=userspace listen={} public_key={} api={} token_file={}",
-        listen_address,
-        public_key,
+        "READY net=quic listen={} public_key={} api={} token_file={}",
+        network.listen_addr(),
+        portal_net::encode_key(&network.public_key()),
         api.local_addr(),
         options.api_token_file.display()
     );
-
-    let mut serve_result = Ok(());
+    let mut result = Ok(());
     loop {
         if platform.stop_requested() {
             break;
         }
-        {
-            let runtime = match runtime.lock() {
-                Ok(runtime) => runtime,
-                Err(_) => {
-                    serve_result = Err("runtime state became unavailable".into());
-                    break;
-                }
-            };
-            if let Some(device) = runtime.device.as_ref()
-                && let Err(error) = device.health()
-            {
-                serve_result = Err(format!("WireGuard device failed: {error}"));
-                break;
-            }
-            if let Some(network) = &runtime.network
-                && let Err(error) = network.health()
-            {
-                serve_result = Err(error.to_string());
-                break;
-            }
-            if runtime.shutdown_requested {
+        match runtime.lock() {
+            Ok(runtime) if runtime.shutdown_requested => break,
+            Ok(_) => {}
+            Err(_) => {
+                result = Err("runtime state is unavailable".into());
                 break;
             }
         }
+        if let Err(error) = network.health() {
+            result = Err(error);
+            break;
+        }
+        if let Ok(request) = receiver.try_recv() {
+            let reloaded = reload_services(
+                executor,
+                &network,
+                config_path.as_deref().expect("reload enabled"),
+                &mut peer_services,
+            );
+            let _ = request.response.send(reloaded);
+        }
         if api.has_exited() {
-            serve_result = Err("local HTTP API exited unexpectedly".into());
+            result = Err("local HTTP API exited unexpectedly".into());
             break;
         }
         if peer_services.as_ref().is_some_and(PeerServices::has_exited) {
-            serve_result = match peer_services
+            result = peer_services
                 .take()
-                .expect("peer server was present")
+                .expect("present services")
                 .stop()
-            {
-                Ok(()) => Err("peer HTTP server exited unexpectedly".into()),
-                Err(error) => Err(error),
-            };
+                .and_then(|_| Err("QUIC services exited unexpectedly".into()));
             break;
         }
         thread::sleep(LOOP_INTERVAL);
     }
-
     let api_result = api.stop();
-    if serve_result.is_ok() {
-        serve_result = api_result;
-    }
-    if let Some(services) = peer_services.take() {
-        let peer_service_result = services.stop();
-        if serve_result.is_ok() {
-            serve_result = peer_service_result;
-        }
-    }
-
-    let cleanup_result = runtime
-        .lock()
-        .map_err(|_| "runtime state became unavailable during cleanup".to_owned())
-        .and_then(|mut runtime| runtime.cleanup());
-    serve_result?;
-    cleanup_result
+    let services_result = peer_services
+        .take()
+        .map(PeerServices::stop)
+        .unwrap_or(Ok(()));
+    network.shutdown();
+    executor.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(1), network.wait_idle()).await;
+    });
+    result.and(api_result).and(services_result)
 }
-
 impl Runtime {
-    /// Resolve only a registered peer's exact tunnel host route, never a caller-supplied URL.
-    pub(crate) fn file_peer_address(
-        &self,
-        public_key: &str,
-        port: u16,
-        tunnel_ip: Option<std::net::IpAddr>,
-    ) -> Result<SocketAddr, String> {
-        if port == 0 {
-            return Err("peer HTTP port must be nonzero".into());
+    pub(crate) fn file_peer(&self, key: &str) -> Result<PeerKey, String> {
+        let key = portal_net::parse_key(key)?;
+        if !self.network.as_ref().is_some_and(|net| net.has_peer(&key)) {
+            return Err("unregistered peer".into());
         }
-        let key = parse_key_hex(public_key)?;
-        let peer = self.peers.get(&key).ok_or("peer is not registered")?;
-        let mut hosts: Vec<_> = peer
-            .allowed_ips
-            .iter()
-            .filter(|prefix| {
-                prefix.prefix_len() == if prefix.network().is_ipv4() { 32 } else { 128 }
-                    && !prefix.network().is_loopback()
-                    && !prefix.network().is_unspecified()
-                    && !prefix.network().is_multicast()
-                    && !self
-                        .addresses
-                        .iter()
-                        .any(|address| address.address == prefix.network())
-            })
-            .map(|prefix| prefix.network())
-            .collect();
-        hosts.sort();
-        hosts.dedup();
-        let host = match tunnel_ip {
-            Some(ip) if hosts.contains(&ip) => ip,
-            Some(_) => {
-                return Err(
-                    "tunnel_ip must be an exact host AllowedIP assigned to this peer".into(),
-                );
-            }
-            None if hosts.len() == 1 => hosts[0],
-            None if hosts.is_empty() => {
-                return Err("peer needs an exact tunnel host AllowedIP (/32 or /128)".into());
-            }
-            None => return Err("peer has multiple tunnel host addresses; specify tunnel_ip".into()),
-        };
-        Ok(SocketAddr::new(host, port))
+        Ok(key)
     }
-
-    /// Dispatch one authenticated JSON API operation to its Device or host-network operation.
     pub(crate) fn handle_api_request(
         &mut self,
         request: ManagementRequest,
     ) -> Result<String, String> {
+        if matches!(request, ManagementRequest::Shutdown) {
+            self.shutdown_requested = true;
+            return Ok("shutdown requested".into());
+        }
+        let network = self.network.as_ref().ok_or("network unavailable")?;
         match request {
             ManagementRequest::PeerUpsert {
                 public_key,
-                preshared_key,
                 endpoint,
-                keepalive_seconds,
-                allowed_ips,
             } => {
-                let preshared_key = preshared_key
-                    .map(|value| parse_key_hex(&value.0).map(SecretKey))
-                    .transpose()?;
-                let public_key = parse_key_hex(&public_key)?;
-                let keepalive = keepalive_seconds
-                    .map(|seconds| {
-                        if seconds == 0 || seconds > u16::MAX as u64 {
-                            return Err(String::from(
-                                "keepalive must be between 1 and 65535 seconds",
-                            ));
-                        }
-                        Ok(Duration::from_secs(seconds))
-                    })
-                    .transpose()?;
-                let allowed_ips = allowed_ips
-                    .into_iter()
-                    .map(|value| {
-                        value
-                            .parse::<AllowedIp>()
-                            .map_err(|error| format!("invalid allowed IP `{value}`: {error}"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.upsert_peer(public_key, preshared_key, endpoint, keepalive, allowed_ips)
+                network.upsert_peer(portal_net::parse_key(&public_key)?, endpoint)?;
+                Ok("peer configured".into())
             }
             ManagementRequest::PeerRemove { public_key } => {
-                self.remove_peer(parse_key_hex(&public_key)?)
+                network.remove_peer(&portal_net::parse_key(&public_key)?)?;
+                Ok("peer removed".into())
             }
             ManagementRequest::EndpointSet {
                 public_key,
                 endpoint,
-            } => self.set_endpoint(parse_key_hex(&public_key)?, endpoint),
+            } => {
+                let key = portal_net::parse_key(&public_key)?;
+                if !network.has_peer(&key) {
+                    return Err("peer not found".into());
+                }
+                network.upsert_peer(key, Some(endpoint))?;
+                Ok("endpoint updated".into())
+            }
             ManagementRequest::EndpointClear { public_key } => {
-                self.clear_endpoint(parse_key_hex(&public_key)?)
+                let key = portal_net::parse_key(&public_key)?;
+                if !network.has_peer(&key) {
+                    return Err("peer not found".into());
+                }
+                network.upsert_peer(key, None)?;
+                Ok("endpoint cleared".into())
             }
             ManagementRequest::Stats => {
-                let stats = self.device.as_ref().expect("running device").stats();
+                let (connections, tx, rx) = network.stats(None)?;
                 Ok(format!(
-                    "received_udp={} received_ip={} dropped={} timer_send_errors={} udp_send_errors={}",
-                    stats.received_udp_packets,
-                    stats.received_ip_packets,
-                    stats.dropped_packets,
-                    stats.timer_send_errors,
-                    stats.udp_send_errors
+                    "active_connections={connections} udp_tx_bytes={tx} udp_rx_bytes={rx}"
                 ))
             }
             ManagementRequest::PeerStats { public_key } => {
-                let key = parse_key_hex(&public_key)?;
-                let stats = self
-                    .device
-                    .as_ref()
-                    .expect("running device")
-                    .peer_stats(&key)
-                    .map_err(|error| error.to_string())?;
+                let key = portal_net::parse_key(&public_key)?;
+                let (connections, tx, rx) = network.stats(Some(&key))?;
                 Ok(format!(
-                    "peer={} tx_packets={} tx_bytes={} rx_packets={} rx_bytes={}",
-                    encode_hex(&key),
-                    stats.tx_packets,
-                    stats.tx_bytes,
-                    stats.rx_packets,
-                    stats.rx_bytes
+                    "peer={} active_connections={connections} udp_tx_bytes={tx} udp_rx_bytes={rx}",
+                    portal_net::encode_key(&key)
                 ))
             }
             ManagementRequest::Health => {
-                self.device
-                    .as_ref()
-                    .expect("running device")
-                    .health()
-                    .map_err(|error| error.to_string())?;
+                network.health()?;
                 Ok("healthy".into())
             }
             ManagementRequest::Status => {
-                let device = self.device.as_ref().expect("running device");
-                device.health().map_err(|error| error.to_string())?;
+                network.health()?;
                 Ok(format!(
-                    "net=userspace listen={} public_key={} peers={}",
-                    device.listen_addr(),
-                    encode_hex(&device.public_key()),
-                    self.peers.len()
+                    "net=quic listen={} public_key={} peers={}",
+                    network.listen_addr(),
+                    portal_net::encode_key(&network.public_key()),
+                    network.peers().len()
                 ))
             }
             ManagementRequest::List => {
-                let mut peers = self
-                    .peers
-                    .iter()
-                    .map(|(key, peer)| {
-                        let ips = if peer.allowed_ips.is_empty() {
-                            "-".to_owned()
-                        } else {
-                            peer.allowed_ips
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        };
+                let mut peers = network
+                    .peers()
+                    .into_iter()
+                    .map(|(key, endpoint)| {
                         format!(
-                            "{} endpoint={} keepalive={} allowed_ips={}",
-                            encode_hex(key),
-                            peer.endpoint
-                                .map(|endpoint| endpoint.to_string())
-                                .unwrap_or_else(|| "-".into()),
-                            peer.keepalive
-                                .map(|value| value.as_secs().to_string())
-                                .unwrap_or_else(|| "-".into()),
-                            ips
+                            "{} endpoint={}",
+                            portal_net::encode_key(&key),
+                            endpoint
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "-".into())
                         )
                     })
                     .collect::<Vec<_>>();
@@ -385,232 +267,18 @@ impl Runtime {
                     peers.join("; ")
                 })
             }
-            ManagementRequest::Shutdown => {
-                self.shutdown_requested = true;
-                Ok("shutdown requested".into())
+            ManagementRequest::ServicesReload => {
+                Err("reload must be dispatched through controller".into())
             }
-        }
-    }
-
-    // Stage route changes, update Device and roll back newly added routes if the peer update fails.
-    fn upsert_peer(
-        &mut self,
-        public_key: PeerKey,
-        preshared_key: Option<SecretKey>,
-        requested_endpoint: Option<SocketAddr>,
-        keepalive: Option<Duration>,
-        allowed_ips: Vec<AllowedIp>,
-    ) -> Result<String, String> {
-        let old_record = self.peers.get(&public_key).cloned();
-        let record = PeerRecord {
-            endpoint: requested_endpoint
-                .or_else(|| old_record.as_ref().and_then(|peer| peer.endpoint)),
-            keepalive,
-            allowed_ips,
-        };
-        let mut staged = self.peers.clone();
-        staged.insert(public_key, record.clone());
-        let peer_config = PeerConfig {
-            public_key,
-            preshared_key: preshared_key.as_ref().map(|key| key.0),
-            endpoint: requested_endpoint,
-            persistent_keepalive: keepalive,
-            allowed_ips: record.allowed_ips.clone(),
-        };
-        if let Err(error) = self
-            .device
-            .as_ref()
-            .expect("running device")
-            .upsert_peer(peer_config)
-        {
-            return Err(error.to_string());
-        }
-
-        self.peers = staged;
-        Ok(format!("peer {} upserted", encode_hex(&public_key)))
-    }
-
-    // Remove a peer from Device and then release host routes no longer used by any peer.
-    fn remove_peer(&mut self, public_key: PeerKey) -> Result<String, String> {
-        self.device
-            .as_ref()
-            .expect("running device")
-            .remove_peer(&public_key)
-            .map_err(|error| error.to_string())?;
-        self.peers.remove(&public_key);
-        Ok(format!("peer {} removed", encode_hex(&public_key)))
-    }
-
-    // Change the endpoint of a peer currently tracked by this runtime.
-    fn set_endpoint(
-        &mut self,
-        public_key: PeerKey,
-        endpoint: SocketAddr,
-    ) -> Result<String, String> {
-        if !self.peers.contains_key(&public_key) {
-            return Err("peer is not managed by this runtime".into());
-        }
-        self.device
-            .as_ref()
-            .expect("running device")
-            .set_peer_endpoint(&public_key, endpoint)
-            .map_err(|error| error.to_string())?;
-        self.peers
-            .get_mut(&public_key)
-            .expect("peer checked")
-            .endpoint = Some(endpoint);
-        Ok(format!(
-            "endpoint for {} set to {endpoint}",
-            encode_hex(&public_key)
-        ))
-    }
-
-    // Clear the configured endpoint for a tracked peer.
-    fn clear_endpoint(&mut self, public_key: PeerKey) -> Result<String, String> {
-        if !self.peers.contains_key(&public_key) {
-            return Err("peer is not managed by this runtime".into());
-        }
-        self.device
-            .as_ref()
-            .expect("running device")
-            .clear_peer_endpoint(&public_key)
-            .map_err(|error| error.to_string())?;
-        self.peers
-            .get_mut(&public_key)
-            .expect("peer checked")
-            .endpoint = None;
-        Ok(format!("endpoint for {} cleared", encode_hex(&public_key)))
-    }
-
-    // Stop the userspace stack and WireGuard workers.
-    fn cleanup(&mut self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        if let Some(network) = self.network.take() {
-            network.shutdown();
-        }
-        if let Some(mut device) = self.device.take() {
-            if let Err(error) = device.shutdown() {
-                errors.push(format!("device shutdown failed: {error}"));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
+            ManagementRequest::Shutdown => unreachable!(),
         }
     }
 }
-
-// Decode a 64-character WireGuard key and clear the partially decoded bytes on failure.
-fn parse_key_hex(value: &str) -> Result<PeerKey, String> {
-    if value.len() != 64 {
-        return Err("key must be exactly 64 hexadecimal characters".into());
-    }
-    let mut key = [0_u8; 32];
-    for index in 0..key.len() {
-        let offset = index * 2;
-        let high = match hex_nibble(value.as_bytes()[offset]) {
-            Ok(nibble) => nibble,
-            Err(error) => {
-                key.zeroize();
-                return Err(error);
-            }
-        };
-        let low = match hex_nibble(value.as_bytes()[offset + 1]) {
-            Ok(nibble) => nibble,
-            Err(error) => {
-                key.zeroize();
-                return Err(error);
-            }
-        };
-        key[index] = (high << 4) | low;
-    }
-    Ok(key)
-}
-
-// Convert one ASCII hexadecimal character to its four-bit value.
-fn hex_nibble(value: u8) -> Result<u8, String> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err("key contains a non-hexadecimal character".into()),
-    }
-}
-
-// Encode bytes as lowercase hexadecimal for local status and operation responses.
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 #[cfg(test)]
-pub(crate) fn file_api_test_runtime(allowed_ips: Vec<AllowedIp>) -> Runtime {
+pub(crate) fn test_runtime() -> Runtime {
     Runtime {
-        device: None,
-        addresses: Vec::new(),
-        peers: HashMap::from([(
-            [1; 32],
-            PeerRecord {
-                endpoint: None,
-                keepalive: None,
-                allowed_ips,
-            },
-        )]),
-        shutdown_requested: false,
         network: None,
-    }
-}
-
-#[cfg(test)]
-mod file_api_tests {
-    use super::*;
-    #[test]
-    fn file_targets_are_registered_exact_host_routes() {
-        let key = encode_hex(&[1; 32]);
-        let runtime = file_api_test_runtime(vec![
-            "10.20.0.2/32".parse().unwrap(),
-            "10.30.0.0/24".parse().unwrap(),
-        ]);
-        assert_eq!(
-            runtime
-                .file_peer_address(&key, 8080, None)
-                .unwrap()
-                .to_string(),
-            "10.20.0.2:8080"
-        );
-        assert!(
-            runtime
-                .file_peer_address(&encode_hex(&[2; 32]), 8080, None)
-                .is_err()
-        );
-        assert!(runtime.file_peer_address(&key, 0, None).is_err());
-        assert!(
-            runtime
-                .file_peer_address(&key, 8080, Some("10.30.0.3".parse().unwrap()))
-                .is_err()
-        );
-        let runtime = file_api_test_runtime(vec![
-            "127.0.0.1/32".parse().unwrap(),
-            "10.30.0.0/24".parse().unwrap(),
-        ]);
-        assert!(runtime.file_peer_address(&key, 8080, None).is_err());
-        let runtime = file_api_test_runtime(vec![
-            "10.20.0.2/32".parse().unwrap(),
-            "fd00::2/128".parse().unwrap(),
-        ]);
-        assert!(runtime.file_peer_address(&key, 8080, None).is_err());
-        assert_eq!(
-            runtime
-                .file_peer_address(&key, 8080, Some("fd00::2".parse().unwrap()))
-                .unwrap()
-                .to_string(),
-            "[fd00::2]:8080"
-        );
+        shutdown_requested: false,
+        reload: None,
     }
 }

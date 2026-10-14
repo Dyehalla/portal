@@ -1,343 +1,212 @@
-# portal
+# Portal
 
-`portal` — библиотека для встраивания WireGuard-сетей в приложение виртуальных сетей. Публичная единица управления — `Device`: он владеет каналом IP-пакетов, UDP-портом, списком пиров и worker-потоками.
+Portal соединяет сервисы приложения через аутентифицированный QUIC поверх UDP.
+Файлы, управление и будущие сервисы используют независимые надёжные потоки;
+виртуальные IP, TUN и пользовательский TCP/IP-стек для этого не нужны.
+`net` содержит транспорт Quinn и нативный протокол операций.
+`runtime` запускает сервисы и локальный HTTP API на одном Tokio runtime.
+`wireguard` сохранён как отдельная библиотека для будущего VPN; runtime сервисов
+не запускает WireGuard Device и не зависит от этой библиотеки.
 
-Протокол и криптография основаны на BoringTun 0.7.1. Небольшой локальный fork в `wireguard/vendor/boringtun` добавляет типизированную границу между разбором входящего пакета, проверкой MAC/cookie на уровне устройства и обработкой состояния туннеля.
+Подробная карта модулей, потоков данных и точек расширения: [docs/CODE_MAP.md](docs/CODE_MAP.md).
 
-## Публичный API
-
-Библиотека экспортирует `Device`, типы конфигурации и статистики, а также `PeerKey` и `AllowedIp`:
-
-```rust
-use portal::{AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
-use std::time::Duration;
-
-fn run(device_key: PeerKey, peer_key: PeerKey) -> Result<(), Box<dyn std::error::Error>> {
-    // Ключи — 32 байта в сыром формате WireGuard; приложение загружает их из своей конфигурации.
-    let mut config = DeviceConfig::new(
-        device_key,
-        "0.0.0.0:51820".parse()?,
-    );
-    config.workers = 4;
-    // По умолчанию также включены dual_stack и лимит рукопожатий 100 в секунду.
-
-    let mut device = Device::new(config)?;
-    let allowed_ip: AllowedIp = "10.20.0.0/24".parse()?;
-    device.upsert_peer(PeerConfig {
-        public_key: peer_key,
-        preshared_key: None,
-        endpoint: Some("198.51.100.10:51820".parse()?),
-        persistent_keepalive: Some(Duration::from_secs(25)),
-        allowed_ips: vec![allowed_ip],
-    })?;
-
-    // Здесь приложение использует устройство.
-    device.shutdown()?;
-    Ok(())
-}
-```
-
-### Устройство
-
-`DeviceConfig::new(private_key, listen)` задаёт приватный ключ и UDP-адрес прослушивания. Адрес с портом `0` просит ОС выбрать свободный порт; фактический адрес возвращает `Device::listen_addr()`. Конфигурацию можно настроить до вызова `Device::new()` через публичные поля:
-
-- `dual_stack` — привязать wildcard-сокет для второго семейства IP на том же порту; включено по умолчанию.
-- `workers` — число packet worker-потоков. По умолчанию используется число доступных CPU (не более 256); допустимо от 1 до 256.
-- `handshake_rate_limit` — порог рукопожатий в секунду до запроса cookie; по умолчанию 100.
-
-`Device::new(config)` открывает внутренний канал IP-пакетов и UDP-сокеты и запускает worker-потоки. `public_key()` возвращает открытый ключ устройства. `health()` сообщает об остановке устройства или ошибке worker-потока. `shutdown()` будит и дожидается завершения потоков; повторный вызов безопасен, а `Drop` также вызывает остановку.
-
-### Пиры и маршруты
-
-`PeerConfig` описывает `public_key`, необязательные `preshared_key`, `endpoint` и `persistent_keepalive`, а также список `allowed_ips`. Keepalive задаётся целым числом секунд от 1 до 65535. `upsert_peer()` добавляет пира или обновляет его конфигурацию и маршруты. При обновлении `endpoint: None` сохраняет уже установленный endpoint; чтобы удалить его, вызовите `clear_peer_endpoint()`. `set_peer_endpoint()` задаёт или меняет endpoint. `remove_peer()` удаляет пира вместе с его маршрутами.
-
-`AllowedIp` можно создать через `AllowedIp::new(ip, prefix_len)` или разобрать из строки, например `"10.20.0.0/24"`. Адрес сети нормализуется обнулением host-битов. Методы `network()`, `prefix_len()` и `contains(ip)` позволяют читать и проверять префикс. Эти маршруты используются библиотекой для выбора пира для исходящего IP-пакета и проверки адреса источника расшифрованного входящего пакета. Для совпадающих префиксов действует один владелец; для разных префиксов выбирается наиболее специфичный.
-
-Если для пира ожидает отправки рукопожатие, установка endpoint может инициировать его отправку. Такие отправки выполняются по возможности: ошибки учитываются в `DeviceStats::udp_send_errors`.
-
-### Статистика и ошибки
-
-`stats()` возвращает общие счётчики `DeviceStats`: принятые UDP- и внутренних IP-пакетов, отброшенные пакеты, ошибки отправки таймерных пакетов и прочих UDP-пакетов. `peer_stats(&key)` возвращает `PeerStats` конкретного пира. Счётчики `tx_packets`/`tx_bytes` отражают внутренние IP-пакеты, принятые BoringTun к отправке, а `rx_packets`/`rx_bytes` — аутентифицированные расшифрованные пакеты, успешно переданные пользовательскому стеку; `tx` не подтверждает доставку удалённой стороной.
-
-Методы управления возвращают `DeviceError`: среди вариантов — некорректные параметры, отсутствие пира, исчерпание индексов, остановка устройства, ошибка ввода-вывода или сбой worker-потока. Ошибку разбора префикса представляет `AllowedIpParseError`.
-
-## Пользовательская сеть
-
-Модуль `net` (`portal-net`) содержит пользовательский TCP/IP-стек на smoltcp,
-виртуальные TCP listener/stream и адаптеры HTTP для Axum и Hyper.
-`Device::packet_port()` соединяет стек с WireGuard: исходящие IP-пакеты
-шифруются для выбранного пира, входящие проходят проверку ключа и AllowedIPs.
-
-Runtime назначает виртуальные адреса только этому стеку. Системные интерфейсы,
-адреса и маршруты не создаются; root, TUN и iproute2 для запуска не нужны.
-Сервисы приложения используют `Net::listen` и `Net::connect`. Сейчас реализован
-TCP по IPv4 и IPv6; прикладные UDP-сокеты и VPN ещё не реализованы.
-Транспортный backend WireGuard пока поддерживает Linux.
-
-Стек ограничен 128 TCP-сокетами и буферами по 64 КиБ на направление.
-Внутренний канал пакетов ограничен буферами ОС; при перегрузке пакеты могут
-отбрасываться, TCP выполняет повторную передачу. Статистика доступна через
-`Net::dropped_packets()`. При остановке закрываются listener и соединения.
-
-```sh
-cargo test -p portal-net -- --include-ignored
-```
-
-Тесты связывают два WireGuard-устройства через локальный UDP и проверяют
-передачу 300 КБ по виртуальному TCP для IPv4 и IPv6 без TUN.
-
-## Runtime и CLI
-
-`portal-runtime` — отдельный foreground daemon: он владеет `Device` и
-пользовательским стеком `Net`. `portal-cli` — отдельный бинарник `portal`, который управляет
-локальным runtime через HTTP API на loopback-адресе. API предназначен для CLI и
-веб-клиента; прикладной HTTP API между пирами отдельно от управления
-локальным `Device`.
+## Запуск
 
 ```sh
 cargo build -p portal-runtime -p portal-cli --release
 install -d -m 700 ./portal-state
 target/release/portal keygen --private-key-file ./portal-state/device.key
-cat > ./portal-state/portal.json <<'EOF'
+```
+
+`keygen` сохраняет 32-байтный seed Ed25519 с правами 0600 без перезаписи
+существующего файла и печатает публичный ключ в hex. Runtime создаёт из него
+самоподписанный TLS-сертификат. Обе стороны проверяют зарегистрированные публичные
+ключи и TLS-подтверждение владения приватным ключом. Сертификат служит контейнером
+ключа: доверие задаётся ключом устройства, а не DNS-именем или публичным CA.
+0-RTT выключен. Один endpoint может принимать и инициировать соединения.
+
+Создайте `./portal-state/portal.json`:
+
+```json
 {
   "private_key_file": "device.key",
   "listen": "0.0.0.0:51820",
   "api_listen": "127.0.0.1:51821",
   "api_token_file": "api.token",
-  "addresses": ["10.20.0.1/32"],
-  "mtu": 1420
+  "services": [
+    {
+      "type": "files",
+      "root": "share",
+      "allowed_downloaders": ["PUBLIC_KEY_OF_READER_HEX"]
+    }
+  ]
 }
-EOF
+```
+
+Создайте общую папку `./portal-state/share`, замените ключ читателя настоящим.
+Для устройства без файлового сервиса используйте `services: []`.
+
+```sh
 PORTAL_CONFIG=./portal-state/portal.json target/release/portal-runtime
 ```
 
-Runtime не принимает CLI-команд и аргументов. Он читает JSON из `PORTAL_CONFIG`
-или `portal.json` в текущем каталоге. Относительные пути разрешаются относительно
-файла конфигурации. Обязательные поля: `private_key_file`, `listen`, `addresses`.
-Дополнительно: `mtu` (1420), `workers`, `handshake_rate_limit`, `dual_stack` (true),
-`api_listen` (127.0.0.1:51821), `api_token_file`, `peer_http_listen`, `services`.
-Неизвестные поля отклоняются. Генерация ключа находится в отдельном CLI.
+Runtime не принимает CLI-команд и аргументов. Без `PORTAL_CONFIG` он читает
+`portal.json` в текущем каталоге. Относительные пути разрешаются рядом с JSON-файлом.
+Обязательные поля: `private_key_file`, `listen`. Неизвестные поля отклоняются.
+UDP `listen` используется всеми QUIC-сервисами и исходящими соединениями.
+По умолчанию API слушает 127.0.0.1:51821, token-файл — `portal-UID.token` во
+временном каталоге. Для нескольких runtime задайте разные порты и token-файлы.
+Runtime-процесс пока поддерживает Linux; транспорт `net` использует переносимый Quinn.
 
-`keygen` создаёт raw-файл приватного ключа с режимом `0600` и печатает открытый
-ключ в hex. `portal-runtime` запускает WireGuard и пользовательский стек с указанными
-виртуальными адресами и MTU, затем слушает локальный HTTP API только на loopback. Случайный bearer-
-токен записывается в файл с режимом `0600` и удаляется при штатной остановке.
-Для веб-клиента токен можно прочитать с правами владельца runtime и передать в
-`Authorization: Bearer ...`; не встраивайте его в общедоступные frontend-файлы.
-Runtime остаётся отдельным процессом. CLI обращается к тому же API, что и веб-клиент:
+## Регистрация пиров
+
+На обоих устройствах зарегистрируйте публичный ключ другой стороны. Endpoint —
+настоящий доступный UDP-адрес, а не виртуальный IP. Для инициатора соединения он
+обязателен; принимающей стороне достаточно доверенного ключа.
 
 ```sh
 target/release/portal peer upsert \
-  --api 127.0.0.1:51821 \
   --token-file ./portal-state/api.token \
-  --public-key PUBLIC_KEY_HEX \
-  --endpoint 198.51.100.10:51820 \
-  --keepalive 25 \
-  --allowed-ip 10.20.0.2/32
-target/release/portal status --api 127.0.0.1:51821 --token-file ./portal-state/api.token
-target/release/portal peer-stats \
-  --api 127.0.0.1:51821 \
-  --token-file ./portal-state/api.token \
-  --public-key PUBLIC_KEY_HEX
-target/release/portal shutdown --api 127.0.0.1:51821 --token-file ./portal-state/api.token
+  --public-key PEER_PUBLIC_KEY_HEX \
+  --endpoint 192.168.1.20:51820
+target/release/portal status --token-file ./portal-state/api.token
+target/release/portal list --token-file ./portal-state/api.token
 ```
 
-API v1 принимает `POST /api/v1/command` с JSON-телом `{"operation":"status"}` и
-заголовком `Authorization: Bearer <token>`. Доступны операции `peer_upsert`,
-`peer_remove`, `endpoint_set`, `endpoint_clear`, `status`, `health`, `stats`,
-`peer_stats`, `list` и `shutdown`. Например, веб-клиент может отправить ту же
-команду через `fetch` с bearer-токеном:
+Доступны также `peer remove`, `endpoint set|clear`, `health`, `services-reload`,
+`shutdown`, `stats`, `peer-stats`. Счётчики относятся к активным QUIC-соединениям. Все управляющие команды используют локальный HTTP API, по умолчанию
+127.0.0.1:51821. Таблица доверенных пиров хранится в памяти. Изменение или удаление
+пира закрывает его текущие QUIC-соединения. Права сервиса задаются отдельно от
+доверия к ключу: регистрация пира сама по себе не разрешает чтение файлов.
+Обнаружение пиров, NAT traversal и relay пока не реализованы.
+
+## Файлы и веб-интерфейс
+
+Файловый сервис встроен в `portal-runtime` и включается записью `files` в
+`services`. Отдельного файлового бинарника нет. Веб-интерфейс обращается к
+локальному HTTP API, а runtime выполняет нативную QUIC-операцию на пире.
+Браузер не подключается к QUIC endpoint напрямую.
+
+| Локальный HTTP маршрут (POST) | JSON |
+|---|---|
+| `/api/v1/files/resources` | `{"peer":"PUBLIC_KEY_HEX"}` |
+| `/api/v1/files/list` | `{"peer":"PUBLIC_KEY_HEX","path":"","offset":0,"limit":100}` |
+| `/api/v1/files/metadata` | `{"peer":"PUBLIC_KEY_HEX","path":"report.pdf"}` |
+| `/api/v1/files/download` | `{"peer":"PUBLIC_KEY_HEX","path":"report.pdf"}` |
+
+Нужны `Authorization: Bearer TOKEN` и `Content-Type: application/json`.
+Сервер проверяет loopback-источник, Host, Origin и токен. Веб-клиент должен
+работать с того же origin. Скачивание возвращает поток с Content-Length и
+Content-Disposition; остальные операции — JSON. Ошибка QUIC-соединения даёт 502.
+Токен локального API никогда не пересылается пиру.
+
+Например, просмотр каталога из веб-интерфейса на том же origin:
 
 ```js
-const response = await fetch("http://127.0.0.1:51821/api/v1/command", {
+const response = await fetch("/api/v1/files/list", {
   method: "POST",
   headers: {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   },
-  body: JSON.stringify({ operation: "status" }),
+  body: JSON.stringify({ peer: peerPublicKey, path: "documents" }),
 });
-const result = await response.json();
+if (!response.ok) throw new Error(`File request failed: ${response.status}`);
+const { entries, next_offset } = await response.json();
 ```
 
-Для `peer_upsert` тело содержит `public_key`, необязательные `preshared_key`,
-`endpoint`, `keepalive_seconds` и массив строк `allowed_ips`. Другие операции:
-`peer_remove`, `endpoint_set`, `endpoint_clear`, `peer_stats`, `status`, `health`,
-`stats`, `list` и `shutdown`; ключи задаются 64 символами hex.
-Ошибки возвращают HTTP-статус и JSON `{"message":"..."}`. Браузерный клиент
-должен работать с того же origin; listener нельзя переносить на публичный или
-туннельный интерфейс.
+Управляющий API: `POST /api/v1/command`, например `{"operation":"status"}`.
+`peer_upsert` принимает `public_key` и необязательный `endpoint`.
+Другие операции: `peer_remove`, `endpoint_set`, `endpoint_clear`, `health`,
+`list`, `stats`, `peer_stats`, `services_reload`, `shutdown`. Ответ: `{"message":"..."}`.
 
-Также доступны `peer remove`, `endpoint set|clear`, `list`, `stats` и `health`.
-`AllowedIPs` задают выбор пира и проверку источника внутри WireGuard.
-Конфигурация пиров хранится в памяти; после перезапуска их нужно добавить снова.
-`upsert` заменяет `preshared_key` и `persistent_keepalive`; если PSK не передан,
-он сбрасывается. По умолчанию файл API-токена находится в системном временном
-каталоге под именем `portal-UID.token`; несколько runtime одного пользователя
-должны использовать разные `api_token_file` и `api_listen`.
+Файловый сервис публикует один ресурс `files` только для разрешённых ключей.
+Пустой путь означает корень. Список сортируется по имени, `limit` — 1–1000,
+каталоги более 10000 записей отклоняются с 429. Запись и загрузка не реализованы.
+Скачивание открывает файл и отправляет размер, имя и байты в одном QUIC-потоке:
+отдельные одноразовые HTTP-билеты больше не нужны. Одновременно допускается
+128 файловых скачиваний. Runtime проверяет размер и обрыв потока;
+сохранением скачивания на устройстве пользователя управляет веб-клиент.
 
-## Передача файлов между пирами
+Абсолютные пути, `..` и симлинки вне общей папки отклоняются.
+TODO: устранить кроссплатформенным способом гонку между canonicalize и открытием
+файла/каталога. Подмена пути симлинком между проверкой и доступом пока возможна.
 
-`portal-files` — прикладной сервис поверх настроенной WireGuard-сети.
-HTTP + JSON проверяет доступ пира, выдаёт одноразовые билеты на скачивание и
-метаданные файлов и папок. Этот же HTTP-listener передаёт байты файлов.
-Трафик защищает WireGuard; listener работает на виртуальном IP внутри `Net`.
-Контракт JSON описан типами в `files/src/models.rs`, маршруты — в `files/src/api.rs`.
-Для сборки достаточно Rust toolchain.
+## Протокол и сервисы
 
-```sh
-cargo build -p portal-runtime -p portal-files --release
-```
+ALPN: `portal-rpc/1`. Это собственный прикладной протокол поверх стандартного QUIC,
+не HTTP/3. Каждая операция использует новый двунаправленный поток одного
+переиспользуемого соединения с пиром. Запрос: 4-байтная длина big-endian и JSON
+`{"service":"files","operation":"list","payload":{"path":""}}`, затем FIN.
+Ответ: такая же рамка с `status`, `length`, `file_name`, затем ровно `length`
+байт и FIN. Статусы совпадают с HTTP-кодами для прозрачного локального API.
+Достоверная идентичность берётся из TLS; ключ в payload не заменяет её.
 
-Файловый сервис запускает `portal-runtime` вместе с Device. На пире `10.20.0.1` добавьте в JSON-конфигурацию runtime:
+Лимиты: запрос 16 КиБ, заголовок ответа 4 КиБ, JSON-ответ 1 МиБ; 32 входящих
+двунаправленных потока на соединение, 128 принимаемых соединений, 256 активных
+операций на endpoint. Буферы приёма — 1 МиБ на поток, 8 МиБ на соединение.
+Подключение, включая ожидание очереди, ограничено 10 секундами, обработка
+операции и прогресс передачи — 30 секундами. Клиент ждёт заголовок ответа
+до 60 секунд, чтобы получить серверный 504 при таймауте обработчика.
+Надёжность, flow control и congestion control обслуживает Quinn.
 
-```json
-{
-  "peer_http_listen": "10.20.0.1:8080",
-  "services": [
-    {"type": "files", "root": "share", "allowed_downloaders": ["10.20.0.2"]}
-  ]
-}
-```
-
-С другого разрешённого пира запросите файл по относительному пути внутри
-`./share` и укажите локальное имя для результата:
-
-```sh
-target/release/portal-files download \
-  --peer PUBLIC_KEY_HEX --api-token-file ./portal-state/api.token \
-  --path documents/report.pdf \
-  --output ./report.pdf
-```
-
-CLI и веб-интерфейс обращаются к локальному runtime, который отправляет HTTP
-запросы пиру через пользовательский стек. Обычный системный `curl` не имеет
-доступа к виртуальным адресам; используйте локальный API, описанный ниже.
-На обоих устройствах должны быть зарегистрированы ключи и точные AllowedIPs
-друг друга (`/32` для IPv4 или `/128` для IPv6).
-
-`POST /v1/downloads` возвращает `download_url`, `file_name`, `size_bytes` и
-`expires_at_unix_seconds`. `GET /v1/download/:ticket` отдаёт файл один раз тому же
-пиру. Ошибки авторизации — HTTP 403, неверный путь — 400, отсутствующий файл — 404,
-переполнение лимита — 429, недоступный путь — 404. Ошибки прикладных обработчиков
-имеют JSON `{"error":"..."}`; некорректный JSON/Content-Type отклоняет HTTP framework.
-
-Сервис отклоняет абсолютные пути и `..`, а также проверяет, что разрешённый
-симлинк остаётся внутри корневой папки.
-TODO: устранить гонку между проверкой пути и открытием файла кроссплатформенным
-способом: подмена файла или родительской директории симлинком в этот промежуток
-может привести к чтению вне общей папки.
-
-Билеты действуют пять минут и очищаются раз в секунду. Одновременно допускается
-128 билетов и активных скачиваний в сумме. Клиент ограничивает подключение десятью
-секундами, согласование и ожидание HTTP-ответа — тридцатью; скачивание прерывается после
-тридцати секунд без новых данных, а частичный файл удаляется. При остановке runtime
-даёт серверам пять секунд на завершение, затем отменяет оставшиеся соединения.
-
-Разрешение пока задаётся целиком на
-скачивание по туннельному IP; адрес пира должен быть закреплён за его WireGuard
-ключом через `AllowedIPs`. Peer HTTP-listener открывается только внутри пользовательского стека. В этой версии реализовано скачивание; загрузка и права
-на отдельные файлы пока не входят в контракт.
-
-
-## HTTP API файлового проводника
-
-Файловый сервис работает только через HTTP поверх WireGuard. Он публикует один
-ресурс `files`, соответствующий `root` сервиса `files`. Локальный путь сервера не раскрывается.
-Разрешение `allowed_downloaders` сервиса `files` теперь включает просмотр и чтение файлов.
-Запись, загрузка, переименование и удаление пока не реализованы.
-
-Peer API:
-
-| Метод и маршрут | Запрос | Результат |
-|---|---|---|
-| GET `/v1/resources` | — | Разрешённые ресурсы: `id`, `name`, `read_only` |
-| POST `/v1/files/list` | `{"path":"","offset":0,"limit":100}` | `path`, `entries`, `next_offset` |
-| POST `/v1/files/metadata` | `{"path":"report.pdf"}` | Имя, относительный путь, тип, размер, время изменения |
-| POST `/v1/downloads` | `{"path":"report.pdf"}` | Одноразовый URL и параметры скачивания |
-| GET `/v1/download/:ticket` | — | Поток байтов файла |
-
-Пустой путь означает корень общей папки. Пагинация сортирует записи по имени;
-`limit` — 1–1000, по умолчанию 100. Каталоги более 10000 записей отклоняются с 429.
-`next_offset` равен null на последней странице. Между запросами каталог может измениться.
-Типы записей: `file`, `directory`, `symlink`, `other`. Имена должны быть UTF-8.
-Симлинки в списке не раскрывают метаданные своей цели; переход и чтение проверяют
-принадлежность цели общей папке. Сохраняется описанный выше TODO о гонке файловых путей.
-
-CLI использует peer API через локальный runtime:
-
-```sh
-portal-files resources --peer PUBLIC_KEY_HEX --api-token-file ./portal-state/api.token
-portal-files ls --peer PUBLIC_KEY_HEX --api-token-file ./portal-state/api.token --path documents --limit 100
-portal-files stat --peer PUBLIC_KEY_HEX --api-token-file ./portal-state/api.token --path documents/report.pdf
-```
-
-Локальный API для веб-интерфейса принимает POST на:
-
-```text
-/api/v1/files/resources
-/api/v1/files/list
-/api/v1/files/metadata
-/api/v1/files/download
-```
-
-Нужны `Authorization: Bearer TOKEN` и `Content-Type: application/json`, как для
-`/api/v1/command`. Браузер должен использовать тот же origin, что локальный API.
-JSON содержит `peer` — публичный ключ зарегистрированного пира, `port` — порт его
-HTTP API (по умолчанию 8080), и поля выбранной операции. Например:
-
-```json
-{"peer":"PUBLIC_KEY_HEX","port":8080,"path":"documents","offset":0,"limit":100}
-```
-
-Адрес выбирается из точного host AllowedIP пира (`/32` или `/128`). Если таких
-адресов несколько, добавьте `tunnel_ip`, совпадающий с одним из них. Произвольные URL,
-незарегистрированные пиры и только сетевые префиксы не принимаются. Удалённый пир
-должен разрешить туннельный IP запрашивающего runtime. Локальный bearer token пиру
-не пересылается. Runtime освобождает блокировку своего состояния перед сетью.
-
-`/api/v1/files/download` сразу возвращает поток файла с `Content-Disposition`;
-браузер вызывает его через fetch с заголовком авторизации. Peer-билет получает и
-использует сам runtime. Удалённые ошибки сохраняют HTTP status, ошибки соединения
-дают 502. Скачивание ограничивает ожидание данных, проверяет объявленный размер и
-не загружает весь файл в память. Локальный сервер ограничивает завершение пятью секундами.
-
-Проверка HTTP API на loopback:
-
-```sh
-cargo test -p portal-files -- --include-ignored
-```
-
-Она проверяет чтение, browsing API, транспортные разрешения, запрет подмены IP,
-одноразовость билетов и потоковую пересылку для веб-интерфейса. Отдельный тест
-проверяет просмотр и скачивание 300 КБ через два WireGuard-устройства и `Net`.
-
-Проверка двух runtime и файлового CLI без root:
-
-```sh
-cargo build -p portal-runtime -p portal-cli -p portal-files
-python3 runtime/scripts/check-userspace.py
-```
-
-## Регистрация сервисов
-
-`RuntimeConfig.services` — список `ServiceRegistration`. Регистрация получает
-`ServiceContext` с пользовательской сетью и фактическим HTTP-адресом и возвращает
-`ServiceRoutes`: Axum router и необязательную фоновую задачу. Runtime объединяет
-маршруты на одном listener, проверяет уникальность имён и останавливает задачи
-вместе с сервером. Сервисы сами проверяют права пиров; сервер передаёт достоверный
-`ConnectInfo` из виртуального TCP. Ошибка фоновой задачи останавливает runtime.
-
-Для встраивания другого сервиса зарегистрируйте его фабрику:
+`RuntimeConfig.services` содержит `ServiceRegistration`. Фабрика получает
+`ServiceContext` с сетью и возвращает `ServiceImplementation`: обработчик
+`portal_net::Service` и необязательную фоновую задачу. Для добавления другого
+сервиса общий сервер менять не требуется. Сервисы сами проверяют свои права.
 
 ```rust
-config.services.push(portal_runtime::ServiceRegistration::new("terminal", |context| async move {
-    // Построить router с состоянием и авторизацией терминального сервиса.
-    let router = terminal_router(context.network);
-    Ok(portal_runtime::ServiceRoutes::new(router))
+config.services.push(portal_runtime::ServiceRegistration::new("example", |_| async {
+    let service = portal_net::Service::new("example", |peer, request| async move {
+        // Проверить разрешения peer (PeerKey) и параметры request.payload.
+        portal_net::Response::json(&serde_json::json!({"ok": true})).unwrap()
+    });
+    Ok(portal_runtime::ServiceImplementation::new(service))
 }));
 ```
 
-JSON-конфигурация сейчас знает встроенный тип `files`. Новый встроенный тип
-добавляется в декодер конфигурации; общий HTTP-сервер менять не требуется.
-Это точка подключения сервисов приложения, а не загрузчик динамических плагинов.
+JSON пока знает встроенный сервис `files`; другие типы добавляются в декодер.
+Регистрация не является загрузчиком динамических библиотек.
+
+## Перезагрузка
+
+Измените `services` в исходном JSON, затем выполните `portal services-reload`
+с обычными `--api` и `--token-file`. HTTP-операция: `services_reload`.
+Ответ приходит после переключения. Новые сервисы готовятся до остановки старых;
+неверный JSON или недоступная папка оставляют старые сервисы работать.
+Переключение закрывает входящие соединения сервисов; следующий запрос открывает
+новое QUIC-соединение. Ключ устройства, endpoint, доверенные пиры и локальный API
+сохраняются. Для отключения сервисов используйте `services: []`.
+Перезагрузка требует `RuntimeConfig.config_path` и восстанавливает список из JSON.
+Регистрации, добавленные программно, из JSON не восстанавливаются.
+
+## Потоки и проверки
+
+Локальный API, Quinn, операции и фоновые задачи сервисов используют один Tokio
+runtime. Отдельного потока `portal-net` и WG workers в приложении больше нет.
+Главный поток управляет жизненным циклом; файлы могут задействовать blocking-пул Tokio.
+
+```sh
+cargo test --workspace
+cargo test -p portal-net -p portal-files -- --include-ignored
+cargo build -p portal-runtime -p portal-cli
+python3 runtime/scripts/check-quic.py
+```
+
+Сетевые тесты требуют локальных UDP-сокетов. Они проверяют IPv4/IPv6,
+независимость потоков, TLS-привязку ключей, отказ неизвестному пиру, отзыв
+подключённого пира, файловые права, пути и потоковую передачу 300 КБ.
+Проверка двух runtime покрывает файловый HTTP API для веб-клиента, перезагрузку и остановку.
+
+## Миграция с WireGuard + smoltcp
+
+Удалите из JSON `addresses`, `mtu`, `workers`, `handshake_rate_limit`, `dual_stack`
+и `peer_http_listen`. `listen` теперь обозначает QUIC UDP endpoint.
+В `allowed_downloaders` замените IP-адреса публичными Ed25519-ключами.
+Файловые операции доступны через локальный HTTP API; endpoint задаётся в таблице пиров.
+WireGuard PSK, keepalive и AllowedIPs больше не относятся к сервисным соединениям.
+
+Публичные ключи теперь Ed25519, а не X25519 WireGuard. Старые публичные ключи
+несовместимы: создайте новые ключи через `portal keygen` и зарегистрируйте их
+на обоих устройствах. Порты сервиса больше не отделены от порта транспорта.
+WireGuard-библиотека остаётся самостоятельной и использует собственные X25519-ключи.

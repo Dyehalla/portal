@@ -2,17 +2,17 @@
 mod api;
 mod config;
 mod services;
-pub use services::{ServiceContext, ServiceRegistration, ServiceRoutes};
+pub use services::{ServiceContext, ServiceImplementation, ServiceRegistration};
 #[cfg(target_os = "linux")]
 mod peer_services;
 mod platform;
 #[cfg(target_os = "linux")]
 mod service;
 
-pub use config::{InterfaceAddress, RuntimeConfig, SecretKey, load_config};
+pub use config::{RuntimeConfig, SecretKey, load_config};
 
 #[cfg(target_os = "linux")]
-/// Start the configured WireGuard device and local HTTP API until shutdown.
+/// Start the configured QUIC endpoint and local HTTP API until shutdown.
 pub fn run(config: RuntimeConfig) -> Result<(), String> {
     service::run_device(config)
 }

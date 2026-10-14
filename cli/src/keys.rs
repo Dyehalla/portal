@@ -12,8 +12,8 @@ pub fn create_key_file(path: &Path) -> Result<[u8; 32], String> {
     rand::rngs::OsRng
         .try_fill_bytes(&mut *bytes)
         .map_err(|error| format!("could not generate private key: {error}"))?;
-    let secret = x25519_dalek::StaticSecret::from(*bytes);
-    let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let secret = ed25519_dalek::SigningKey::from_bytes(&bytes);
+    let public = secret.verifying_key().to_bytes();
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -52,8 +52,8 @@ mod tests {
             0o600
         );
         let private =
-            x25519_dalek::StaticSecret::from(<[u8; 32]>::try_from(bytes.as_slice()).unwrap());
-        assert_eq!(public, x25519_dalek::PublicKey::from(&private).to_bytes());
+            ed25519_dalek::SigningKey::from_bytes(&<[u8; 32]>::try_from(bytes.as_slice()).unwrap());
+        assert_eq!(public, private.verifying_key().to_bytes());
         assert!(create_key_file(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_dir_all(directory).unwrap();
