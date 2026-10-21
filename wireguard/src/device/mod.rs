@@ -33,9 +33,10 @@ pub struct DeviceConfig {
     /// The device's WireGuard private key.
     pub private_key: PeerKey,
     /// Primary UDP address to bind. Port zero lets the OS select a port.
-    /// With `dual_stack`, the other family also gets a wildcard socket on this port.
+    /// With `dual_stack`, wildcard and loopback binds get a matching socket in the other family.
     pub listen: SocketAddr,
-    /// Bind a wildcard socket for the other IP family on the same port. Defaults to true.
+    /// Mirror wildcard or loopback scope in the other family; specific interface binds stay single-family.
+    /// Defaults to true.
     pub dual_stack: bool,
     /// Number of packet workers. Zero is invalid.
     pub workers: usize,

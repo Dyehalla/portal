@@ -8,8 +8,11 @@ mod peer_services;
 mod platform;
 #[cfg(target_os = "linux")]
 mod service;
+#[cfg(target_os = "linux")]
+mod web;
 
 pub use config::{RuntimeConfig, SecretKey, load_config};
+pub use portal_net::RelayServerConfig;
 
 #[cfg(target_os = "linux")]
 /// Start the configured QUIC endpoint and local HTTP API until shutdown.

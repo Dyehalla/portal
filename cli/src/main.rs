@@ -35,7 +35,7 @@ portal — control CLI for a running portal runtime
 
 Commands:
   portal keygen --private-key-file PATH
-  portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
+  portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR] [--relay-key HEX --relay-endpoint IP:PORT]
   portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
   portal endpoint set|clear [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
@@ -68,22 +68,54 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
             "upsert" => {
                 validate_options(
                     &options,
-                    &["api", "token-file", "public-key", "endpoint"],
+                    &[
+                        "api",
+                        "token-file",
+                        "public-key",
+                        "endpoint",
+                        "relay-key",
+                        "relay-endpoint",
+                    ],
                     &[],
                 )?;
                 let public_key = encode_hex(&parse_key_hex(required(&options, "public-key")?)?);
                 let endpoint = options
                     .get("endpoint")
-                    .and_then(first)
+                    .and_then(|values| values.first())
                     .map(|value| {
                         value
                             .parse::<SocketAddr>()
                             .map_err(|error| format!("invalid --endpoint: {error}"))
                     })
                     .transpose()?;
+                let relay_key = options
+                    .get("relay-key")
+                    .and_then(|values| values.first())
+                    .map(|key| parse_key_hex(key).map(|key| encode_hex(&key)))
+                    .transpose()?;
+                let relay = match (
+                    relay_key.as_deref(),
+                    options
+                        .get("relay-endpoint")
+                        .and_then(|values| values.first()),
+                ) {
+                    (Some(public_key), Some(endpoint)) => Some(crate::http_api::RelayPeer {
+                        public_key,
+                        endpoint: endpoint
+                            .parse()
+                            .map_err(|e| format!("invalid --relay-endpoint: {e}"))?,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(
+                            "--relay-key and --relay-endpoint must be provided together".into()
+                        );
+                    }
+                };
                 let command = crate::http_api::ManagementRequest::PeerUpsert {
                     public_key: &public_key,
                     endpoint,
+                    relay,
                 };
                 let result = send_command(&options, &command)?;
                 print_operation(result)
@@ -188,13 +220,13 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
     ) -> Result<String, String> {
         let address = options
             .get("api")
-            .and_then(first)
+            .and_then(|values| values.first())
             .map(String::as_str)
             .unwrap_or("127.0.0.1:51821");
         let default_token = default_token_file();
         let token_file = options
             .get("token-file")
-            .and_then(first)
+            .and_then(|values| values.first())
             .map(String::as_str)
             .unwrap_or(default_token.to_str().ok_or("token path is not UTF-8")?);
         let mut request = serde_json::to_string(command)
@@ -265,13 +297,9 @@ The default API is 127.0.0.1:51821; its token file is per-user in the temporary 
     ) -> Result<&'a str, String> {
         options
             .get(name)
-            .and_then(first)
+            .and_then(|values| values.first())
             .map(String::as_str)
             .ok_or_else(|| format!("missing required option --{name}"))
-    }
-
-    fn first(values: &Vec<String>) -> Option<&String> {
-        values.first()
     }
 
     pub(crate) fn parse_key_hex(value: &str) -> Result<[u8; 32], String> {

@@ -240,7 +240,7 @@ impl PacketIo {
     }
 }
 
-// Bind both address families to one port, or only the configured family.
+// Mirror loopback/wildcard scope; a specific interface address enables only its family.
 fn bind_udp_pair(
     listen: SocketAddr,
     dual_stack: bool,
@@ -250,32 +250,42 @@ fn bind_udp_pair(
             let udp_v4 = UdpSocket::bind(SocketAddr::V4(address))?;
             let port = udp_v4.local_addr()?.port();
             udp_v4.set_nonblocking(true)?;
-            let udp_v6 = if dual_stack {
-                Some(bind_v6(SocketAddrV6::new(
-                    Ipv6Addr::UNSPECIFIED,
-                    port,
-                    0,
-                    0,
-                ))?)
-            } else {
-                None
-            };
+            let udp_v6 =
+                if dual_stack && (address.ip().is_loopback() || address.ip().is_unspecified()) {
+                    Some(bind_v6(SocketAddrV6::new(
+                        if address.ip().is_loopback() {
+                            Ipv6Addr::LOCALHOST
+                        } else {
+                            Ipv6Addr::UNSPECIFIED
+                        },
+                        port,
+                        0,
+                        0,
+                    ))?)
+                } else {
+                    None
+                };
             let local_addr = udp_v4.local_addr()?;
             Ok((Some(udp_v4), udp_v6, local_addr))
         }
         SocketAddr::V6(address) => {
             let udp_v6 = bind_v6(address)?;
             let port = udp_v6.local_addr()?.port();
-            let udp_v4 = if dual_stack {
-                let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::UNSPECIFIED,
-                    port,
-                )))?;
-                socket.set_nonblocking(true)?;
-                Some(socket)
-            } else {
-                None
-            };
+            let udp_v4 =
+                if dual_stack && (address.ip().is_loopback() || address.ip().is_unspecified()) {
+                    let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
+                        if address.ip().is_loopback() {
+                            Ipv4Addr::LOCALHOST
+                        } else {
+                            Ipv4Addr::UNSPECIFIED
+                        },
+                        port,
+                    )))?;
+                    socket.set_nonblocking(true)?;
+                    Some(socket)
+                } else {
+                    None
+                };
             let local_addr = udp_v6.local_addr()?;
             Ok((udp_v4, Some(udp_v6), local_addr))
         }
@@ -330,6 +340,26 @@ fn bind_v6(address: SocketAddrV6) -> io::Result<UdpSocket> {
     }
     let raw_fd = owned.into_raw_fd();
     Ok(unsafe { UdpSocket::from_raw_fd(raw_fd) })
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires local UDP sockets"]
+    fn dual_stack_preserves_loopback_and_wildcard_scope() {
+        for listen in ["127.0.0.1:0", "[::1]:0", "0.0.0.0:0", "[::]:0"] {
+            let listen: SocketAddr = listen.parse().unwrap();
+            let (v4, v6, primary) = bind_udp_pair(listen, true).unwrap();
+            for socket in [v4, v6] {
+                let address = socket.unwrap().local_addr().unwrap();
+                assert_eq!(address.ip().is_loopback(), listen.ip().is_loopback());
+                assert_eq!(address.ip().is_unspecified(), listen.ip().is_unspecified());
+                assert_eq!(address.port(), primary.port());
+            }
+        }
+    }
 }
 
 // Read one packet from a ready descriptor; WouldBlock means another worker won the race.

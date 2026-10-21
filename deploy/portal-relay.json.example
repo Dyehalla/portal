@@ -1,0 +1,13 @@
+{
+  "private_key_file": "device.key",
+  "listen": "0.0.0.0:51820",
+  "relays": [],
+  "api_listen": "127.0.0.1:51821",
+  "api_token_file": "api.token",
+  "relay_server": {
+    "public_endpoint": "PUBLIC_IP:40000",
+    "listen": "0.0.0.0:40000",
+    "allowed_peers": ["PEER_PUBLIC_KEY_HEX"]
+  },
+  "services": []
+}

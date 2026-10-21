@@ -23,13 +23,19 @@ async fn native_quic_files_streaming_and_key_authorization() {
     std::fs::write(root.join("outside"), b"private").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("outside"), share.join("escape")).unwrap();
-    let a = Net::new(&[1; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    let b = Net::new(&[2; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    let c = Net::new(&[3; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let a = Net::new(&[1; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
+    let b = Net::new(&[2; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
+    let c = Net::new(&[3; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
     for net in [&a, &c] {
-        net.upsert_peer(b.public_key(), Some(b.listen_addr()))
+        net.upsert_peer(b.public_key(), Some(b.listen_addr().unwrap()), None)
             .unwrap();
-        b.upsert_peer(net.public_key(), None).unwrap();
+        b.upsert_peer(net.public_key(), None, None).unwrap();
     }
     let file_service = FileService::new(FileServiceConfig {
         root: share,
@@ -73,8 +79,8 @@ async fn native_quic_files_streaming_and_key_authorization() {
     }).await.unwrap();
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
-    a.shutdown();
-    b.shutdown();
-    c.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }

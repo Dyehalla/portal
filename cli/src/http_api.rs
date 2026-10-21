@@ -6,7 +6,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+// The API bounds command JSON at 256 KiB; reserve another 8 KiB for HTTP headers.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 + 8 * 1024;
 
 /// JSON operation shared by the CLI and local web client.
 #[derive(Serialize)]
@@ -15,6 +16,7 @@ pub(crate) enum ManagementRequest<'a> {
     PeerUpsert {
         public_key: &'a str,
         endpoint: Option<SocketAddr>,
+        relay: Option<RelayPeer<'a>>,
     },
     PeerRemove {
         public_key: &'a str,
@@ -35,6 +37,12 @@ pub(crate) enum ManagementRequest<'a> {
     List,
     ServicesReload,
     Shutdown,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RelayPeer<'a> {
+    pub public_key: &'a str,
+    pub endpoint: SocketAddr,
 }
 
 #[derive(Deserialize)]
@@ -131,5 +139,30 @@ fn decode_response(response: &[u8]) -> Result<String, String> {
             "local API returned HTTP {status}: {}",
             reply.message
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_of_1024_peers_fits_the_http_response_bound() {
+        let message = (0..1024)
+            .map(|i| {
+                format!(
+                    "{i:064x} endpoint=[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let body = serde_json::to_string(&serde_json::json!({"message": message})).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(response.len() > 64 * 1024);
+        assert!(response.len() <= MAX_RESPONSE_BYTES);
+        assert_eq!(decode_response(response.as_bytes()).unwrap(), message);
     }
 }

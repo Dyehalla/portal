@@ -1,10 +1,10 @@
+mod auth;
+mod peer_relay;
 mod rpc;
-#[cfg(test)]
-mod tests;
-mod tls;
-use quinn::{Connection, Endpoint, ServerConfig, Side, TransportConfig};
+use iroh::endpoint::{Builder, Connection, QuicTransportConfig, presets};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey, TransportAddr};
+pub use peer_relay::{RelayPeer, RelayServerConfig, RelaySnapshot};
 pub use rpc::{IncomingResponse, Registry, Request, Response, ResponseHeader, Service};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
     collections::HashMap,
     io,
@@ -18,12 +18,14 @@ use std::{
 
 pub type PeerKey = [u8; 32];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const ALPN: &[u8] = b"portal-rpc/1";
 pub(crate) type Peers = Arc<RwLock<HashMap<PeerKey, Arc<Peer>>>>;
 #[derive(Debug)]
 pub(crate) struct Peer {
     endpoint: Option<SocketAddr>,
+    relay: Option<RelayPeer>,
     connections: Mutex<Vec<Connection>>,
-    connect: tokio::sync::Mutex<()>,
+    outgoing: tokio::sync::Mutex<Option<Connection>>,
 }
 #[derive(Clone)]
 pub struct Net {
@@ -32,71 +34,102 @@ pub struct Net {
 struct Inner {
     endpoint: Endpoint,
     peers: Peers,
-    cert: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-    public_key: PeerKey,
-    server: ServerConfig,
+    relays: Vec<RelayPeer>,
+    peer_relay: peer_relay::PeerRelayTransport,
     serving: AtomicBool,
     stopped: AtomicBool,
 }
-impl Drop for Inner {
-    fn drop(&mut self) {
-        self.endpoint.close(0u32.into(), b"shutdown");
-    }
-}
-static TRANSPORT: LazyLock<Arc<TransportConfig>> = LazyLock::new(|| {
-    let mut config = TransportConfig::default();
-    config
+static TRANSPORT: LazyLock<QuicTransportConfig> = LazyLock::new(|| {
+    QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(32u32.into())
-        .max_concurrent_uni_streams(0u32.into());
-    config
+        .max_concurrent_uni_streams(0u32.into())
         .stream_receive_window((1024u32 * 1024).into())
-        .receive_window((8u32 * 1024 * 1024).into());
-    config.send_window(8 * 1024 * 1024);
-    config.max_idle_timeout(Some(
-        Duration::from_secs(60).try_into().expect("valid timeout"),
-    ));
-    config.keep_alive_interval(Some(Duration::from_secs(15)));
-    Arc::new(config)
+        .receive_window((8u32 * 1024 * 1024).into())
+        .send_window(8 * 1024 * 1024)
+        .max_idle_timeout(Some(
+            Duration::from_secs(60).try_into().expect("valid timeout"),
+        ))
+        .build()
 });
 impl Net {
-    /// Bind an ordinary OS UDP socket. Must be called inside a Tokio runtime.
-    pub fn new(seed: &[u8; 32], listen: SocketAddr) -> Result<Self, String> {
+    /// Bind iroh with explicit relay infrastructure and no public address lookup.
+    /// A missing listen address enables relay-only operation.
+    pub async fn new(
+        seed: &[u8; 32],
+        listen: Option<SocketAddr>,
+        relays: Vec<RelayPeer>,
+    ) -> Result<Self, String> {
+        Self::with_relay_server(seed, listen, relays, None).await
+    }
+    pub async fn with_relay_server(
+        seed: &[u8; 32],
+        listen: Option<SocketAddr>,
+        mut relays: Vec<RelayPeer>,
+        server: Option<RelayServerConfig>,
+    ) -> Result<Self, String> {
+        if listen.is_none() && relays.is_empty() && server.is_none() {
+            return Err("a UDP listen address or at least one relay is required".into());
+        }
+        for relay in &relays {
+            relay.validate()?;
+        }
+        let peer_relay = peer_relay::PeerRelayTransport::new(seed, server).await?;
+        for relay in &relays {
+            peer_relay.add_relay(relay)?;
+        }
+        if let Some(server) = peer_relay.server() {
+            relays.push(server);
+        }
         let peers: Peers = Arc::new(RwLock::new(HashMap::new()));
-        let (cert, key) = tls::identity(seed)?;
-        let mut server = tls::server(cert.clone(), key.clone_key(), peers.clone())?;
-        server.transport_config(Arc::clone(&TRANSPORT));
-        let endpoint = Endpoint::server(server.clone(), listen).map_err(|e| e.to_string())?;
-        endpoint.set_server_config(None);
+        let mut builder = Builder::new(presets::Minimal)
+            .clear_ip_transports()
+            .secret_key(SecretKey::from_bytes(seed))
+            .transport_config(TRANSPORT.clone())
+            .add_custom_transport(Arc::new(peer_relay.clone()))
+            .path_selector(Arc::new(peer_relay::PreferDirect))
+            .hooks(auth::TrustedPeers(Arc::downgrade(&peers)));
+        if let Some(listen) = listen {
+            builder = builder.bind_addr(listen).map_err(|e| e.to_string())?;
+        }
+        let endpoint = builder.bind().await.map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 endpoint,
                 peers,
-                cert,
-                key,
-                public_key: public_key(seed),
-                server,
+                relays,
+                peer_relay,
                 serving: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
             }),
         })
     }
     pub fn public_key(&self) -> PeerKey {
-        self.inner.public_key
+        *self.inner.endpoint.id().as_bytes()
     }
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.inner.endpoint.local_addr().expect("bound endpoint")
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        self.inner.endpoint.bound_sockets().into_iter().next()
     }
     pub fn health(&self) -> Result<(), String> {
-        if self.inner.stopped.load(Ordering::Acquire) {
+        if self.inner.stopped.load(Ordering::Acquire)
+            || self.inner.endpoint.is_closed()
+            || !self.inner.peer_relay.healthy()
+        {
             Err("QUIC endpoint stopped".into())
         } else {
             Ok(())
         }
     }
-    pub fn upsert_peer(&self, key: PeerKey, endpoint: Option<SocketAddr>) -> Result<(), String> {
+    pub fn upsert_peer(
+        &self,
+        key: PeerKey,
+        endpoint: Option<SocketAddr>,
+        relay: Option<RelayPeer>,
+    ) -> Result<(), String> {
         self.health()?;
-        ed25519_dalek::VerifyingKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key")?;
+        PublicKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key")?;
+        if let Some(relay) = &relay {
+            relay.validate()?;
+        }
         if key == self.public_key()
             || endpoint
                 .is_some_and(|e| e.port() == 0 || e.ip().is_unspecified() || e.ip().is_multicast())
@@ -104,6 +137,12 @@ impl Net {
             return Err("invalid peer key or endpoint".into());
         }
         let mut peers = self.inner.peers.write().unwrap_or_else(|e| e.into_inner());
+        if peers
+            .get(&key)
+            .is_some_and(|peer| peer.endpoint == endpoint && peer.relay == relay)
+        {
+            return Ok(());
+        }
         // TODO: change or remove the limit
         if peers.len() >= 1024 && !peers.contains_key(&key) {
             return Err("peer limit reached".into());
@@ -122,8 +161,9 @@ impl Net {
             key,
             Arc::new(Peer {
                 endpoint,
+                relay,
                 connections: Mutex::new(Vec::new()),
-                connect: tokio::sync::Mutex::new(()),
+                outgoing: tokio::sync::Mutex::new(None),
             }),
         );
         Ok(())
@@ -194,42 +234,43 @@ impl Net {
             .get(&key)
             .cloned()
             .ok_or("unregistered peer")?;
-        let _guard = tokio::time::timeout_at(deadline, peer.connect.lock())
+        let mut outgoing = tokio::time::timeout_at(deadline, peer.outgoing.lock())
             .await
             .map_err(|_| "QUIC connection timed out")?;
-        // Only reuse locally initiated connections. Incoming connections are served by the receiver.
-        if let Some(connection) = peer
-            .connections
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find(|c| c.side() == Side::Client && c.close_reason().is_none())
-            .cloned()
-        {
-            return Ok(connection);
+        // Keep the cache locked through the handshake so concurrent requests share one connection.
+        if let Some(connection) = outgoing.as_ref().filter(|c| c.close_reason().is_none()) {
+            return Ok(connection.clone());
         }
-        let endpoint = peer.endpoint.ok_or("peer has no endpoint")?;
-        let mut config = tls::client(
-            self.inner.cert.clone(),
-            self.inner.key.clone_key(),
-            key,
-            self.inner.peers.clone(),
-        )?;
-        config.transport_config(Arc::clone(&TRANSPORT));
-        let connecting = self
-            .inner
-            .endpoint
-            .connect_with(config, endpoint, "portal")
-            .map_err(|e| e.to_string())?;
+        let mut address =
+            EndpointAddr::new(PublicKey::from_bytes(&key).map_err(|e| e.to_string())?);
+        if let Some(endpoint) = peer.endpoint {
+            address = address.with_ip_addr(endpoint);
+        }
+        let relays = peer
+            .relay
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&self.inner.relays);
+        for relay in relays {
+            self.inner.peer_relay.add_relay(relay)?;
+            address = address.with_addrs([TransportAddr::Custom(
+                self.inner.peer_relay.peer_address(relay, key),
+            )]);
+        }
+        if address.addrs.is_empty() {
+            return Err("peer has no direct address or relay".into());
+        }
         // Waiting for another attempt and performing our handshake share a deadline.
-        let connection = tokio::time::timeout_at(deadline, connecting)
-            .await
-            .map_err(|_| "QUIC connection timed out")?
-            .map_err(|e| e.to_string())?;
+        let connection =
+            tokio::time::timeout_at(deadline, self.inner.endpoint.connect(address, ALPN))
+                .await
+                .map_err(|_| "QUIC connection timed out")?
+                .map_err(|e| e.to_string())?;
         if let Err(error) = self.track(key, connection.clone(), Some(&peer)) {
             connection.close(0u32.into(), b"connection rejected");
             return Err(error);
         }
+        *outgoing = Some(connection.clone());
         Ok(connection)
     }
     /// Counters for currently active QUIC sessions, not lifetime WireGuard counters.
@@ -258,18 +299,55 @@ impl Net {
         }
         Ok(result)
     }
-    pub fn shutdown(&self) {
-        self.inner.stopped.store(true, Ordering::Release);
-        self.inner.endpoint.close(0u32.into(), b"shutdown");
+    /// Return the currently selected route without changing peer configuration.
+    pub fn peer_path(&self, key: &PeerKey) -> Result<&'static str, String> {
+        let peers = self.inner.peers.read().unwrap_or_else(|e| e.into_inner());
+        let peer = peers.get(key).ok_or("peer not found")?;
+        let connections = peer.connections.lock().unwrap_or_else(|e| e.into_inner());
+        let mut result = "offline";
+        for connection in connections.iter().filter(|c| c.close_reason().is_none()) {
+            if result == "offline" {
+                result = "connecting";
+            }
+            for path in connection.paths().iter().filter(|p| p.is_selected()) {
+                match path.remote_addr() {
+                    TransportAddr::Ip(_) => return Ok("direct"),
+                    TransportAddr::Custom(_) => result = "relay",
+                    _ => {}
+                }
+            }
+        }
+        Ok(result)
     }
-    pub async fn wait_idle(&self) {
-        self.inner.endpoint.wait_idle().await;
+    pub fn peer_relay(&self, key: &PeerKey) -> Result<Option<RelayPeer>, String> {
+        self.inner
+            .peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|peer| peer.relay.clone())
+            .ok_or_else(|| "peer not found".into())
+    }
+    pub async fn shutdown(&self) {
+        self.inner.stopped.store(true, Ordering::Release);
+        self.inner.endpoint.close().await;
+        self.inner.peer_relay.shutdown().await;
+    }
+    pub fn relay_server(&self) -> Option<RelayPeer> {
+        self.inner.peer_relay.server()
+    }
+    pub fn relay_snapshot(&self) -> Option<RelaySnapshot> {
+        self.inner.peer_relay.snapshot()
+    }
+    pub fn relay_is_allowed(&self, key: &PeerKey) -> bool {
+        self.inner.peer_relay.is_allowed(key)
+    }
+    pub fn set_relay_allowed(&self, key: PeerKey, allowed: bool) -> Result<(), String> {
+        self.inner.peer_relay.set_allowed(key, allowed)
     }
 }
 pub fn public_key(seed: &[u8; 32]) -> PeerKey {
-    ed25519_dalek::SigningKey::from_bytes(seed)
-        .verifying_key()
-        .to_bytes()
+    *SecretKey::from_bytes(seed).public().as_bytes()
 }
 pub fn encode_key(key: &PeerKey) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
@@ -283,7 +361,7 @@ pub fn parse_key(value: &str) -> Result<PeerKey, String> {
         *byte = u8::from_str_radix(value.get(i * 2..i * 2 + 2).ok_or("invalid key")?, 16)
             .map_err(|_| "invalid public key")?;
     }
-    ed25519_dalek::VerifyingKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key")?;
+    PublicKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key")?;
     Ok(key)
 }
 fn io_error(error: impl std::fmt::Display) -> io::Error {

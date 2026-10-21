@@ -13,11 +13,15 @@ fn request(operation: &str) -> Request {
 #[tokio::test]
 #[ignore = "requires local UDP sockets"]
 async fn authenticated_quic_streams_and_peer_revocation() {
-    let a = Net::new(&[1; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    let b = Net::new(&[2; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
+    let a = Net::new(&[1; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
         .unwrap();
-    b.upsert_peer(a.public_key(), None).unwrap();
+    let b = Net::new(&[2; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr().unwrap()), None)
+        .unwrap();
+    b.upsert_peer(a.public_key(), None, None).unwrap();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let mut registry = Registry::default();
@@ -89,12 +93,15 @@ async fn authenticated_quic_streams_and_peer_revocation() {
     );
     // A registered endpoint must not be accepted as a different registered key.
     let wrong = portal_net::public_key(&[3; 32]);
-    a.upsert_peer(wrong, Some(b.listen_addr())).unwrap();
+    a.upsert_peer(wrong, Some(b.listen_addr().unwrap()), None)
+        .unwrap();
     assert!(a.request(wrong, request("fast")).await.is_err());
     // Server rejection: unknown client identity cannot use a trusted server.
-    let outsider = Net::new(&[4; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let outsider = Net::new(&[4; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
     outsider
-        .upsert_peer(b.public_key(), Some(b.listen_addr()))
+        .upsert_peer(b.public_key(), Some(b.listen_addr().unwrap()), None)
         .unwrap();
     assert!(
         tokio::time::timeout(
@@ -118,19 +125,23 @@ async fn authenticated_quic_streams_and_peer_revocation() {
     );
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
-    a.shutdown();
-    b.shutdown();
-    outsider.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
+    outsider.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "requires local UDP sockets"]
 async fn quic_ipv6_and_oversized_frame() {
-    let a = Net::new(&[11; 32], "[::1]:0".parse().unwrap()).unwrap();
-    let b = Net::new(&[12; 32], "[::1]:0".parse().unwrap()).unwrap();
-    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
+    let a = Net::new(&[11; 32], Some("[::1]:0".parse().unwrap()), Vec::new())
+        .await
         .unwrap();
-    b.upsert_peer(a.public_key(), None).unwrap();
+    let b = Net::new(&[12; 32], Some("[::1]:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr().unwrap()), None)
+        .unwrap();
+    b.upsert_peer(a.public_key(), None, None).unwrap();
     let mut registry = Registry::default();
     registry
         .register(Service::new("test", |_, _| async {
@@ -160,8 +171,8 @@ async fn quic_ipv6_and_oversized_frame() {
     assert!(a.request(b.public_key(), large).await.is_err());
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 #[tokio::test]
@@ -169,10 +180,12 @@ async fn quic_ipv6_and_oversized_frame() {
 async fn concurrent_connection_attempts_share_the_queue_and_handshake_budget() {
     // An open socket that never replies makes the handshake time out predictably.
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let client = Net::new(&[31; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = Net::new(&[31; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
     let key = portal_net::public_key(&[32; 32]);
     client
-        .upsert_peer(key, Some(blackhole.local_addr().unwrap()))
+        .upsert_peer(key, Some(blackhole.local_addr().unwrap()), None)
         .unwrap();
 
     let net = client.clone();
@@ -207,17 +220,21 @@ async fn concurrent_connection_attempts_share_the_queue_and_handshake_budget() {
     })
     .await
     .expect("queued connection attempts exceeded their shared ten-second budgets");
-    client.shutdown();
+    client.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "requires local UDP sockets"]
 async fn service_timeout_returns_504_and_keeps_the_connection_usable() {
-    let a = Net::new(&[33; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    let b = Net::new(&[34; 32], "127.0.0.1:0".parse().unwrap()).unwrap();
-    a.upsert_peer(b.public_key(), Some(b.listen_addr()))
+    let a = Net::new(&[33; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
         .unwrap();
-    b.upsert_peer(a.public_key(), None).unwrap();
+    let b = Net::new(&[34; 32], Some("127.0.0.1:0".parse().unwrap()), Vec::new())
+        .await
+        .unwrap();
+    a.upsert_peer(b.public_key(), Some(b.listen_addr().unwrap()), None)
+        .unwrap();
+    b.upsert_peer(a.public_key(), None, None).unwrap();
     let mut registry = Registry::default();
     registry
         .register(Service::new("test", |_, req| async move {
@@ -276,6 +293,6 @@ async fn service_timeout_returns_504_and_keeps_the_connection_usable() {
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }

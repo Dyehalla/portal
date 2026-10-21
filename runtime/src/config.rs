@@ -7,7 +7,9 @@ use zeroize::Zeroize;
 pub struct RuntimeConfig {
     pub config_path: Option<PathBuf>,
     pub private_key: SecretKey,
-    pub listen: SocketAddr,
+    pub listen: Option<SocketAddr>,
+    pub relays: Vec<portal_net::RelayPeer>,
+    pub relay_server: Option<crate::RelayServerConfig>,
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
     pub services: Vec<crate::ServiceRegistration>,
@@ -23,7 +25,11 @@ impl Drop for SecretKey {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     private_key_file: PathBuf,
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
+    #[serde(default)]
+    relays: Vec<portal_net::RelayPeer>,
+    #[serde(default)]
+    relay_server: Option<crate::RelayServerConfig>,
     #[serde(default = "default_api_listen")]
     api_listen: SocketAddr,
     #[serde(default)]
@@ -39,6 +45,7 @@ enum ServiceConfig {
         allowed_downloaders: Vec<String>,
     },
 }
+
 fn default_api_listen() -> SocketAddr {
     "127.0.0.1:51821".parse().expect("constant address")
 }
@@ -92,7 +99,8 @@ fn build_services(
     Ok(services)
 }
 pub fn load_config(path: &Path) -> Result<RuntimeConfig, String> {
-    let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let path = std::fs::canonicalize(path)
+        .map_err(|e| format!("could not resolve configuration {}: {e}", path.display()))?;
     let settings = read_settings(&path)?;
     let base = path.parent().expect("absolute path");
     if !settings.api_listen.ip().is_loopback() {
@@ -100,10 +108,23 @@ pub fn load_config(path: &Path) -> Result<RuntimeConfig, String> {
     }
     let private_key = SecretKey(read_key_file(&resolve(base, settings.private_key_file))?);
     let services = build_services(settings.services, base)?;
+    let relay_server = settings.relay_server;
+    if let Some(server) = &relay_server {
+        server.validate()?;
+    }
+    let relays = settings.relays;
+    for relay in &relays {
+        relay.validate()?;
+    }
+    if settings.listen.is_none() && relays.is_empty() && relay_server.is_none() {
+        return Err("listen or at least one relay is required".into());
+    }
     Ok(RuntimeConfig {
         config_path: Some(path.clone()),
         private_key,
         listen: settings.listen,
+        relays,
+        relay_server,
         api_listen: settings.api_listen,
         api_token_file: settings
             .api_token_file
@@ -196,9 +217,19 @@ mod tests {
         assert_eq!(config.private_key.0, [7; 32]);
         assert_eq!(config.api_token_file, directory.join("api.token"));
         assert_eq!(config.services.len(), 1);
+        let mut relay_only = valid.clone();
+        relay_only["listen"] = serde_json::Value::Null;
+        relay_only["relays"] = serde_json::json!([{"public_key":portal_net::encode_key(&portal_net::public_key(&[9;32])), "endpoint":"127.0.0.1:40000"}]);
+        std::fs::write(&path, serde_json::to_vec(&relay_only).unwrap()).unwrap();
+        let config = load_config(&path).unwrap();
+        assert!(config.listen.is_none());
+        assert_eq!(config.relays.len(), 1);
         for (field, value) in [
             ("addresses", serde_json::json!(["10.20.0.1/32"])),
             ("api_listen", serde_json::json!("0.0.0.0:51821")),
+            ("listen", serde_json::Value::Null),
+            ("relays", serde_json::json!(["file:///tmp/relay"])),
+            ("relays", serde_json::json!(["http://relay.example.com"])),
             (
                 "services",
                 serde_json::json!([{ "type":"files", "root":"share", "allowed_downloaders":["127.0.0.1"] }]),

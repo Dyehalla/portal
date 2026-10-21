@@ -17,7 +17,7 @@ pub struct FileServiceConfig {
 }
 #[derive(Clone)]
 pub(crate) struct SharedState {
-    pub root: Arc<PathBuf>,
+    pub root: Arc<cap_std::fs::Dir>,
     pub allowed_downloaders: Arc<HashSet<PeerKey>>,
     pub download_slots: Arc<Semaphore>,
 }
@@ -27,19 +27,15 @@ pub struct FileService {
 }
 impl FileService {
     pub async fn new(config: FileServiceConfig) -> Result<Self, String> {
-        let root = tokio::fs::canonicalize(&config.root)
-            .await
-            .map_err(|e| format!("could not resolve file root {}: {e}", config.root.display()))?;
-        if !tokio::fs::metadata(&root)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_dir()
-        {
-            return Err("file root must be a directory".into());
-        }
         if config.allowed_downloaders.is_empty() {
             return Err("at least one reader key is required".into());
         }
+        let root = tokio::task::spawn_blocking(move || {
+            cap_std::fs::Dir::open_ambient_dir(&config.root, cap_std::ambient_authority())
+                .map_err(|e| format!("could not open file root {}: {e}", config.root.display()))
+        })
+        .await
+        .map_err(|e| format!("could not prepare file root: {e}"))??;
         Ok(Self {
             state: SharedState {
                 root: Arc::new(root),

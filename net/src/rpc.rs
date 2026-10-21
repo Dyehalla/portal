@@ -1,5 +1,5 @@
-use crate::{Net, PeerKey, io_error, tls};
-use quinn::{Connection, RecvStream, SendStream};
+use crate::{ALPN, Net, PeerKey, io_error};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -27,6 +27,16 @@ pub struct Request {
     pub operation: String,
     #[serde(default)]
     pub payload: serde_json::Value,
+}
+impl Request {
+    /// Check the encoded QUIC frame size before attempting network IO.
+    pub fn validate_size(&self) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > REQUEST_LIMIT {
+            return Err("request exceeds the 16 KiB QUIC frame limit".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,6 +245,7 @@ impl Net {
         peer: PeerKey,
         request: Request,
     ) -> Result<IncomingResponse, String> {
+        request.validate_size()?;
         let connection = self.connect(peer).await?;
         let (mut send, mut recv) =
             tokio::time::timeout(Duration::from_secs(10), connection.open_bi())
@@ -286,14 +297,12 @@ impl Net {
         struct Serving(Net);
         impl Drop for Serving {
             fn drop(&mut self) {
-                self.0.inner.endpoint.set_server_config(None);
+                self.0.inner.endpoint.set_alpns(Vec::new());
                 self.0.inner.serving.store(false, Ordering::Release);
             }
         }
         let _guard = Serving(self.clone());
-        self.inner
-            .endpoint
-            .set_server_config(Some(self.inner.server.clone()));
+        self.inner.endpoint.set_alpns(vec![ALPN.to_vec()]);
         ready();
         let registry = Arc::new(registry);
         let slots = Arc::new(tokio::sync::Semaphore::new(128));
@@ -313,10 +322,8 @@ impl Net {
                         struct Close(Connection);
                         impl Drop for Close { fn drop(&mut self) { self.0.close(0u32.into(), b"service stopped"); } }
                         let _close = Close(connection.clone());
-                        let Some(identity) = connection.peer_identity().and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok()) else { return; };
-                        let Some(cert) = identity.first() else { return; };
-                        // Services receive the key from the authenticated TLS certificate.
-                        let Ok(key) = tls::certificate_key(cert) else { return; };
+                        // Iroh exposes the identity authenticated by the completed TLS handshake.
+                        let key = *connection.remote_id().as_bytes();
                         if net.track(key, connection.clone(), None).is_err() { return; }
                         let mut streams = tokio::task::JoinSet::new();
                         loop {

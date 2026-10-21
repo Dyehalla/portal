@@ -4,19 +4,65 @@ use crate::{
     peer_services::PeerServices,
     platform::{HostPlatform, Platform},
 };
-use portal_net::{Net, PeerKey};
+use portal_net::{Net, PeerKey, RelayPeer, RelaySnapshot};
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 use zeroize::Zeroize;
 
+#[derive(Serialize)]
+pub(crate) struct NetworkStats {
+    connections: usize,
+    tx_bytes: u64,
+    rx_bytes: u64,
+}
+impl From<(usize, u64, u64)> for NetworkStats {
+    fn from((connections, tx_bytes, rx_bytes): (usize, u64, u64)) -> Self {
+        Self {
+            connections,
+            tx_bytes,
+            rx_bytes,
+        }
+    }
+}
+#[derive(Serialize)]
+pub(crate) struct PeerSnapshot {
+    public_key: String,
+    endpoint: Option<std::net::SocketAddr>,
+    relay: Option<RelayPeer>,
+    relay_server: Option<RelayPeer>,
+    relay_allowed: bool,
+    path: &'static str,
+    stats: NetworkStats,
+}
+#[derive(Serialize)]
+pub(crate) struct RuntimeSnapshot {
+    healthy: bool,
+    public_key: String,
+    listen: Option<std::net::SocketAddr>,
+    can_reload: bool,
+    relay_server: Option<RelaySnapshot>,
+    stats: NetworkStats,
+    peers: Vec<PeerSnapshot>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerInfo {
+    pub(crate) public_key: String,
+    pub(crate) relay_server: Option<RelayPeer>,
+}
+
 const LOOP_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct Runtime {
     network: Option<Net>,
     shutdown_requested: bool,
     pub(crate) reload: Option<std::sync::mpsc::SyncSender<ReloadRequest>>,
+    pub(crate) peer_info: HashMap<PeerKey, PeerInfo>,
 }
 pub(crate) struct ReloadRequest {
     pub(crate) response: tokio::sync::oneshot::Sender<Result<String, String>>,
@@ -25,9 +71,39 @@ pub(crate) struct ReloadRequest {
 fn start_services(
     executor: &tokio::runtime::Handle,
     network: Net,
-    services: Vec<crate::ServiceRegistration>,
+    mut services: Vec<crate::ServiceRegistration>,
 ) -> Result<PeerServices, String> {
+    services.push(identity_service(&network));
     PeerServices::start(executor, network, services)
+}
+
+/// Advertise capabilities only to authenticated, trusted Portal peers.
+fn identity_service(network: &Net) -> crate::ServiceRegistration {
+    let info = PeerInfo {
+        public_key: portal_net::encode_key(&network.public_key()),
+        relay_server: network.relay_server(),
+    };
+    crate::ServiceRegistration::new("portal", move |_| async move {
+        Ok(crate::ServiceImplementation::new(portal_net::Service::new(
+            "portal",
+            move |_, request| {
+                let info = info.clone();
+                async move {
+                    if request.operation != "info" {
+                        return portal_net::Response::error(404, "unknown portal operation");
+                    }
+                    if request.payload != serde_json::json!({}) {
+                        return portal_net::Response::error(
+                            400,
+                            "info payload must be an empty object",
+                        );
+                    }
+                    portal_net::Response::json(&info)
+                        .unwrap_or_else(|e| portal_net::Response::error(500, &e))
+                }
+            },
+        )))
+    })
 }
 fn reload_services(
     executor: &tokio::runtime::Handle,
@@ -35,7 +111,8 @@ fn reload_services(
     path: &std::path::Path,
     current: &mut Option<PeerServices>,
 ) -> Result<String, String> {
-    let services = crate::config::load_services(path)?;
+    let mut services = crate::config::load_services(path)?;
+    services.push(identity_service(network));
     let context = crate::ServiceContext {
         network: network.clone(),
     };
@@ -74,10 +151,12 @@ fn run_with_executor(
 ) -> Result<(), String> {
     let platform = Platform;
     platform.install_signal_handlers();
-    let network = {
-        let _guard = executor.enter();
-        Net::new(&options.private_key.0, options.listen)?
-    };
+    let network = executor.block_on(Net::with_relay_server(
+        &options.private_key.0,
+        options.listen,
+        std::mem::take(&mut options.relays),
+        options.relay_server.take(),
+    ))?;
     options.private_key.0.zeroize();
     let mut peer_services = match start_services(
         executor,
@@ -86,7 +165,7 @@ fn run_with_executor(
     ) {
         Ok(services) => Some(services),
         Err(error) => {
-            network.shutdown();
+            shutdown_network(executor, &network);
             return Err(error);
         }
     };
@@ -96,6 +175,7 @@ fn run_with_executor(
         network: Some(network.clone()),
         shutdown_requested: false,
         reload: config_path.as_ref().map(|_| sender),
+        peer_info: HashMap::new(),
     }));
     let api = match LocalApi::start(
         executor,
@@ -109,16 +189,23 @@ fn run_with_executor(
             if let Some(services) = peer_services.take() {
                 let _ = services.stop();
             }
-            network.shutdown();
+            shutdown_network(executor, &network);
             return Err(error);
         }
     };
     println!(
-        "READY net=quic listen={} public_key={} api={} token_file={}",
-        network.listen_addr(),
+        "READY net=iroh listen={} public_key={} api={} token_file={} relay_server={}",
+        network
+            .listen_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "relay-only".into()),
         portal_net::encode_key(&network.public_key()),
         api.local_addr(),
-        options.api_token_file.display()
+        options.api_token_file.display(),
+        network
+            .relay_server()
+            .map(|relay| relay.endpoint.to_string())
+            .unwrap_or_else(|| "disabled".into()),
     );
     let mut result = Ok(());
     loop {
@@ -144,7 +231,21 @@ fn run_with_executor(
                 config_path.as_deref().expect("reload enabled"),
                 &mut peer_services,
             );
+            let fatal = peer_services.is_none();
+            if fatal {
+                result = Err(format!(
+                    "service reload activation failed; shutting down runtime: {}",
+                    reloaded
+                        .as_ref()
+                        .err()
+                        .map(String::as_str)
+                        .unwrap_or("no active service host")
+                ));
+            }
             let _ = request.response.send(reloaded);
+            if fatal {
+                break;
+            }
         }
         if api.has_exited() {
             result = Err("local HTTP API exited unexpectedly".into());
@@ -165,14 +266,49 @@ fn run_with_executor(
         .take()
         .map(PeerServices::stop)
         .unwrap_or(Ok(()));
-    network.shutdown();
-    executor.block_on(async {
-        let _ = tokio::time::timeout(Duration::from_secs(1), network.wait_idle()).await;
-    });
+    shutdown_network(executor, &network);
     result.and(api_result).and(services_result)
 }
+
+fn shutdown_network(executor: &tokio::runtime::Handle, network: &Net) {
+    executor.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(5), network.shutdown()).await;
+    });
+}
 impl Runtime {
-    pub(crate) fn file_peer(&self, key: &str) -> Result<PeerKey, String> {
+    /// A structured view for the web client; management commands retain their CLI response format.
+    pub(crate) fn snapshot(&self) -> Result<RuntimeSnapshot, String> {
+        let network = self.network.as_ref().ok_or("network unavailable")?;
+        let mut peers = network
+            .peers()
+            .into_iter()
+            .map(|(key, endpoint)| {
+                Ok(PeerSnapshot {
+                    public_key: portal_net::encode_key(&key),
+                    endpoint,
+                    relay: network.peer_relay(&key)?,
+                    relay_server: self
+                        .peer_info
+                        .get(&key)
+                        .and_then(|info| info.relay_server.clone()),
+                    relay_allowed: network.relay_is_allowed(&key),
+                    path: network.peer_path(&key)?,
+                    stats: network.stats(Some(&key))?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        peers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+        Ok(RuntimeSnapshot {
+            healthy: !self.shutdown_requested && network.health().is_ok(),
+            public_key: portal_net::encode_key(&network.public_key()),
+            listen: network.listen_addr(),
+            can_reload: self.reload.is_some(),
+            relay_server: network.relay_snapshot(),
+            stats: network.stats(None)?.into(),
+            peers,
+        })
+    }
+    pub(crate) fn registered_peer(&self, key: &str) -> Result<PeerKey, String> {
         let key = portal_net::parse_key(key)?;
         if !self.network.as_ref().is_some_and(|net| net.has_peer(&key)) {
             return Err("unregistered peer".into());
@@ -192,12 +328,26 @@ impl Runtime {
             ManagementRequest::PeerUpsert {
                 public_key,
                 endpoint,
+                relay,
+                allow_relay,
             } => {
-                network.upsert_peer(portal_net::parse_key(&public_key)?, endpoint)?;
+                let key = portal_net::parse_key(&public_key)?;
+                if allow_relay.is_some() && network.relay_server().is_none() {
+                    return Err("this device does not host a relay".into());
+                }
+                network.upsert_peer(key, endpoint, relay)?;
+                if let Some(allowed) = allow_relay {
+                    network.set_relay_allowed(key, allowed)?;
+                }
                 Ok("peer configured".into())
             }
             ManagementRequest::PeerRemove { public_key } => {
-                network.remove_peer(&portal_net::parse_key(&public_key)?)?;
+                let key = portal_net::parse_key(&public_key)?;
+                network.remove_peer(&key)?;
+                self.peer_info.remove(&key);
+                if network.relay_server().is_some() {
+                    network.set_relay_allowed(key, false)?;
+                }
                 Ok("peer removed".into())
             }
             ManagementRequest::EndpointSet {
@@ -208,7 +358,7 @@ impl Runtime {
                 if !network.has_peer(&key) {
                     return Err("peer not found".into());
                 }
-                network.upsert_peer(key, Some(endpoint))?;
+                network.upsert_peer(key, Some(endpoint), network.peer_relay(&key)?)?;
                 Ok("endpoint updated".into())
             }
             ManagementRequest::EndpointClear { public_key } => {
@@ -216,7 +366,7 @@ impl Runtime {
                 if !network.has_peer(&key) {
                     return Err("peer not found".into());
                 }
-                network.upsert_peer(key, None)?;
+                network.upsert_peer(key, None, network.peer_relay(&key)?)?;
                 Ok("endpoint cleared".into())
             }
             ManagementRequest::Stats => {
@@ -229,8 +379,9 @@ impl Runtime {
                 let key = portal_net::parse_key(&public_key)?;
                 let (connections, tx, rx) = network.stats(Some(&key))?;
                 Ok(format!(
-                    "peer={} active_connections={connections} udp_tx_bytes={tx} udp_rx_bytes={rx}",
-                    portal_net::encode_key(&key)
+                    "peer={} active_connections={connections} udp_tx_bytes={tx} udp_rx_bytes={rx} path={}",
+                    portal_net::encode_key(&key),
+                    network.peer_path(&key)?
                 ))
             }
             ManagementRequest::Health => {
@@ -240,8 +391,11 @@ impl Runtime {
             ManagementRequest::Status => {
                 network.health()?;
                 Ok(format!(
-                    "net=quic listen={} public_key={} peers={}",
-                    network.listen_addr(),
+                    "net=iroh listen={} public_key={} peers={}",
+                    network
+                        .listen_addr()
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "relay-only".into()),
                     portal_net::encode_key(&network.public_key()),
                     network.peers().len()
                 ))
@@ -252,11 +406,12 @@ impl Runtime {
                     .into_iter()
                     .map(|(key, endpoint)| {
                         format!(
-                            "{} endpoint={}",
+                            "{} endpoint={} path={}",
                             portal_net::encode_key(&key),
                             endpoint
                                 .map(|e| e.to_string())
-                                .unwrap_or_else(|| "-".into())
+                                .unwrap_or_else(|| "-".into()),
+                            network.peer_path(&key).unwrap_or("offline")
                         )
                     })
                     .collect::<Vec<_>>();
@@ -270,6 +425,13 @@ impl Runtime {
             ManagementRequest::ServicesReload => {
                 Err("reload must be dispatched through controller".into())
             }
+            ManagementRequest::RelayAccessSet {
+                public_key,
+                allowed,
+            } => {
+                network.set_relay_allowed(portal_net::parse_key(&public_key)?, allowed)?;
+                Ok("relay access updated".into())
+            }
             ManagementRequest::Shutdown => unreachable!(),
         }
     }
@@ -280,5 +442,6 @@ pub(crate) fn test_runtime() -> Runtime {
         network: None,
         shutdown_requested: false,
         reload: None,
+        peer_info: HashMap::new(),
     }
 }

@@ -8,9 +8,9 @@ use tokio::task::JoinHandle;
 use axum::Json;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use axum::routing::post;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::service::Runtime;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 struct ApiState {
@@ -37,6 +38,10 @@ pub(crate) enum ManagementRequest {
         public_key: String,
         #[serde(default)]
         endpoint: Option<SocketAddr>,
+        #[serde(default)]
+        relay: Option<portal_net::RelayPeer>,
+        #[serde(default)]
+        allow_relay: Option<bool>,
     },
     PeerRemove {
         public_key: String,
@@ -56,6 +61,10 @@ pub(crate) enum ManagementRequest {
     Health,
     List,
     ServicesReload,
+    RelayAccessSet {
+        public_key: String,
+        allowed: bool,
+    },
     Shutdown,
 }
 
@@ -71,7 +80,7 @@ pub(crate) struct LocalApi {
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), String>>,
     address: SocketAddr,
-    token_file: PathBuf,
+    token_file: crate::platform::linux::api_token::TokenFile,
 }
 
 impl LocalApi {
@@ -108,7 +117,7 @@ impl LocalApi {
             TcpListener::from_std(listener)
                 .map_err(|error| format!("could not start local API listener: {error}"))?
         };
-        let token = crate::platform::linux::api_token::create(&token_file)?;
+        let (token, token_file) = crate::platform::linux::api_token::create(&token_file)?;
 
         let state = ApiState {
             runtime,
@@ -119,6 +128,12 @@ impl LocalApi {
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = executor.spawn(async move {
             let app = Router::new()
+                .route("/", get(handle_web))
+                .route("/app.js", get(handle_web))
+                .route("/styles.css", get(handle_web))
+                .route("/favicon.svg", get(handle_web))
+                .route("/api/v1/state", post(handle_state))
+                .route("/api/v1/peers/info", post(handle_peer_info))
                 .route("/api/v1/command", post(handle_command))
                 .route("/api/v1/files/:operation", post(handle_files))
                 .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -182,9 +197,158 @@ impl LocalApi {
                 }
             }
         });
-        let token_result = crate::platform::linux::api_token::remove(&self.token_file);
+        let token_result = self.token_file.remove();
         task_result.and(token_result)
     }
+}
+
+/// Static assets contain no credentials. The browser authenticates API calls separately.
+async fn handle_web(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
+    if !remote.ip().is_loopback()
+        || !valid_host(&headers, state.listen_address)
+        || !valid_origin(&headers, state.listen_address)
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "request must target the local API",
+        ));
+    }
+    let (content_type, body) = crate::web::asset(uri.path())
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "asset not found"))?;
+    let mut response = Response::new(axum::body::Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
+    Ok(response)
+}
+
+async fn handle_state(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
+    authenticate(&state, remote, &headers)?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StateRequest {}
+    serde_json::from_slice::<StateRequest>(&body).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "state request must be an empty JSON object",
+        )
+    })?;
+    let snapshot = state
+        .runtime
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime state is unavailable",
+            )
+        })?
+        .snapshot()
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, &e))?;
+    Ok(([("cache-control", "no-store")], Json(snapshot)).into_response())
+}
+
+/// Query authenticated capabilities over QUIC without holding the runtime lock during IO.
+async fn handle_peer_info(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
+    use tokio::io::AsyncReadExt;
+    authenticate(&state, remote, &headers)?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct InfoRequest {
+        peer: String,
+    }
+    let request: InfoRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "expected a peer public key"))?;
+    let key = state
+        .runtime
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime state is unavailable",
+            )
+        })?
+        .registered_peer(&request.peer)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+    let network = state
+        .network
+        .as_ref()
+        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "network unavailable"))?;
+    let mut response = network
+        .request(
+            key,
+            portal_net::Request {
+                service: "portal".into(),
+                operation: "info".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, &e))?;
+    if response.header.status != 200 || response.header.length > 4096 {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "peer did not return supported capabilities",
+        ));
+    }
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        response.body.read_to_end(&mut bytes),
+    )
+    .await
+    .map_err(|_| api_error(StatusCode::GATEWAY_TIMEOUT, "peer info timed out"))?
+    .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "could not read peer info"))?;
+    let info: crate::service::PeerInfo = serde_json::from_slice(&bytes)
+        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid peer info"))?;
+    if portal_net::parse_key(&info.public_key).ok() != Some(key) {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "peer info identity mismatch",
+        ));
+    }
+    if let Some(relay) = &info.relay_server {
+        if relay.public_key != key {
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                "relay capability identity mismatch",
+            ));
+        }
+        relay
+            .validate()
+            .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid advertised peer relay"))?;
+    }
+    let mut runtime = state.runtime.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state is unavailable",
+        )
+    })?;
+    runtime
+        .registered_peer(&request.peer)
+        .map_err(|e| api_error(StatusCode::CONFLICT, &e))?;
+    runtime.peer_info.insert(key, info.clone());
+    Ok(([("cache-control", "no-store")], Json(info)).into_response())
 }
 
 /// Authenticate a loopback request, dispatch its command, and return a JSON result.
@@ -239,8 +403,8 @@ async fn handle_command(
             )
         })?;
         return result
-            .map(|message| Json(CommandResponse { message }))
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error));
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+            .and_then(command_response);
     }
     let mut runtime = state.runtime.lock().map_err(|_| {
         api_error(
@@ -250,8 +414,29 @@ async fn handle_command(
     })?;
     let result = runtime.handle_api_request(request);
     result
-        .map(|message| Json(CommandResponse { message }))
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+        .and_then(command_response)
+}
+
+fn command_response(
+    message: String,
+) -> Result<Json<CommandResponse>, (StatusCode, Json<CommandResponse>)> {
+    let response = CommandResponse { message };
+    let size = serde_json::to_vec(&response)
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not encode command response",
+            )
+        })?
+        .len();
+    if size > MAX_COMMAND_RESPONSE_BYTES {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "command response exceeds the 256 KiB limit",
+        ));
+    }
+    Ok(Json(response))
 }
 
 fn authenticate(
@@ -259,13 +444,13 @@ fn authenticate(
     remote: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<CommandResponse>)> {
-    if !remote.ip().is_loopback() || !valid_host(&headers, state.listen_address) {
+    if !remote.ip().is_loopback() || !valid_host(headers, state.listen_address) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "request must target the local API",
         ));
     }
-    if !valid_origin(&headers, state.listen_address) {
+    if !valid_origin(headers, state.listen_address) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "request origin is not allowed",
@@ -281,7 +466,7 @@ fn authenticate(
             "Content-Type must be application/json",
         ));
     }
-    if !valid_token(&headers, state.token.as_str()) {
+    if !valid_token(headers, state.token.as_str()) {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid API bearer token",
@@ -325,6 +510,14 @@ async fn handle_files(
             ));
         }
     };
+    let peer_request = portal_net::Request {
+        service: "files".into(),
+        operation,
+        payload,
+    };
+    peer_request
+        .validate_size()
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
     // Release the runtime lock before any network IO.
     let address = state
         .runtime
@@ -335,21 +528,16 @@ async fn handle_files(
                 "runtime state is unavailable",
             )
         })?
-        .file_peer(&request.peer)
+        .registered_peer(&request.peer)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
-    let bytes = serde_json::to_vec(&payload).map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not encode peer request",
-        )
-    })?;
     let network = state.network.clone().ok_or_else(|| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "QUIC transport unavailable",
         )
     })?;
-    let response = portal_files::proxy_request(network, address, &operation, &bytes)
+    let response = network
+        .request(address, peer_request)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, &error))?;
     let header = response.header.clone();
@@ -504,6 +692,23 @@ mod file_api_tests {
         assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
         let result = handle_files(State(state.clone()), ConnectInfo("127.0.0.1:1234".parse().unwrap()), Path("resources".into()), headers.clone(), Bytes::from_static(br#"{"peer":"0101010101010101010101010101010101010101010101010101010101010101","url":"http://127.0.0.1"}"#)).await;
         assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        // Valid local JSON can exceed the QUIC frame limit after encoding its envelope.
+        let result = handle_files(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            Path("download".into()),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "peer": "01".repeat(32), "path": "\u{0001}".repeat(3000)
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        let (status, Json(error)) = result.err().unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("16 KiB"));
         let result = handle_files(
             State(state),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
