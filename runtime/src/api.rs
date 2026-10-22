@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::service::Runtime;
+use crate::runtime::Runtime;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 

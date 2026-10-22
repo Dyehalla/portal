@@ -1,1 +1,4 @@
 /target
+/coordinator-state/
+/coordinator.json
+/coordinator-tls/

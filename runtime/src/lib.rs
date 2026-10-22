@@ -1,18 +1,16 @@
 #[cfg(target_os = "linux")]
 mod api;
 mod config;
-#[cfg(target_os = "linux")]
-mod peer_services;
 mod platform;
 #[cfg(target_os = "linux")]
-mod service;
+mod runtime;
 
-pub use config::{InterfaceAddress, RuntimeConfig, SecretKey, SmbConfig};
+pub use config::{InterfaceAddress, RuntimeConfig, SecretKey};
 
 #[cfg(target_os = "linux")]
 /// Start the configured WireGuard device and local HTTP API until shutdown.
 pub fn run(config: RuntimeConfig) -> Result<(), String> {
-    service::run_device(config)
+    runtime::run_device(config)
 }
 
 #[cfg(not(target_os = "linux"))]

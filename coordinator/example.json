@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:8443",
+  "state_dir": "../coordinator-state",
+  "ipv4_network": "10.77.0.0/16",
+  "ipv6_network": "fd77:706f:7274::/64",
+  "lease_seconds": 300,
+  "tls": {
+    "cert_file": "../coordinator-tls/cert.pem",
+    "key_file": "../coordinator-tls/key.pem"
+  }
+}

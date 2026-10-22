@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use portal_files::FileServiceConfig;
-use portal_runtime::{InterfaceAddress, RuntimeConfig, SecretKey, SmbConfig};
+use portal_runtime::{InterfaceAddress, RuntimeConfig, SecretKey};
 use zeroize::Zeroize;
 
 // Run the selected command and report failures using a nonzero process exit code.
@@ -55,17 +54,6 @@ Run options:
   --handshake-rate-limit N  Handshakes per second (Device default if omitted)
   --no-dual-stack           Bind only the address family of --listen
   --no-auto-routes          Leave host routes to the administrator
-  --peer-http-listen IP:PORT     Shared peer-to-peer HTTP listener (requires a service)
-  --files-root DIR          Enable the file download service with this shared root
-  --files-allow-download IP  Grant file downloads to this tunnel IP; repeatable
-  --smb-root DIR            Read-only Samba share (requires Samba and --peer-http-listen)
-  --smb-name NAME           Share name (default: documents)
-  --smb-listen IP           Tunnel IP assigned with --address
-  --smb-user USER           Unix/SMB account (default: current user or sudo caller)
-  --smb-as-root             Run Samba as root (requires privileged runtime)
-  --smb-port PORT           TCP port (default: 1445; 445 with --smb-as-root)
-  --smb-password-file PATH  Owner-only file containing the SMB password
-  --smb-allow-peer IP       Allow SMB connections from this tunnel IP; repeatable
 
 The runtime stays in the foreground. Use the separate `portal` CLI to manage it."
     );
@@ -73,7 +61,7 @@ The runtime stays in the foreground. Use the separate `portal` CLI to manage it.
 
 // Validate runtime options, build the device configuration, and start the foreground service.
 fn run_command(args: &[String]) -> Result<(), String> {
-    let options = parse_options(args, &["no-dual-stack", "no-auto-routes", "smb-as-root"])?;
+    let options = parse_options(args, &["no-dual-stack", "no-auto-routes"])?;
     validate_options(
         &options,
         &[
@@ -86,21 +74,10 @@ fn run_command(args: &[String]) -> Result<(), String> {
             "handshake-rate-limit",
             "api-listen",
             "api-token-file",
-            "peer-http-listen",
-            "files-root",
-            "files-allow-download",
-            "smb-root",
-            "smb-name",
-            "smb-listen",
-            "smb-user",
-            "smb-as-root",
-            "smb-port",
-            "smb-password-file",
-            "smb-allow-peer",
             "no-dual-stack",
             "no-auto-routes",
         ],
-        &["address", "files-allow-download", "smb-allow-peer"],
+        &["address"],
     )?;
     let tun_name = required(&options, "tun")?;
     portal_runtime::validate_interface_name(tun_name)?;
@@ -150,107 +127,6 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .and_then(first)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/portal.token"));
-    let peer_http_listen = options
-        .get("peer-http-listen")
-        .and_then(first)
-        .map(|value| {
-            value
-                .parse::<SocketAddr>()
-                .map_err(|error| format!("invalid --peer-http-listen address: {error}"))
-        })
-        .transpose()?;
-    if peer_http_listen.is_some_and(|address| address.ip().is_unspecified()) {
-        return Err("bind --peer-http-listen to a specific tunnel address".into());
-    }
-    let file_service = match options.get("files-root").and_then(first) {
-        Some(root) => {
-            let allowed_downloaders = options
-                .get("files-allow-download")
-                .into_iter()
-                .flatten()
-                .map(|value| {
-                    value.parse::<IpAddr>().map_err(|error| {
-                        format!("invalid --files-allow-download peer IP `{value}`: {error}")
-                    })
-                })
-                .collect::<Result<HashSet<_>, _>>()?;
-            if allowed_downloaders.is_empty() {
-                return Err("at least one --files-allow-download IP is required".into());
-            }
-            Some(FileServiceConfig {
-                root: PathBuf::from(root),
-                allowed_downloaders,
-            })
-        }
-        None => {
-            if options.contains_key("files-allow-download") {
-                return Err("file service options require --files-root".into());
-            }
-            None
-        }
-    };
-    let smb = match options.get("smb-root").and_then(first) {
-        Some(root) => {
-            let listen = required(&options, "smb-listen")?
-                .parse::<IpAddr>()
-                .map_err(|error| format!("invalid --smb-listen: {error}"))?;
-            if !addresses.iter().any(|address| address.address == listen)
-                || listen.is_loopback()
-                || listen.is_unspecified()
-                || listen.is_multicast()
-            {
-                return Err("--smb-listen must be a tunnel IP assigned with --address".into());
-            }
-            let allowed_peers = options
-                .get("smb-allow-peer")
-                .into_iter()
-                .flatten()
-                .map(|value| {
-                    value
-                        .parse::<IpAddr>()
-                        .map_err(|error| format!("invalid --smb-allow-peer: {error}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if allowed_peers.is_empty() {
-                return Err("at least one --smb-allow-peer IP is required".into());
-            }
-            Some(SmbConfig {
-                root: PathBuf::from(root),
-                name: options
-                    .get("smb-name")
-                    .and_then(first)
-                    .cloned()
-                    .unwrap_or_else(|| "documents".into()),
-                listen,
-                user: options.get("smb-user").and_then(first).cloned(),
-                as_root: options.contains_key("smb-as-root"),
-                port: options
-                    .get("smb-port")
-                    .and_then(first)
-                    .map(|value| {
-                        value
-                            .parse::<u16>()
-                            .map_err(|error| format!("invalid --smb-port: {error}"))
-                    })
-                    .transpose()?,
-                password_file: PathBuf::from(required(&options, "smb-password-file")?),
-                allowed_peers,
-            })
-        }
-        None => {
-            if options.keys().any(|name| name.starts_with("smb-")) {
-                return Err("SMB options require --smb-root".into());
-            }
-            None
-        }
-    };
-    match (peer_http_listen, (file_service.is_some() || smb.is_some())) {
-        (Some(_), false) => {
-            return Err("--peer-http-listen requires at least one configured HTTP service".into());
-        }
-        (None, true) => return Err("file sharing requires --peer-http-listen".into()),
-        _ => {}
-    }
     portal_runtime::run(RuntimeConfig {
         tun_name: tun_name.to_owned(),
         private_key,
@@ -263,9 +139,6 @@ fn run_command(args: &[String]) -> Result<(), String> {
         auto_routes: !options.contains_key("no-auto-routes"),
         api_listen,
         api_token_file,
-        peer_http_listen,
-        file_service,
-        smb,
     })
 }
 
