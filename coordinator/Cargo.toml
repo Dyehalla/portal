@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "User and device registry for Portal networks"
 
 [dependencies]
+portal-net = { path = "../net" }
 axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 ipnet = { version = "2", features = ["serde"] }

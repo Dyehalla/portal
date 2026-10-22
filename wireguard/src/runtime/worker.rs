@@ -8,6 +8,7 @@ use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 
+use crate::access::AccessGuard;
 use crate::device::registry::{DeviceState, Peer};
 use crate::device::{
     DeviceCounters, MAX_DATAGRAM_SIZE, PeerKey, SecretKey, TIMER_POLL_INTERVAL, allowed_source,
@@ -17,6 +18,7 @@ use crate::platform::{PacketIo, PacketSource, WorkerIo};
 use boringtun::noise::rate_limiter::RateLimiter;
 
 pub(crate) struct WorkerContext {
+    pub access_control: Option<Arc<crate::AccessControl>>,
     pub worker_id: usize,
     pub io: Arc<PacketIo>,
     pub worker_io: WorkerIo,
@@ -31,6 +33,7 @@ pub(crate) struct WorkerContext {
 // Run the event loop, drain bounded batches, and let worker zero service timers.
 pub(crate) fn run(context: WorkerContext) -> io::Result<()> {
     let WorkerContext {
+        access_control,
         worker_id,
         io,
         mut worker_io,
@@ -61,6 +64,7 @@ pub(crate) fn run(context: WorkerContext) -> io::Result<()> {
                 &local_private,
                 &local_public,
                 &mut scratch,
+                access_control.as_deref(),
             );
 
             // Drain a bounded batch without another blocking epoll_wait. The
@@ -82,12 +86,20 @@ pub(crate) fn run(context: WorkerContext) -> io::Result<()> {
                     &local_private,
                     &local_public,
                     &mut scratch,
+                    access_control.as_deref(),
                 );
             }
         }
 
         if worker_id == 0 && last_timer_tick.elapsed() >= TIMER_POLL_INTERVAL {
-            run_timers(&io, &state, &rate_limiter, &stats, &mut scratch);
+            run_timers(
+                &io,
+                &state,
+                &rate_limiter,
+                &stats,
+                &mut scratch,
+                access_control.as_deref(),
+            );
             last_timer_tick = Instant::now();
         }
     }
@@ -108,7 +120,9 @@ fn process_packet(
     local_private: &StaticSecret,
     local_public: &PublicKey,
     scratch: &mut [u8],
+    access_control: Option<&crate::AccessControl>,
 ) {
+    let mut access = access_control.map(crate::AccessControl::lock);
     let packet = &packet_buffer[..event.len];
     match event.source {
         PacketSource::Udp(source) => {
@@ -123,13 +137,14 @@ fn process_packet(
                 source,
                 packet,
                 scratch,
+                access.as_mut(),
             ) {
                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
         PacketSource::Tun => {
             stats.received_tun_packets.fetch_add(1, Ordering::Relaxed);
-            if !handle_tun(io, state, packet, scratch) {
+            if !handle_tun(io, state, packet, scratch, access.as_mut()) {
                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -137,6 +152,7 @@ fn process_packet(
 }
 
 // Validate and classify an inbound datagram, then pass it to the selected tunnel.
+#[allow(clippy::too_many_arguments)]
 fn handle_udp(
     io: &Arc<PacketIo>,
     state: &Arc<RwLock<DeviceState>>,
@@ -147,6 +163,7 @@ fn handle_udp(
     source: SocketAddr,
     datagram: &[u8],
     scratch: &mut [u8],
+    mut access: Option<&mut AccessGuard<'_>>,
 ) -> bool {
     let parsed = match Tunn::parse_packet(datagram) {
         Ok(packet) => packet,
@@ -183,6 +200,12 @@ fn handle_udp(
     let Some((peer, packet_kind)) = peer_and_kind else {
         return false;
     };
+    if access
+        .as_ref()
+        .is_some_and(|a| !a.peer_allowed(&peer.public_key))
+    {
+        return false;
+    }
 
     let (result, flush_endpoint) = {
         let mut runtime = lock(&peer.runtime);
@@ -204,12 +227,28 @@ fn handle_udp(
             }
         }
         TunnResult::WriteToTunnelV4(packet, source_ip) => {
-            if !write_inner_packet(io, state, stats, &peer, packet, IpAddr::V4(source_ip)) {
+            if !write_inner_packet(
+                io,
+                state,
+                stats,
+                &peer,
+                packet,
+                IpAddr::V4(source_ip),
+                access.as_deref_mut(),
+            ) {
                 io_success = false;
             }
         }
         TunnResult::WriteToTunnelV6(packet, source_ip) => {
-            if !write_inner_packet(io, state, stats, &peer, packet, IpAddr::V6(source_ip)) {
+            if !write_inner_packet(
+                io,
+                state,
+                stats,
+                &peer,
+                packet,
+                IpAddr::V6(source_ip),
+                access.as_deref_mut(),
+            ) {
                 io_success = false;
             }
         }
@@ -219,6 +258,12 @@ fn handle_udp(
 
     if let Some(endpoint) = flush_endpoint {
         loop {
+            if access
+                .as_ref()
+                .is_some_and(|a| !a.peer_allowed(&peer.public_key))
+            {
+                break;
+            }
             let queued = {
                 let mut runtime = lock(&peer.runtime);
                 runtime.tunnel.decapsulate(None, &[], scratch)
@@ -230,12 +275,28 @@ fn handle_udp(
                     }
                 }
                 TunnResult::WriteToTunnelV4(packet, source_ip) => {
-                    if !write_inner_packet(io, state, stats, &peer, packet, IpAddr::V4(source_ip)) {
+                    if !write_inner_packet(
+                        io,
+                        state,
+                        stats,
+                        &peer,
+                        packet,
+                        IpAddr::V4(source_ip),
+                        access.as_deref_mut(),
+                    ) {
                         io_success = false;
                     }
                 }
                 TunnResult::WriteToTunnelV6(packet, source_ip) => {
-                    if !write_inner_packet(io, state, stats, &peer, packet, IpAddr::V6(source_ip)) {
+                    if !write_inner_packet(
+                        io,
+                        state,
+                        stats,
+                        &peer,
+                        packet,
+                        IpAddr::V6(source_ip),
+                        access.as_deref_mut(),
+                    ) {
                         io_success = false;
                     }
                 }
@@ -254,8 +315,11 @@ fn write_inner_packet(
     peer: &Arc<Peer>,
     packet: &[u8],
     source_ip: IpAddr,
+    access: Option<&mut AccessGuard<'_>>,
 ) -> bool {
-    if !allowed_source(state, peer, source_ip) {
+    if !allowed_source(state, peer, source_ip)
+        || access.is_some_and(|a| !a.packet_allowed(peer.public_key, true, packet))
+    {
         stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
         return true;
     }
@@ -292,6 +356,7 @@ fn handle_tun(
     state: &Arc<RwLock<DeviceState>>,
     packet: &[u8],
     scratch: &mut [u8],
+    access: Option<&mut AccessGuard<'_>>,
 ) -> bool {
     let Some(destination) = Tunn::dst_address(packet) else {
         return false;
@@ -300,6 +365,9 @@ fn handle_tun(
     let Some(peer) = peer else {
         return false;
     };
+    if access.is_some_and(|a| !a.packet_allowed(peer.public_key, false, packet)) {
+        return false;
+    }
 
     let (endpoint, output) = {
         let mut runtime = lock(&peer.runtime);
@@ -314,15 +382,15 @@ fn handle_tun(
     };
     match output {
         TunnResult::WriteToNetwork(datagram) => {
-            let handshake_is_queued = endpoint.is_none() && is_handshake_initiation(&datagram);
+            let handshake_is_queued = endpoint.is_none() && is_handshake_initiation(datagram);
             if endpoint.is_some() || handshake_is_queued {
                 peer.count_tx(packet.len());
             }
             if let Some(endpoint) = endpoint {
-                if io.send_udp(endpoint, &datagram).is_err() {
+                if io.send_udp(endpoint, datagram).is_err() {
                     return false;
                 }
-            } else if is_handshake_initiation(&datagram) {
+            } else if is_handshake_initiation(datagram) {
                 // BoringTun queued the inner packet while producing the initiation.
             } else {
                 return false;
@@ -350,10 +418,18 @@ fn run_timers(
     rate_limiter: &RateLimiter,
     stats: &DeviceCounters,
     scratch: &mut [u8],
+    access_control: Option<&crate::AccessControl>,
 ) {
     rate_limiter.reset_count();
     let peers = read_lock(state).peers.values().cloned().collect::<Vec<_>>();
     for peer in peers {
+        let access = access_control.map(crate::AccessControl::lock);
+        if access
+            .as_ref()
+            .is_some_and(|a| !a.peer_allowed(&peer.public_key))
+        {
+            continue;
+        }
         let (endpoint, output) = {
             let mut runtime = lock(&peer.runtime);
             let Some(endpoint) = runtime.endpoint else {
@@ -362,12 +438,12 @@ fn run_timers(
             let result = runtime.tunnel.update_timers(scratch);
             (endpoint, result)
         };
-        if let TunnResult::WriteToNetwork(packet) = output {
-            if io.send_udp(endpoint, packet).is_err() {
-                stats.timer_send_errors.fetch_add(1, Ordering::Relaxed);
-                stats.udp_send_errors.fetch_add(1, Ordering::Relaxed);
-                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-            }
+        if let TunnResult::WriteToNetwork(packet) = output
+            && io.send_udp(endpoint, packet).is_err()
+        {
+            stats.timer_send_errors.fetch_add(1, Ordering::Relaxed);
+            stats.udp_send_errors.fetch_add(1, Ordering::Relaxed);
+            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

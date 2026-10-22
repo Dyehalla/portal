@@ -12,6 +12,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 #[derive(Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum ManagementRequest<'a> {
+    Connect {
+        peer_device_id: &'a str,
+    },
     PeerUpsert {
         public_key: &'a str,
         preshared_key: Option<&'a str>,

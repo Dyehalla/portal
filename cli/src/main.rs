@@ -21,6 +21,14 @@ mod cli {
             }
             "peer" => peer_command(&args[1..]),
             "endpoint" => endpoint_command(&args[1..]),
+            "connect" => {
+                let options = parse_options(&args[1..], &[])?;
+                validate_options(&options, &["api", "token-file", "device-id"], &[])?;
+                let command = crate::http_api::ManagementRequest::Connect {
+                    peer_device_id: required(&options, "device-id")?,
+                };
+                print_operation(send_command(&options, &command)?)
+            }
             "stats" | "status" | "health" | "list" | "peer-stats" | "shutdown" => {
                 control_command(command, &args[1..])
             }
@@ -42,6 +50,7 @@ Commands:
   portal endpoint set|clear [--api IP:PORT] [--token-file PATH] --public-key HEX [--endpoint ADDR]
   portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
+  portal connect --device-id ID [--api IP:PORT] [--token-file PATH]
 
 Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
 The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
@@ -71,12 +80,12 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
                 let public_key = parse_key_hex(required(&options, "public-key")?)?;
                 let psk = options
                     .get("preshared-key-file")
-                    .and_then(first)
+                    .and_then(|values| first(values))
                     .map(|path| read_key_file(path).map(Zeroizing::new))
                     .transpose()?;
                 let endpoint = options
                     .get("endpoint")
-                    .and_then(first)
+                    .and_then(|values| first(values))
                     .map(|value| {
                         value
                             .parse::<SocketAddr>()
@@ -85,7 +94,7 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
                     .transpose()?;
                 let keepalive = options
                     .get("keepalive")
-                    .and_then(first)
+                    .and_then(|values| first(values))
                     .map(|value| parse_number(Some(value), 1_u64, "--keepalive"))
                     .transpose()?;
                 if keepalive.is_some_and(|seconds| seconds == 0 || seconds > u16::MAX as u64) {
@@ -203,12 +212,12 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
     ) -> Result<String, String> {
         let address = options
             .get("api")
-            .and_then(first)
+            .and_then(|values| first(values))
             .map(String::as_str)
             .unwrap_or("127.0.0.1:51821");
         let token_file = options
             .get("token-file")
-            .and_then(first)
+            .and_then(|values| first(values))
             .map(String::as_str)
             .unwrap_or("/run/portal.token");
         let mut request = serde_json::to_string(command)
@@ -279,12 +288,12 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
     ) -> Result<&'a str, String> {
         options
             .get(name)
-            .and_then(first)
+            .and_then(|values| first(values))
             .map(String::as_str)
             .ok_or_else(|| format!("missing required option --{name}"))
     }
 
-    fn first(values: &Vec<String>) -> Option<&String> {
+    fn first(values: &[String]) -> Option<&String> {
         values.first()
     }
 

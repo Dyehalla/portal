@@ -6,12 +6,15 @@
 
 Проект сейчас содержит только сетевую основу: WireGuard, TUN, маршруты и
 локальный API управления, а также отдельный HTTPS-координатор. Прикладные сервисы
-удалены. Подключение агента к координатору, P2P discovery, реле, exit nodes и ACL
-на пути пакетов ещё предстоит реализовать.
+удалены. Runtime подключён к HTTPS-координатору: регистрация, карты сети,
+локальные TCP-разрешения, сроки действия и P2P-согласование. P2P discovery,
+hole punching, реле и exit nodes ещё предстоит реализовать.
+Запуск агента: [управляемый runtime](docs/RUNTIME.md).
 Последовательность работ: [план сетевой составляющей](docs/NETWORK_PLAN.md).
 
-В workspace четыре части: `wireguard/` — библиотека `Device`, `runtime/` — сетевой
+В workspace пять частей: `wireguard/` — библиотека `Device`, `runtime/` — сетевой
 агент и операции Linux, `cli/` — диагностический клиент локального API,
+`net/` — общие модели, HTTPS-клиент и компиляция политик;
 `coordinator/` — HTTPS API регистрации, политик, карт сети и согласования P2P
 с long polling.
 Жизненный цикл агента находится в `runtime/src/runtime.rs`.
@@ -150,7 +153,7 @@ sudo target/release/portal shutdown --api 127.0.0.1:51821 --token-file /run/port
 API v1 принимает `POST /api/v1/command` с JSON-телом `{"operation":"status"}` и
 заголовком `Authorization: Bearer <token>`. Доступны операции `peer_upsert`,
 `peer_remove`, `endpoint_set`, `endpoint_clear`, `status`, `health`, `stats`,
-`peer_stats`, `list` и `shutdown`. Например, веб-клиент может отправить ту же
+`peer_stats`, `list`, `connect` и `shutdown`. Например, веб-клиент может отправить ту же
 команду через `fetch` с bearer-токеном:
 
 ```js

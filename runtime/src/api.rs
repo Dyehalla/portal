@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use tokio::task::JoinHandle;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
@@ -20,6 +20,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct ApiState {
+    agent: Option<Arc<crate::managed::Agent>>,
     runtime: Arc<Mutex<Runtime>>,
     token: Arc<Zeroizing<String>>,
     listen_address: SocketAddr,
@@ -29,6 +30,9 @@ struct ApiState {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum ManagementRequest {
+    Connect {
+        peer_device_id: String,
+    },
     PeerUpsert {
         public_key: String,
         #[serde(default)]
@@ -92,6 +96,7 @@ impl LocalApi {
         address: SocketAddr,
         token_file: PathBuf,
         runtime: Arc<Mutex<Runtime>>,
+        agent: Option<Arc<crate::managed::Agent>>,
     ) -> Result<Self, String> {
         if !address.ip().is_loopback() {
             return Err("--api-listen must use a loopback address".into());
@@ -116,41 +121,28 @@ impl LocalApi {
         let token = crate::platform::linux::api_token::create(&token_file)?;
 
         let state = ApiState {
+            agent,
             runtime,
             token: Arc::new(Zeroizing::new(token)),
             listen_address: address,
         };
         let (shutdown, shutdown_receiver) = oneshot::channel();
-        let task = match thread::Builder::new()
-            .name("portal-local-api".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("could not create local API runtime: {error}"))?;
-                runtime.block_on(async move {
-                    let listener = TcpListener::from_std(listener)
-                        .map_err(|error| format!("could not start local API listener: {error}"))?;
-                    let app = Router::new()
-                        .route("/api/v1/command", post(handle_command))
-                        .with_state(state);
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async {
-                        let _ = shutdown_receiver.await;
-                    })
-                    .await
-                    .map_err(|error| format!("local API server failed: {error}"))
-                })
-            }) {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = crate::platform::linux::api_token::remove(&token_file);
-                return Err(format!("could not start local API thread: {error}"));
-            }
-        };
+        let task = tokio::spawn(async move {
+            let listener = TcpListener::from_std(listener)
+                .map_err(|error| format!("could not start local API listener: {error}"))?;
+            let app = Router::new()
+                .route("/api/v1/command", post(handle_command))
+                .with_state(state);
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+            .map_err(|error| format!("local API server failed: {error}"))
+        });
 
         Ok(Self {
             shutdown: Some(shutdown),
@@ -170,14 +162,14 @@ impl LocalApi {
         self.task.is_finished()
     }
 
-    /// Stop the HTTP server, join its thread, and remove the bearer token file.
-    pub(crate) fn stop(mut self) -> Result<(), String> {
+    /// Stop the HTTP server, await its task, and remove the bearer token file.
+    pub(crate) async fn stop(mut self) -> Result<(), String> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let task_result = match self.task.join() {
+        let task_result = match self.task.await {
             Ok(result) => result,
-            Err(_) => Err("local API thread panicked".to_owned()),
+            Err(_) => Err("local API task failed".to_owned()),
         };
         let token_result = crate::platform::linux::api_token::remove(&self.token_file);
         task_result.and(token_result)
@@ -232,6 +224,19 @@ async fn handle_command(
             &format!("invalid JSON request: {error}"),
         )
     })?;
+    if let ManagementRequest::Connect { peer_device_id } = request {
+        let agent = state.agent.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "P2P signaling requires managed mode",
+            )
+        })?;
+        return agent
+            .connect(peer_device_id)
+            .await
+            .map(|message| Json(CommandResponse { message }))
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e));
+    }
     let mut runtime = state.runtime.lock().map_err(|_| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

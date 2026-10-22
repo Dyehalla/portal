@@ -80,7 +80,7 @@ impl HostPlatform for LinuxPlatform {
             family.into(),
             "addr".into(),
             "add".into(),
-            address.into(),
+            address,
             "dev".into(),
             name.into(),
         ])
@@ -122,16 +122,16 @@ impl HostPlatform for LinuxPlatform {
                 errors.push(error);
             }
         }
-        if link_up {
-            if let Err(error) = ip_checked(&[
+        if link_up
+            && let Err(error) = ip_checked(&[
                 "link".into(),
                 "set".into(),
                 "dev".into(),
                 name.into(),
                 "down".into(),
-            ]) {
-                errors.push(error);
-            }
+            ])
+        {
+            errors.push(error);
         }
         if errors.is_empty() {
             Ok(())

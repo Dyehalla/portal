@@ -1,5 +1,5 @@
 [workspace]
-members = ["wireguard", "runtime", "cli", "coordinator"]
+members = ["wireguard", "net", "runtime", "cli", "coordinator"]
 resolver = "3"
 
 [patch.crates-io]

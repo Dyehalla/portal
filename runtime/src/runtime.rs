@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::LocalApi;
 use crate::api::ManagementRequest;
+use crate::managed::{Agent, ManagedState, Prepared};
 use crate::platform::{HostPlatform, LinuxPlatform};
 use crate::{InterfaceAddress, RuntimeConfig, SecretKey};
-use portal::{AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
+use portal::{AccessControl, AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
+use portal_net::{
+    model::{NetworkMap, Permissions},
+    policy,
+};
 use zeroize::Zeroize;
 
 const LOOP_INTERVAL: Duration = Duration::from_millis(100);
@@ -21,6 +25,9 @@ struct PeerRecord {
 }
 
 pub(crate) struct Runtime {
+    pub(crate) managed: Option<ManagedState>,
+    access_control: Option<Arc<AccessControl>>,
+    pub(crate) dual_stack: bool,
     device: Option<Device>,
     tun_name: String,
     addresses: Vec<InterfaceAddress>,
@@ -28,15 +35,48 @@ pub(crate) struct Runtime {
     auto_routes: bool,
     peers: HashMap<PeerKey, PeerRecord>,
     routes: HashMap<AllowedIp, bool>,
-    shutdown_requested: bool,
+    pub(crate) shutdown_requested: bool,
     platform: Arc<dyn HostPlatform>,
 }
 
 /// Create the WireGuard device, configure its host interface, serve the local API, and clean up.
-pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
+pub(crate) fn run_device(options: RuntimeConfig) -> Result<(), String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(run_device_async(options))
+}
+
+async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
     let platform: Arc<dyn HostPlatform> = Arc::new(LinuxPlatform);
     platform.install_signal_handlers();
     platform.ensure_interface_absent(&options.tun_name)?;
+
+    let prepared = if let Some(config) = options.coordinator.take() {
+        let key = boringtun::x25519::PublicKey::from(&boringtun::x25519::StaticSecret::from(
+            options.private_key.0,
+        ))
+        .to_bytes();
+        Some(Prepared::load(config, key).await?)
+    } else {
+        None
+    };
+    if let Some(prepared) = &prepared {
+        options.addresses = vec![
+            InterfaceAddress {
+                address: prepared.map.device.ipv4.into(),
+                prefix_len: 32,
+            },
+            InterfaceAddress {
+                address: prepared.map.device.ipv6.into(),
+                prefix_len: 128,
+            },
+        ];
+    }
+    let access_control = prepared
+        .as_ref()
+        .map(|_| Arc::new(AccessControl::default()));
 
     let mut device_config = DeviceConfig::new(
         options.private_key.0,
@@ -44,6 +84,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
         options.tun_name.clone(),
     );
     device_config.dual_stack = options.dual_stack;
+    device_config.access_control = access_control.clone();
     if let Some(workers) = options.workers {
         device_config.workers = workers;
     }
@@ -78,6 +119,9 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
 
     let tun_name = options.tun_name.clone();
     let runtime = Runtime {
+        managed: None,
+        access_control: access_control.clone(),
+        dual_stack: options.dual_stack,
         device: Some(device),
         tun_name: options.tun_name,
         addresses: configured_addresses,
@@ -101,10 +145,28 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             .public_key(),
     );
     let runtime = Arc::new(Mutex::new(runtime));
+    let agent = if let Some(prepared) = prepared {
+        match Agent::attach(
+            prepared,
+            runtime.clone(),
+            access_control.clone().expect("managed access control"),
+        ) {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                if let Ok(mut runtime) = runtime.lock() {
+                    let _ = runtime.cleanup();
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let api = match LocalApi::start(
         options.api_listen,
         options.api_token_file.clone(),
         Arc::clone(&runtime),
+        agent.clone(),
     ) {
         Ok(api) => api,
         Err(error) => {
@@ -118,6 +180,7 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             };
         }
     };
+    let mut agent_task = agent.map(|agent| tokio::spawn(agent.run()));
 
     println!(
         "READY tun={} listen={} public_key={} api={} token_file={}",
@@ -155,10 +218,26 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
             serve_result = Err("local HTTP API exited unexpectedly".into());
             break;
         }
-        thread::sleep(LOOP_INTERVAL);
+        if agent_task.as_ref().is_some_and(|t| t.is_finished()) {
+            let task = agent_task.take().expect("agent task present");
+            serve_result = task
+                .await
+                .map_err(|e| format!("network agent failed: {e}"))
+                .and_then(|r| r)
+                .and(Err("network agent exited unexpectedly".into()));
+            break;
+        }
+        tokio::time::sleep(LOOP_INTERVAL).await;
     }
 
-    let api_result = api.stop();
+    if let Some(access) = &access_control {
+        access.block();
+    }
+    if let Some(task) = agent_task {
+        task.abort();
+        let _ = task.await;
+    }
+    let api_result = api.stop().await;
     if serve_result.is_ok() {
         serve_result = api_result;
     }
@@ -172,11 +251,141 @@ pub(crate) fn run_device(mut options: RuntimeConfig) -> Result<(), String> {
 }
 
 impl Runtime {
+    pub(crate) fn apply_managed_map(
+        &mut self,
+        map: NetworkMap,
+        local: Permissions,
+        deadline: Instant,
+        cache_file: &std::path::Path,
+    ) -> Result<(), String> {
+        let key = self.device.as_ref().expect("running device").public_key();
+        // Concurrent immediate refreshes can finish before the older long poll.
+        if let Some(old) = &self.managed
+            && map.network_id == old.map.network_id
+            && map.generation == old.map.generation
+            && (map.revision < old.map.revision || map.generated_at < old.map.generated_at)
+        {
+            return Ok(());
+        }
+        let rules = match policy::compile(&map, &local, key, self.managed.as_ref().map(|s| &s.map))
+        {
+            Ok(rules) => rules,
+            Err(e) => {
+                if let Some(access) = &self.access_control {
+                    access.block();
+                }
+                self.shutdown_requested = true;
+                return Err(e);
+            }
+        };
+        let access = self
+            .access_control
+            .clone()
+            .ok_or("managed access control unavailable")?;
+        let result = access.update(rules, deadline, |changed| {
+            if changed {
+                // Holding the worker gate drains in-flight operations. Discard pending
+                // plaintext before enabling new grants, preserving authenticated sessions.
+                for key in self.peers.keys().copied().collect::<Vec<_>>() {
+                    let device = self.device.as_ref().expect("running device");
+                    device.discard_peer_queue(&key).map_err(|e| e.to_string())?;
+                    if !map
+                        .peers
+                        .iter()
+                        .any(|peer| policy::public_key(&peer.device.public_key).ok() == Some(key))
+                    {
+                        device.remove_peer(&key).map_err(|e| e.to_string())?;
+                        self.peers.remove(&key);
+                    }
+                }
+            }
+            for peer in &map.peers {
+                let key = policy::public_key(&peer.device.public_key)?;
+                let endpoint_changed = self
+                    .managed
+                    .as_ref()
+                    .and_then(|s| s.map.peers.iter().find(|p| p.device.id == peer.device.id))
+                    .is_none_or(|p| p.device.endpoints != peer.device.endpoints);
+                let endpoint = endpoint_changed
+                    .then(|| {
+                        peer.device
+                            .endpoints
+                            .iter()
+                            .copied()
+                            .find(|e| self.endpoint_supported(*e))
+                    })
+                    .flatten();
+                self.upsert_peer(
+                    key,
+                    None,
+                    endpoint,
+                    Some(Duration::from_secs(25)),
+                    vec![
+                        AllowedIp::new(peer.device.ipv4.into(), 32).map_err(|e| e.to_string())?,
+                        AllowedIp::new(peer.device.ipv6.into(), 128).map_err(|e| e.to_string())?,
+                    ],
+                )?;
+                if endpoint_changed && endpoint.is_none() {
+                    self.clear_endpoint(key)?;
+                }
+            }
+            let desired = self.desired_routes(&self.peers);
+            let errors = self.remove_stale_routes(&desired);
+            if !errors.is_empty() {
+                return Err(errors.join("; "));
+            }
+            let bytes = serde_json::to_vec(&map).map_err(|e| e.to_string())?;
+            crate::private_file::write(cache_file, &bytes, false)?;
+            Ok(())
+        });
+        if result.is_err() {
+            self.shutdown_requested = true;
+        }
+        result?;
+        self.managed = Some(ManagedState {
+            map,
+            local,
+            deadline,
+            connected: true,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn set_managed_endpoint(
+        &mut self,
+        key: PeerKey,
+        endpoint: SocketAddr,
+    ) -> Result<(), String> {
+        self.set_endpoint(key, endpoint).map(|_| ())
+    }
+
+    pub(crate) fn endpoint_supported(&self, endpoint: SocketAddr) -> bool {
+        self.dual_stack
+            || endpoint.is_ipv4()
+                == self
+                    .device
+                    .as_ref()
+                    .expect("running device")
+                    .listen_addr()
+                    .is_ipv4()
+    }
+
     /// Dispatch one authenticated JSON API operation to its Device or host-network operation.
     pub(crate) fn handle_api_request(
         &mut self,
         request: ManagementRequest,
     ) -> Result<String, String> {
+        if self.access_control.is_some()
+            && matches!(
+                &request,
+                ManagementRequest::PeerUpsert { .. }
+                    | ManagementRequest::PeerRemove { .. }
+                    | ManagementRequest::EndpointSet { .. }
+                    | ManagementRequest::EndpointClear { .. }
+            )
+        {
+            return Err("managed peers and endpoints are controlled by the coordinator; edit the local policy file to change access".into());
+        }
         match request {
             ManagementRequest::PeerUpsert {
                 public_key,
@@ -259,11 +468,12 @@ impl Runtime {
                 let device = self.device.as_ref().expect("running device");
                 device.health().map_err(|error| error.to_string())?;
                 Ok(format!(
-                    "tun={} listen={} public_key={} peers={}",
+                    "tun={} listen={} public_key={} peers={} {}",
                     self.tun_name,
                     device.listen_addr(),
                     encode_hex(&device.public_key()),
-                    self.peers.len()
+                    self.peers.len(),
+                    self.managed.as_ref().map(|s| format!("mode=managed device={} network={} generation={} revision={} policy_revision={} policy_pending={} coordinator_connected={} lease_active={} lease_remaining_seconds={}", s.map.device.id, s.map.network_id, s.map.generation, s.map.revision, s.map.policy.revision, s.map.policy.permissions != s.local, s.connected, s.deadline > Instant::now(), s.deadline.saturating_duration_since(Instant::now()).as_secs())).unwrap_or_else(|| "mode=manual".into())
                 ))
             }
             ManagementRequest::List => {
@@ -303,6 +513,9 @@ impl Runtime {
             ManagementRequest::Shutdown => {
                 self.shutdown_requested = true;
                 Ok("shutdown requested".into())
+            }
+            ManagementRequest::Connect { .. } => {
+                Err("P2P requests require the asynchronous agent handler".into())
             }
         }
     }
@@ -485,11 +698,9 @@ impl Runtime {
         let mut errors = Vec::new();
         for route in stale {
             let owned = self.routes.get(&route).copied().unwrap_or(false);
-            if owned {
-                if let Err(error) = self.platform.delete_host_route(&self.tun_name, route) {
-                    errors.push(error);
-                    continue;
-                }
+            if owned && let Err(error) = self.platform.delete_host_route(&self.tun_name, route) {
+                errors.push(error);
+                continue;
             }
             self.routes.remove(&route);
         }
@@ -507,10 +718,10 @@ impl Runtime {
         {
             errors.push(error);
         }
-        if let Some(mut device) = self.device.take() {
-            if let Err(error) = device.shutdown() {
-                errors.push(format!("device shutdown failed: {error}"));
-            }
+        if let Some(mut device) = self.device.take()
+            && let Err(error) = device.shutdown()
+        {
+            errors.push(format!("device shutdown failed: {error}"));
         }
         if errors.is_empty() {
             Ok(())

@@ -20,3 +20,7 @@ bounded transmit-queue saturation to the embedding device:
   queue is full, so the embedding device can account for the rejected packet.
 
 No WireGuard cryptography or handshake implementation was added to `portal`.
+
+`Tunn::discard_queued_packets` removes plaintext awaiting a handshake when ACLs
+change, preserving established WireGuard sessions. Portal calls it while holding
+the packet-processing gate, before enabling new permissions.

@@ -30,6 +30,8 @@ pub(crate) const TIMER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Runtime configuration for one WireGuard interface.
 pub struct DeviceConfig {
+    /// Optional TCP policy gate; absent for ordinary manually configured WireGuard.
+    pub access_control: Option<Arc<crate::AccessControl>>,
     /// The device's WireGuard private key.
     pub private_key: PeerKey,
     /// Primary UDP address to bind. Port zero lets the OS select a port.
@@ -49,6 +51,7 @@ impl DeviceConfig {
     /// Construct a configuration using the available parallelism as its worker count.
     pub fn new(private_key: PeerKey, listen: SocketAddr, tun_name: impl Into<String>) -> Self {
         Self {
+            access_control: None,
             private_key,
             listen,
             dual_stack: true,
@@ -223,6 +226,7 @@ impl Device {
 
         for (worker_id, worker_io) in worker_ios.into_iter().enumerate() {
             let context = WorkerContext {
+                access_control: config.access_control.clone(),
                 worker_id,
                 io: Arc::clone(&io),
                 worker_io,
@@ -435,6 +439,14 @@ impl Device {
         Ok(())
     }
 
+    /// Discard pending plaintext without replacing the peer's cryptographic session.
+    pub fn discard_peer_queue(&self, public_key: &PeerKey) -> Result<usize, DeviceError> {
+        let peer = self.peer(public_key)?;
+        let mut runtime = lock(&peer.runtime);
+        runtime.pending_handshake = false;
+        Ok(runtime.tunnel.discard_queued_packets())
+    }
+
     /// Clear a peer's current UDP endpoint.
     pub fn clear_peer_endpoint(&self, public_key: &PeerKey) -> Result<(), DeviceError> {
         self.ensure_running()?;
@@ -468,10 +480,10 @@ impl Device {
 
     /// Wake and join all packet workers. Repeated calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), DeviceError> {
-        if !self.stopping.swap(true, Ordering::AcqRel) {
-            if let Some(io) = self.io.as_ref() {
-                io.wake_all();
-            }
+        if !self.stopping.swap(true, Ordering::AcqRel)
+            && let Some(io) = self.io.as_ref()
+        {
+            io.wake_all();
         }
         let mut first_error = None;
         for thread in self.workers.drain(..) {

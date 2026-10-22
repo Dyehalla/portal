@@ -4,7 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use portal_runtime::{InterfaceAddress, RuntimeConfig, SecretKey};
+use portal_runtime::{FileConfig, InterfaceAddress, RuntimeConfig, SecretKey};
 use zeroize::Zeroize;
 
 // Run the selected command and report failures using a nonzero process exit code.
@@ -29,6 +29,7 @@ fn entry() -> Result<(), String> {
         }
         "run" => run_command(&args[1..]),
         "keygen" => keygen_command(&args[1..]),
+        "enroll" => enroll_command(&args[1..]),
         other => Err(format!(
             "unknown command `{other}`; use `portal-runtime help`"
         )),
@@ -44,6 +45,8 @@ portal-runtime — Linux WireGuard runtime with a local HTTP management API
 Commands:
   portal-runtime run --tun NAME --private-key-file PATH --listen ADDR [options]
   portal-runtime keygen --private-key-file PATH
+  portal-runtime enroll --config PATH --user-token-file PATH
+  portal-runtime run --config PATH
 
 Run options:
   --api-listen IP:PORT      Loopback management API (default: 127.0.0.1:51821)
@@ -62,6 +65,17 @@ The runtime stays in the foreground. Use the separate `portal` CLI to manage it.
 // Validate runtime options, build the device configuration, and start the foreground service.
 fn run_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args, &["no-dual-stack", "no-auto-routes"])?;
+    if options.contains_key("config") {
+        validate_options(&options, &["config"], &[])?;
+        let config = FileConfig::load(std::path::Path::new(required(&options, "config")?))?;
+        let key = SecretKey(read_key_file(
+            config
+                .private_key_file
+                .to_str()
+                .ok_or("private key path must be UTF-8")?,
+        )?);
+        return portal_runtime::run(config.into_runtime(key));
+    }
     validate_options(
         &options,
         &[
@@ -91,7 +105,11 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .flatten()
         .map(|value| InterfaceAddress::parse(value))
         .collect::<Result<Vec<_>, _>>()?;
-    let mtu = parse_number(options.get("mtu").and_then(first), 1420_u32, "--mtu")?;
+    let mtu = parse_number(
+        options.get("mtu").and_then(|values| first(values)),
+        1420_u32,
+        "--mtu",
+    )?;
     if !(576..=65_535).contains(&mtu) {
         return Err("--mtu must be between 576 and 65535".into());
     }
@@ -101,17 +119,17 @@ fn run_command(args: &[String]) -> Result<(), String> {
 
     let workers = options
         .get("workers")
-        .and_then(first)
+        .and_then(|values| first(values))
         .map(|value| parse_number(Some(value), 1_usize, "--workers"))
         .transpose()?;
     let handshake_rate_limit = options
         .get("handshake-rate-limit")
-        .and_then(first)
+        .and_then(|values| first(values))
         .map(|value| parse_number(Some(value), 1_u64, "--handshake-rate-limit"))
         .transpose()?;
     let api_listen = options
         .get("api-listen")
-        .and_then(first)
+        .and_then(|values| first(values))
         .map(|value| {
             value
                 .parse::<SocketAddr>()
@@ -124,10 +142,11 @@ fn run_command(args: &[String]) -> Result<(), String> {
     }
     let api_token_file = options
         .get("api-token-file")
-        .and_then(first)
+        .and_then(|values| first(values))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/portal.token"));
     portal_runtime::run(RuntimeConfig {
+        coordinator: None,
         tun_name: tun_name.to_owned(),
         private_key,
         listen,
@@ -140,6 +159,27 @@ fn run_command(args: &[String]) -> Result<(), String> {
         api_listen,
         api_token_file,
     })
+}
+
+fn enroll_command(args: &[String]) -> Result<(), String> {
+    let options = parse_options(args, &[])?;
+    validate_options(&options, &["config", "user-token-file"], &[])?;
+    let config = FileConfig::load(std::path::Path::new(required(&options, "config")?))?;
+    let key = SecretKey(read_key_file(
+        config
+            .private_key_file
+            .to_str()
+            .ok_or("private key path must be UTF-8")?,
+    )?);
+    println!(
+        "{}",
+        portal_runtime::enroll(
+            config.coordinator,
+            key,
+            std::path::Path::new(required(&options, "user-token-file")?)
+        )?
+    );
+    Ok(())
 }
 
 // Create a protected private-key file and print the corresponding public key.
@@ -212,13 +252,13 @@ fn validate_options(
 fn required<'a>(options: &'a HashMap<String, Vec<String>>, name: &str) -> Result<&'a str, String> {
     options
         .get(name)
-        .and_then(first)
+        .and_then(|values| first(values))
         .map(String::as_str)
         .ok_or_else(|| format!("missing required option --{name}"))
 }
 
 // Return the first parsed value for an option, if present.
-fn first(values: &Vec<String>) -> Option<&String> {
+fn first(values: &[String]) -> Option<&String> {
     values.first()
 }
 
