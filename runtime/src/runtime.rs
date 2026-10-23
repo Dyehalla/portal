@@ -251,6 +251,103 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
 }
 
 impl Runtime {
+    pub(crate) fn snapshot(&self) -> Result<crate::snapshot::Snapshot, String> {
+        use crate::snapshot;
+        let device = self.device.as_ref().ok_or("runtime has stopped")?;
+        let stats = device.stats();
+        let remotes = self.managed.as_ref().map(|state| {
+            state
+                .map
+                .peers
+                .iter()
+                .map(|p| (p.device.public_key.as_str(), p))
+                .collect::<HashMap<_, _>>()
+        });
+        let mut peers = self
+            .peers
+            .iter()
+            .map(|(key, peer)| {
+                let public_key = encode_hex(key);
+                let remote = remotes
+                    .as_ref()
+                    .and_then(|peers| peers.get(public_key.as_str()).copied());
+                let incoming_tcp = self.managed.as_ref().map(|state| {
+                    let local = state.local.get(&public_key);
+                    remote
+                        .map(|p| {
+                            p.incoming
+                                .tcp
+                                .iter()
+                                .copied()
+                                .filter(|port| local.is_some_and(|rule| rule.tcp.contains(port)))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+                snapshot::Peer {
+                    public_key,
+                    device_id: remote.map(|p| p.device.id.clone()),
+                    name: remote.map(|p| p.device.name.clone()),
+                    endpoint: peer.endpoint,
+                    allowed_ips: peer.allowed_ips.iter().map(ToString::to_string).collect(),
+                    keepalive_seconds: peer.keepalive.map(|v| v.as_secs()),
+                    incoming_tcp,
+                    outgoing_tcp: self
+                        .managed
+                        .as_ref()
+                        .map(|_| remote.map(|p| p.outgoing.tcp.clone()).unwrap_or_default()),
+                    traffic: device.peer_stats(key).ok().map(|stats| snapshot::Traffic {
+                        tx_packets: stats.tx_packets,
+                        tx_bytes: stats.tx_bytes,
+                        rx_packets: stats.rx_packets,
+                        rx_bytes: stats.rx_bytes,
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.public_key.cmp(&b.public_key))
+        });
+        Ok(snapshot::Snapshot {
+            mode: if self.managed.is_some() {
+                "managed"
+            } else {
+                "manual"
+            },
+            healthy: device.health().is_ok(),
+            interface: snapshot::Interface {
+                name: self.tun_name.clone(),
+                listen: device.listen_addr(),
+                public_key: encode_hex(&device.public_key()),
+                addresses: self.addresses.iter().map(ToString::to_string).collect(),
+            },
+            network: self.managed.as_ref().map(|state| snapshot::Network {
+                device_id: state.map.device.id.clone(),
+                device_name: state.map.device.name.clone(),
+                network_id: state.map.network_id.clone(),
+                revision: state.map.revision,
+                policy_revision: state.map.policy.revision,
+                policy_pending: state.map.policy.permissions != state.local,
+                coordinator_connected: state.connected,
+                lease_active: state.deadline > Instant::now(),
+                lease_remaining_seconds: state
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs(),
+            }),
+            peers,
+            stats: snapshot::Stats {
+                received_udp_packets: stats.received_udp_packets,
+                received_tun_packets: stats.received_tun_packets,
+                dropped_packets: stats.dropped_packets,
+                timer_send_errors: stats.timer_send_errors,
+                udp_send_errors: stats.udp_send_errors,
+            },
+        })
+    }
+
     pub(crate) fn apply_managed_map(
         &mut self,
         map: NetworkMap,

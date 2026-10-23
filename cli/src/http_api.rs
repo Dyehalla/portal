@@ -60,25 +60,8 @@ pub(crate) fn send(
 
 /// Connect to the local API, send a bounded JSON request, and decode its response.
 fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, String> {
-    let address = address
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("invalid --api address: {error}"))?;
-    if !address.ip().is_loopback() {
-        return Err("--api must use a loopback address".into());
-    }
-
-    let mut token_bytes = fs::read(token_file)
-        .map_err(|error| format!("could not read API token file {token_file}: {error}"))?;
-    let token_text = String::from_utf8_lossy(&token_bytes);
-    let token_text = token_text.trim();
-    if token_text.len() != 64 || !token_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        token_bytes.zeroize();
-        return Err(format!(
-            "API token file {token_file} must contain a 64-character hex token"
-        ));
-    }
-    let token = Zeroizing::new(token_text.to_owned());
-    token_bytes.zeroize();
+    let address = parse_address(address)?;
+    let token = read_token(token_file)?;
 
     let mut body = command.as_bytes().to_vec();
     let result = (|| {
@@ -115,6 +98,43 @@ fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, 
     })();
     body.zeroize();
     result
+}
+
+/// Build a login link whose fragment is consumed locally by the web panel.
+pub(crate) fn web_url(address: &str, token_file: &str) -> Result<Zeroizing<String>, String> {
+    let address = parse_address(address)?;
+    let token = read_token(token_file)?;
+    Ok(Zeroizing::new(format!(
+        "http://{address}/#token={}",
+        token.as_str()
+    )))
+}
+
+fn parse_address(address: &str) -> Result<SocketAddr, String> {
+    let address = address
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid --api address: {error}"))?;
+    if !address.ip().is_loopback() {
+        return Err("--api must use a loopback address".into());
+    }
+    Ok(address)
+}
+
+fn read_token(token_file: &str) -> Result<Zeroizing<String>, String> {
+    let mut token_bytes = fs::read(token_file)
+        .map_err(|error| format!("could not read API token file {token_file}: {error}"))?;
+    let token_text = String::from_utf8_lossy(&token_bytes);
+    let token_text = token_text.trim();
+    if token_text.len() != 64 || !token_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        token_bytes.zeroize();
+        return Err(format!(
+            "API token file {token_file} must contain a 64-character hex token"
+        ));
+    }
+    let token = Zeroizing::new(token_text.to_owned());
+    token_bytes.zeroize();
+
+    Ok(token)
 }
 
 /// Parse an HTTP response and return its JSON message or the server's error.

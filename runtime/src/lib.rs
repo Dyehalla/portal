@@ -8,8 +8,10 @@ mod platform;
 mod private_file;
 #[cfg(target_os = "linux")]
 mod runtime;
+#[cfg(target_os = "linux")]
+mod snapshot;
 
-pub use config::{FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey};
+pub use config::{FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey, defaults};
 
 #[cfg(target_os = "linux")]
 /// Enroll a device over verified HTTPS and persist its private device credentials.

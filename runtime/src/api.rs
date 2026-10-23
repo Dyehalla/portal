@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -130,8 +132,21 @@ impl LocalApi {
         let task = tokio::spawn(async move {
             let listener = TcpListener::from_std(listener)
                 .map_err(|error| format!("could not start local API listener: {error}"))?;
-            let app = Router::new()
+            println!(
+                "web panel: http://{address}/#token={}",
+                state.token.as_str()
+            );
+            let api = Router::new()
                 .route("/api/v1/command", post(handle_command))
+                .route("/api/v1/snapshot", get(handle_snapshot))
+                .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
+            let app = Router::new()
+                .route("/", get(index))
+                .route("/app.js", get(javascript))
+                .route("/style.css", get(stylesheet))
+                .merge(api)
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+                .layer(middleware::from_fn_with_state(state.clone(), local_request))
                 .with_state(state);
             axum::serve(
                 listener,
@@ -179,7 +194,6 @@ impl LocalApi {
 /// Authenticate a loopback request, dispatch its command, and return a JSON result.
 async fn handle_command(
     State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<CommandResponse>, (StatusCode, Json<CommandResponse>)> {
@@ -187,18 +201,6 @@ async fn handle_command(
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request is too large",
-        ));
-    }
-    if !remote.ip().is_loopback() || !valid_host(&headers, state.listen_address) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "request must target the local API",
-        ));
-    }
-    if !valid_origin(&headers, state.listen_address) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "request origin is not allowed",
         ));
     }
     if headers
@@ -211,13 +213,6 @@ async fn handle_command(
             "Content-Type must be application/json",
         ));
     }
-    if !valid_token(&headers, state.token.as_str()) {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid API bearer token",
-        ));
-    }
-
     let request: ManagementRequest = serde_json::from_slice(&body).map_err(|error| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -247,6 +242,77 @@ async fn handle_command(
     result
         .map(|message| Json(CommandResponse { message }))
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+}
+
+async fn handle_snapshot(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::snapshot::Snapshot>, (StatusCode, Json<CommandResponse>)> {
+    let runtime = state.runtime.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state is unavailable",
+        )
+    })?;
+    runtime
+        .snapshot()
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, &e))
+}
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../web/index.html"))
+}
+
+async fn javascript() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/app.js"),
+    )
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/style.css"),
+    )
+}
+
+/// Assets are public; every endpoint containing device data requires the API token.
+async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if !valid_token(request.headers(), state.token.as_str()) {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid API bearer token").into_response();
+    }
+    next.run(request).await
+}
+
+async fn local_request(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let mut response = if !remote.ip().is_loopback() || !valid_host(headers, state.listen_address) {
+        api_error(StatusCode::FORBIDDEN, "request must target the local API").into_response()
+    } else if !valid_origin(headers, state.listen_address) {
+        api_error(StatusCode::FORBIDDEN, "request origin is not allowed").into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        (
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    ] {
+        headers.insert(name, value.parse().expect("constant response header"));
+    }
+    response
 }
 
 /// Build a JSON error response with the matching HTTP status.
@@ -289,6 +355,9 @@ fn allowed_authority(authority: &str, port: u16) -> bool {
 
 /// Compare the supplied bearer token without data-dependent early exit.
 fn valid_token(headers: &HeaderMap, expected: &str) -> bool {
+    if headers.get_all(AUTHORIZATION).iter().count() != 1 {
+        return false;
+    }
     let Some(supplied) = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

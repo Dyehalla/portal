@@ -84,6 +84,35 @@ def denied(address, port=8080, connection=None):
     return False
 
 
+def web_probe(config):
+    code = """import json,pathlib,sys,urllib.request,urllib.error
+base='http://127.0.0.1:51821'
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+token=pathlib.Path(sys.argv[1]).read_text().strip()
+def request(path,headers={}):
+ return opener.open(urllib.request.Request(base+path,headers=headers),timeout=5)
+page=request('/')
+assert page.status==200 and 'Portal' in page.read().decode()
+assert page.headers['Cache-Control']=='no-store'
+assert "frame-ancestors 'none'" in page.headers['Content-Security-Policy']
+assert request('/app.js').headers['Content-Type'].startswith('text/javascript')
+assert request('/style.css').headers['Content-Type'].startswith('text/css')
+for headers,status in [({},401),({'Authorization':'Bearer '+token,'Origin':'http://untrusted.example'},403),({'Authorization':'Bearer '+token,'Host':'untrusted.example:51821'},403)]:
+ try:request('/api/v1/snapshot',headers)
+ except urllib.error.HTTPError as error:assert error.code==status
+ else:raise AssertionError('unprotected snapshot')
+response=request('/api/v1/snapshot',{'Authorization':'Bearer '+token})
+raw=response.read().decode()
+assert token not in raw and 'access_token' not in raw and 'credential_file' not in raw and 'private_key' not in raw
+data=json.loads(raw)
+assert data['healthy'] and data['mode']=='managed' and data['network']['lease_active']
+assert len(data['peers'])==1 and data['peers'][0]['device_id']
+assert data['peers'][0]['incoming_tcp']==[8080] or data['peers'][0]['outgoing_tcp']==[8080]
+print(json.dumps(data['network']['device_id']))
+"""
+    return json.loads(run("python3", "-c", code, config["api_token_file"], prefix=config.get("_namespace", ())))
+
+
 def main(directory):
     assert os.geteuid() == 0, "run using unshare --user --map-root-user --net"
     assert Path("/proc/self/uid_map").read_text().split()[2] == "1", "use an isolated user namespace"
@@ -131,6 +160,9 @@ def main(directory):
     for name, config in zip(("a", "b"), configs):
         agents.append(spawn("agent-" + name, [BIN / "portal-runtime", "run", "--config", config["_path"]], directory, prefix=config.get("_namespace", ())))
     wait_for(lambda: all("peers=1" in command(c, "status") for c in configs), "applied peer maps")
+    assert web_probe(a) == identity_a["id"]
+    assert web_probe(b) == identity_b["id"]
+    print("PASS: embedded web panel, authenticated JSON snapshots, origin checks and private credentials omitted", flush=True)
     print("PASS: enrollment, policy publication and two managed agents", flush=True)
 
     echo_server = """import socket,threading,time

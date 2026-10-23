@@ -10,6 +10,12 @@
 локальные TCP-разрешения, сроки действия и P2P-согласование. P2P discovery,
 hole punching, реле и exit nodes ещё предстоит реализовать.
 Запуск агента: [управляемый runtime](docs/RUNTIME.md).
+
+Веб-панель агента доступна на `http://127.0.0.1:51821/`: состояние устройства,
+пиры, TCP-разрешения, статистика и P2P-запрос. Вход выполняется токеном локального
+API из `api_token_file`; отдельная сборка фронтенда не требуется.
+Команда `sudo target/release/portal web` печатает готовую ссылку для входа,
+чтобы не копировать токен вручную.
 Последовательность работ: [план сетевой составляющей](docs/NETWORK_PLAN.md).
 
 В workspace пять частей: `wireguard/` — библиотека `Device`, `runtime/` — сетевой
@@ -108,26 +114,26 @@ sudo WITH_PSK=1 ./wireguard/scripts/check-kernel-interop.sh
 
 `portal-runtime` — отдельный foreground daemon: он владеет `Device` и настраивает
 Linux TUN-интерфейс. `portal-cli` — отдельный бинарник `portal`, который управляет
-локальным runtime через HTTP API на loopback-адресе. API предназначен для CLI и
-будущего веб-клиента. Прикладные сервисы пока удалены: сейчас проект содержит
-только WireGuard, настройку интерфейса и локальное управление сетью.
+локальным runtime через HTTP API на loopback-адресе. Этот API использует и
+встроенная веб-панель. Прикладные сервисы пока удалены; сетевой агент поддерживает
+ручной режим и подключение к HTTPS-координатору.
 
 ```sh
 cargo build -p portal-runtime -p portal-cli --release
-sudo install -d -m 700 /etc/portal
-sudo target/release/portal-runtime keygen --private-key-file /etc/portal/device.key
-sudo target/release/portal-runtime run \
-  --tun portal0 \
-  --private-key-file /etc/portal/device.key \
-  --listen 0.0.0.0:51820 \
-  --api-listen 127.0.0.1:51821 \
-  --api-token-file /run/portal.token \
-  --address 10.20.0.1/24 \
-  --mtu 1420
+sudo target/release/portal-runtime
 ```
 
-`keygen` создаёт raw-файл приватного ключа с режимом `0600` и печатает открытый
-ключ в hex. `portal-runtime run` поднимает устройство, настраивает MTU, адреса и
+Все флаги запуска необязательны. Без аргументов (или с одной командой `run`)
+используется `/etc/portal/runtime.json`, если он есть; иначе запускается ручной
+режим: `portal0`, UDP `0.0.0.0:51820`, API `127.0.0.1:51821`, MTU `1420`.
+Ключ `/etc/portal/device.key` создаётся при первом ручном запуске и сохраняется
+для следующих. Адреса TUN по умолчанию не назначаются; пример переопределения:
+`sudo target/release/portal-runtime run --address 10.20.0.1/24`.
+Полная [таблица значений по умолчанию](docs/RUNTIME.md#запуск-без-параметров).
+
+`keygen` без флагов создаёт `/etc/portal/device.key` с режимом `0600`, печатает
+публичный ключ в hex и не перезаписывает существующий файл. `portal-runtime run`
+поднимает устройство, настраивает MTU, адреса и
 состояние интерфейса, затем слушает HTTP API только на loopback. Случайный bearer-
 токен записывается в файл с режимом `0600` и удаляется при штатной остановке.
 Для веб-клиента токен можно прочитать с правами владельца runtime и передать в

@@ -21,6 +21,14 @@ mod cli {
             }
             "peer" => peer_command(&args[1..]),
             "endpoint" => endpoint_command(&args[1..]),
+            "web" => {
+                let options = parse_options(&args[1..], &[])?;
+                validate_options(&options, &["api", "token-file"], &[])?;
+                let (address, token_file) = api_target(&options);
+                let url = crate::http_api::web_url(address, token_file)?;
+                println!("{}", url.as_str());
+                Ok(())
+            }
             "connect" => {
                 let options = parse_options(&args[1..], &[])?;
                 validate_options(&options, &["api", "token-file", "device-id"], &[])?;
@@ -42,8 +50,9 @@ mod cli {
 portal — control CLI for a running portal runtime
 
 Commands:
-  portal-runtime run --tun NAME --private-key-file PATH --listen ADDR [options]
-  portal-runtime keygen --private-key-file PATH
+  portal-runtime
+  portal-runtime run [options]
+  portal-runtime keygen [--private-key-file PATH]
   portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--preshared-key-file PATH]
       [--endpoint ADDR] [--keepalive SECONDS] [--allowed-ip PREFIX ...]
   portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
@@ -51,6 +60,7 @@ Commands:
   portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
   portal connect --device-id ID [--api IP:PORT] [--token-file PATH]
+  portal web [--api IP:PORT] [--token-file PATH]  Print a web panel login link
 
 Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
 The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
@@ -210,6 +220,13 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
         options: &HashMap<String, Vec<String>>,
         command: &crate::http_api::ManagementRequest<'_>,
     ) -> Result<String, String> {
+        let (address, token_file) = api_target(options);
+        let mut request = serde_json::to_string(command)
+            .map_err(|error| format!("could not encode API request: {error}"))?;
+        crate::http_api::send(address, token_file, &mut request)
+    }
+
+    fn api_target(options: &HashMap<String, Vec<String>>) -> (&str, &str) {
         let address = options
             .get("api")
             .and_then(|values| first(values))
@@ -220,9 +237,7 @@ The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
             .and_then(|values| first(values))
             .map(String::as_str)
             .unwrap_or("/run/portal.token");
-        let mut request = serde_json::to_string(command)
-            .map_err(|error| format!("could not encode API request: {error}"))?;
-        crate::http_api::send(address, token_file, &mut request)
+        (address, token_file)
     }
 
     fn print_operation(message: String) -> Result<(), String> {

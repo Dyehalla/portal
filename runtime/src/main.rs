@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use portal_runtime::{FileConfig, InterfaceAddress, RuntimeConfig, SecretKey};
+use portal_runtime::{FileConfig, InterfaceAddress, RuntimeConfig, SecretKey, defaults};
 use zeroize::Zeroize;
 
 // Run the selected command and report failures using a nonzero process exit code.
@@ -19,8 +19,7 @@ fn main() {
 fn entry() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
-        print_usage();
-        return Ok(());
+        return run_command(&[]);
     };
     match command {
         "help" | "--help" | "-h" => {
@@ -43,37 +42,53 @@ fn print_usage() {
 portal-runtime — Linux WireGuard runtime with a local HTTP management API
 
 Commands:
-  portal-runtime run --tun NAME --private-key-file PATH --listen ADDR [options]
-  portal-runtime keygen --private-key-file PATH
-  portal-runtime enroll --config PATH --user-token-file PATH
-  portal-runtime run --config PATH
+  portal-runtime                             Start with defaults
+  portal-runtime run [options]                Manual startup, or default config
+  portal-runtime run --config PATH            Managed startup from JSON
+  portal-runtime keygen [--private-key-file PATH]
+  portal-runtime enroll [--config PATH] [--user-token-file PATH]
 
 Run options:
-  --api-listen IP:PORT      Loopback management API (default: 127.0.0.1:51821)
-  --api-token-file PATH     API bearer token (default: /run/portal.token)
-  --address IP/PREFIX       Interface address; repeatable
-  --mtu BYTES               Interface MTU (default: 1420)
-  --workers COUNT           Packet workers (Device default if omitted)
-  --handshake-rate-limit N  Handshakes per second (Device default if omitted)
-  --no-dual-stack           Bind only the address family of --listen
-  --no-auto-routes          Leave host routes to the administrator
+  --tun NAME                TUN interface (default: {tun})
+  --private-key-file PATH   Device key (default: {key}; created once if absent)
+  --listen IP:PORT          WireGuard UDP socket (default: {listen})
+  --api-listen IP:PORT      Loopback API and web panel (default: {api})
+  --api-token-file PATH     API bearer token (default: {api_token})
+  --address IP/PREFIX       Repeatable; default: no manual interface addresses
+  --mtu BYTES               Interface MTU (default: {mtu})
+  --workers COUNT           Default: available CPU count, capped at 256
+  --handshake-rate-limit N  Handshakes per second (default: 100)
+  --no-dual-stack           Disable dual stack (default: enabled)
+  --no-auto-routes          Disable automatic routes (default: enabled)
 
-The runtime stays in the foreground. Use the separate `portal` CLI to manage it."
+Without run options, {config} is used if present; otherwise manual defaults apply.
+Explicit manual options select manual mode. --config cannot be combined with them.
+Enrollment defaults: config={config}, user-token-file={user_token}.
+JSON fields also have defaults. Enrollment still requires a real user token.
+An enrolled device's missing key is never replaced automatically.
+The runtime stays in the foreground. Web panel: http://{api}/",
+        tun = defaults::TUN_NAME,
+        key = defaults::PRIVATE_KEY_FILE,
+        listen = defaults::LISTEN,
+        api = defaults::API_LISTEN,
+        api_token = defaults::API_TOKEN_FILE,
+        mtu = defaults::MTU,
+        config = defaults::CONFIG_FILE,
+        user_token = defaults::USER_TOKEN_FILE,
     );
 }
 
 // Validate runtime options, build the device configuration, and start the foreground service.
 fn run_command(args: &[String]) -> Result<(), String> {
+    if matches!(args, [arg] if matches!(arg.as_str(), "--help" | "-h")) {
+        print_usage();
+        return Ok(());
+    }
     let options = parse_options(args, &["no-dual-stack", "no-auto-routes"])?;
-    if options.contains_key("config") {
+    if let Some(path) = configuration_file(&options, Path::new(defaults::CONFIG_FILE))? {
         validate_options(&options, &["config"], &[])?;
-        let config = FileConfig::load(std::path::Path::new(required(&options, "config")?))?;
-        let key = SecretKey(read_key_file(
-            config
-                .private_key_file
-                .to_str()
-                .ok_or("private key path must be UTF-8")?,
-        )?);
+        let config = FileConfig::load(&path)?;
+        let key = load_startup_key(&config.private_key_file, false)?;
         return portal_runtime::run(config.into_runtime(key));
     }
     validate_options(
@@ -93,10 +108,9 @@ fn run_command(args: &[String]) -> Result<(), String> {
         ],
         &["address"],
     )?;
-    let tun_name = required(&options, "tun")?;
+    let tun_name = option_or(&options, "tun", defaults::TUN_NAME);
     portal_runtime::validate_interface_name(tun_name)?;
-    let private_key = SecretKey(read_key_file(required(&options, "private-key-file")?)?);
-    let listen = required(&options, "listen")?
+    let listen = option_or(&options, "listen", defaults::LISTEN)
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid --listen address: {error}"))?;
     let addresses = options
@@ -107,7 +121,7 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     let mtu = parse_number(
         options.get("mtu").and_then(|values| first(values)),
-        1420_u32,
+        defaults::MTU,
         "--mtu",
     )?;
     if !(576..=65_535).contains(&mtu) {
@@ -127,6 +141,12 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .and_then(|values| first(values))
         .map(|value| parse_number(Some(value), 1_u64, "--handshake-rate-limit"))
         .transpose()?;
+    if workers.is_some_and(|n| n == 0 || n > 256) {
+        return Err("--workers must be between 1 and 256".into());
+    }
+    if handshake_rate_limit == Some(0) {
+        return Err("--handshake-rate-limit must be greater than zero".into());
+    }
     let api_listen = options
         .get("api-listen")
         .and_then(|values| first(values))
@@ -136,7 +156,11 @@ fn run_command(args: &[String]) -> Result<(), String> {
                 .map_err(|error| format!("invalid --api-listen address: {error}"))
         })
         .transpose()?
-        .unwrap_or_else(|| "127.0.0.1:51821".parse().expect("constant socket address"));
+        .unwrap_or_else(|| {
+            defaults::API_LISTEN
+                .parse()
+                .expect("constant socket address")
+        });
     if !api_listen.ip().is_loopback() {
         return Err("--api-listen must use a loopback address".into());
     }
@@ -144,7 +168,13 @@ fn run_command(args: &[String]) -> Result<(), String> {
         .get("api-token-file")
         .and_then(|values| first(values))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/portal.token"));
+        .unwrap_or_else(|| PathBuf::from(defaults::API_TOKEN_FILE));
+    let private_key_file = Path::new(option_or(
+        &options,
+        "private-key-file",
+        defaults::PRIVATE_KEY_FILE,
+    ));
+    let private_key = load_startup_key(private_key_file, true)?;
     portal_runtime::run(RuntimeConfig {
         coordinator: None,
         tun_name: tun_name.to_owned(),
@@ -154,8 +184,8 @@ fn run_command(args: &[String]) -> Result<(), String> {
         mtu,
         workers,
         handshake_rate_limit,
-        dual_stack: !options.contains_key("no-dual-stack"),
-        auto_routes: !options.contains_key("no-auto-routes"),
+        dual_stack: defaults::DUAL_STACK && !options.contains_key("no-dual-stack"),
+        auto_routes: defaults::AUTO_ROUTES && !options.contains_key("no-auto-routes"),
         api_listen,
         api_token_file,
     })
@@ -164,19 +194,32 @@ fn run_command(args: &[String]) -> Result<(), String> {
 fn enroll_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args, &[])?;
     validate_options(&options, &["config", "user-token-file"], &[])?;
-    let config = FileConfig::load(std::path::Path::new(required(&options, "config")?))?;
-    let key = SecretKey(read_key_file(
-        config
-            .private_key_file
-            .to_str()
-            .ok_or("private key path must be UTF-8")?,
-    )?);
+    let config = FileConfig::load(Path::new(option_or(
+        &options,
+        "config",
+        defaults::CONFIG_FILE,
+    )))?;
+    let already_enrolled = fs::symlink_metadata(&config.coordinator.credential_file)
+        .map(|_| true)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| format!("could not inspect device credentials: {e}"))?;
+    let key = load_startup_key(&config.private_key_file, !already_enrolled)?;
     println!(
         "{}",
         portal_runtime::enroll(
             config.coordinator,
             key,
-            std::path::Path::new(required(&options, "user-token-file")?)
+            Path::new(option_or(
+                &options,
+                "user-token-file",
+                defaults::USER_TOKEN_FILE
+            ))
         )?
     );
     Ok(())
@@ -186,7 +229,12 @@ fn enroll_command(args: &[String]) -> Result<(), String> {
 fn keygen_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args, &[])?;
     validate_options(&options, &["private-key-file"], &[])?;
-    let path = PathBuf::from(required(&options, "private-key-file")?);
+    let path = PathBuf::from(option_or(
+        &options,
+        "private-key-file",
+        defaults::PRIVATE_KEY_FILE,
+    ));
+    prepare_key_directory(&path)?;
     let public_key = portal_runtime::create_key_file(&path)?;
     println!(
         "private key saved to {} (raw 32-byte format)",
@@ -248,13 +296,78 @@ fn validate_options(
     Ok(())
 }
 
-// Return the first value for a required option or explain which option is missing.
-fn required<'a>(options: &'a HashMap<String, Vec<String>>, name: &str) -> Result<&'a str, String> {
+// Resolve an optional argument using the same defaults as the JSON configuration.
+fn option_or<'a>(
+    options: &'a HashMap<String, Vec<String>>,
+    name: &str,
+    default: &'a str,
+) -> &'a str {
     options
         .get(name)
         .and_then(|values| first(values))
         .map(String::as_str)
-        .ok_or_else(|| format!("missing required option --{name}"))
+        .unwrap_or(default)
+}
+
+// Never silently switch to manual mode if an existing config cannot be read.
+fn configuration_file(
+    options: &HashMap<String, Vec<String>>,
+    default: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = options.get("config").and_then(|values| first(values)) {
+        return Ok(Some(path.into()));
+    }
+    if !options.is_empty() {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(default) {
+        Ok(_) => Ok(Some(default.into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "could not inspect runtime config {}: {e}",
+            default.display()
+        )),
+    }
+}
+
+fn prepare_key_directory(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
+            .map_err(|e| format!("could not create key directory {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn load_startup_key(path: &Path, create_if_missing: bool) -> Result<SecretKey, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
+            prepare_key_directory(path)?;
+            portal_runtime::create_key_file(path)?;
+            eprintln!("created device key: {}", path.display());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "device key {} is missing; restore the enrolled device key or run keygen/enroll for a new device",
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not inspect device key {}: {e}",
+                path.display()
+            ));
+        }
+    }
+    read_key_file(path).map(SecretKey)
 }
 
 // Return the first parsed value for an option, if present.
@@ -276,9 +389,9 @@ where
 }
 
 // Read a 32-byte raw or 64-character hexadecimal key, clearing the file buffer afterward.
-fn read_key_file(path: &str) -> Result<[u8; 32], String> {
-    let mut bytes =
-        fs::read(path).map_err(|error| format!("could not read key file {path}: {error}"))?;
+fn read_key_file(path: &Path) -> Result<[u8; 32], String> {
+    let mut bytes = fs::read(path)
+        .map_err(|error| format!("could not read key file {}: {error}", path.display()))?;
     if bytes.len() == 32 {
         let key = bytes.as_slice().try_into().expect("length checked");
         bytes.zeroize();
@@ -343,4 +456,82 @@ fn encode_hex(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_configuration_is_optional_but_an_existing_or_explicit_file_is_never_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.json");
+        let empty = HashMap::new();
+        assert!(configuration_file(&empty, &path).unwrap().is_none());
+        fs::write(&path, "not JSON").unwrap();
+        assert_eq!(
+            configuration_file(&empty, &path).unwrap(),
+            Some(path.clone())
+        );
+        assert!(FileConfig::load(&path).is_err());
+        let manual = parse_options(&["--tun".into(), "manual0".into()], &[]).unwrap();
+        assert!(configuration_file(&manual, &path).unwrap().is_none());
+        let explicit = parse_options(&["--config".into(), "missing.json".into()], &[]).unwrap();
+        assert_eq!(
+            configuration_file(&explicit, &path).unwrap(),
+            Some(PathBuf::from("missing.json"))
+        );
+    }
+
+    #[test]
+    fn first_manual_start_creates_a_private_random_key_and_restarts_preserve_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state/device.key");
+        let first = load_startup_key(&path, true).unwrap();
+        let second = load_startup_key(&path, true).unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let other = load_startup_key(&directory.path().join("other.key"), true).unwrap();
+        assert_ne!(first.0, other.0);
+    }
+
+    #[test]
+    fn missing_enrolled_keys_corrupt_files_and_dangling_links_are_not_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device.key");
+        assert!(load_startup_key(&path, false).is_err());
+        assert!(!path.exists());
+        fs::write(&path, b"invalid key").unwrap();
+        assert!(load_startup_key(&path, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"invalid key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = directory.path().join("link.key");
+            let missing = directory.path().join("missing.key");
+            symlink(&missing, &link).unwrap();
+            assert!(load_startup_key(&link, true).is_err());
+            assert!(!missing.exists());
+            assert_eq!(
+                configuration_file(&HashMap::new(), &link).unwrap(),
+                Some(link)
+            );
+        }
+    }
 }
