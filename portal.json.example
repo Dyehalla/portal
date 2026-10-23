@@ -1,8 +1,0 @@
-{
-  "private_key_file": "portal-state/device.key",
-  "listen": "0.0.0.0:51820",
-  "relays": [],
-  "api_listen": "127.0.0.1:51821",
-  "api_token_file": "portal-state/api.token",
-  "services": []
-}

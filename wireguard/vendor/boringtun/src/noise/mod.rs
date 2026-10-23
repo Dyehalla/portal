@@ -565,6 +565,16 @@ impl Tunn {
         }
     }
 
+    /// Discard plaintext awaiting a handshake without replacing established sessions.
+    /// Callers must serialize this with encapsulation and queue flushing.
+    pub fn discard_queued_packets(&mut self) -> usize {
+        let count = self.packet_queue.len();
+        for mut packet in self.packet_queue.drain(..) {
+            packet.fill(0);
+        }
+        count
+    }
+
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         if let Some(packet) = self.dequeue_packet() {

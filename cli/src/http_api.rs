@@ -6,17 +6,21 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-// The API bounds command JSON at 256 KiB; reserve another 8 KiB for HTTP headers.
-const MAX_RESPONSE_BYTES: usize = 256 * 1024 + 8 * 1024;
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// JSON operation shared by the CLI and local web client.
 #[derive(Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum ManagementRequest<'a> {
+    Connect {
+        peer_device_id: &'a str,
+    },
     PeerUpsert {
         public_key: &'a str,
+        preshared_key: Option<&'a str>,
         endpoint: Option<SocketAddr>,
-        relay: Option<RelayPeer<'a>>,
+        keepalive_seconds: Option<u64>,
+        allowed_ips: Vec<&'a str>,
     },
     PeerRemove {
         public_key: &'a str,
@@ -28,21 +32,14 @@ pub(crate) enum ManagementRequest<'a> {
     EndpointClear {
         public_key: &'a str,
     },
-    Stats,
     PeerStats {
         public_key: &'a str,
     },
     Status,
     Health,
+    Stats,
     List,
-    ServicesReload,
     Shutdown,
-}
-
-#[derive(Serialize)]
-pub(crate) struct RelayPeer<'a> {
-    pub public_key: &'a str,
-    pub endpoint: SocketAddr,
 }
 
 #[derive(Deserialize)]
@@ -63,25 +60,8 @@ pub(crate) fn send(
 
 /// Connect to the local API, send a bounded JSON request, and decode its response.
 fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, String> {
-    let address = address
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("invalid --api address: {error}"))?;
-    if !address.ip().is_loopback() {
-        return Err("--api must use a loopback address".into());
-    }
-
-    let mut token_bytes = fs::read(token_file)
-        .map_err(|error| format!("could not read API token file {token_file}: {error}"))?;
-    let token_text = String::from_utf8_lossy(&token_bytes);
-    let token_text = token_text.trim();
-    if token_text.len() != 64 || !token_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        token_bytes.zeroize();
-        return Err(format!(
-            "API token file {token_file} must contain a 64-character hex token"
-        ));
-    }
-    let token = Zeroizing::new(token_text.to_owned());
-    token_bytes.zeroize();
+    let address = parse_address(address)?;
+    let token = read_token(token_file)?;
 
     let mut body = command.as_bytes().to_vec();
     let result = (|| {
@@ -102,6 +82,10 @@ fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, 
             .and_then(|()| stream.write_all(&body))
             .and_then(|()| stream.flush())
             .map_err(|error| format!("could not send API request: {error}"))?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| format!("could not finish API request: {error}"))?;
+
         let mut response = Vec::new();
         (&mut stream)
             .take((MAX_RESPONSE_BYTES + 1) as u64)
@@ -114,6 +98,43 @@ fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, 
     })();
     body.zeroize();
     result
+}
+
+/// Build a login link whose fragment is consumed locally by the web panel.
+pub(crate) fn web_url(address: &str, token_file: &str) -> Result<Zeroizing<String>, String> {
+    let address = parse_address(address)?;
+    let token = read_token(token_file)?;
+    Ok(Zeroizing::new(format!(
+        "http://{address}/#token={}",
+        token.as_str()
+    )))
+}
+
+fn parse_address(address: &str) -> Result<SocketAddr, String> {
+    let address = address
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid --api address: {error}"))?;
+    if !address.ip().is_loopback() {
+        return Err("--api must use a loopback address".into());
+    }
+    Ok(address)
+}
+
+fn read_token(token_file: &str) -> Result<Zeroizing<String>, String> {
+    let mut token_bytes = fs::read(token_file)
+        .map_err(|error| format!("could not read API token file {token_file}: {error}"))?;
+    let token_text = String::from_utf8_lossy(&token_bytes);
+    let token_text = token_text.trim();
+    if token_text.len() != 64 || !token_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        token_bytes.zeroize();
+        return Err(format!(
+            "API token file {token_file} must contain a 64-character hex token"
+        ));
+    }
+    let token = Zeroizing::new(token_text.to_owned());
+    token_bytes.zeroize();
+
+    Ok(token)
 }
 
 /// Parse an HTTP response and return its JSON message or the server's error.
@@ -139,30 +160,5 @@ fn decode_response(response: &[u8]) -> Result<String, String> {
             "local API returned HTTP {status}: {}",
             reply.message
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn list_of_1024_peers_fits_the_http_response_bound() {
-        let message = (0..1024)
-            .map(|i| {
-                format!(
-                    "{i:064x} endpoint=[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let body = serde_json::to_string(&serde_json::json!({"message": message})).unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        assert!(response.len() > 64 * 1024);
-        assert!(response.len() <= MAX_RESPONSE_BYTES);
-        assert_eq!(decode_response(response.as_bytes()).unwrap(), message);
     }
 }

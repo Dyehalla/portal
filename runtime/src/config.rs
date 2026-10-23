@@ -1,245 +1,306 @@
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+
+use portal::{AllowedIp, PeerKey};
 use zeroize::Zeroize;
 
+/// Shared defaults for the CLI and file-based startup configuration.
+pub mod defaults {
+    pub const CONFIG_FILE: &str = "/etc/portal/runtime.json";
+    pub const TUN_NAME: &str = "portal0";
+    pub const PRIVATE_KEY_FILE: &str = "/etc/portal/device.key";
+    pub const LISTEN: &str = "0.0.0.0:51820";
+    pub const MTU: u32 = 1420;
+    pub const DUAL_STACK: bool = true;
+    pub const AUTO_ROUTES: bool = true;
+    pub const API_LISTEN: &str = "127.0.0.1:51821";
+    pub const API_TOKEN_FILE: &str = "/run/portal.token";
+    pub const USER_TOKEN_FILE: &str = "/etc/portal/user.token";
+    pub const COORDINATOR_URL: &str = "https://localhost:8443";
+    pub const DEVICE_NAME: &str = "my-device";
+    pub const CREDENTIAL_FILE: &str = "/etc/portal/device.json";
+    pub const POLICY_FILE: &str = "/etc/portal/policy.json";
+    pub const MAP_FILE: &str = "/etc/portal/network-map.json";
+}
+
+/// Configuration for one foreground runtime instance.
 pub struct RuntimeConfig {
-    pub config_path: Option<PathBuf>,
+    pub coordinator: Option<ManagedConfig>,
+    pub tun_name: String,
     pub private_key: SecretKey,
-    pub listen: Option<SocketAddr>,
-    pub relays: Vec<portal_net::RelayPeer>,
-    pub relay_server: Option<crate::RelayServerConfig>,
+    pub listen: SocketAddr,
+    pub addresses: Vec<InterfaceAddress>,
+    pub mtu: u32,
+    pub workers: Option<usize>,
+    pub handshake_rate_limit: Option<u64>,
+    pub dual_stack: bool,
+    pub auto_routes: bool,
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
-    pub services: Vec<crate::ServiceRegistration>,
 }
-pub struct SecretKey(pub [u8; 32]);
+
+/// Persistent managed-mode configuration. Relative paths resolve beside this file.
+#[derive(Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedConfig {
+    pub url: String,
+    pub device_name: String,
+    pub credential_file: PathBuf,
+    pub policy_file: PathBuf,
+    pub map_file: PathBuf,
+    pub ca_file: Option<PathBuf>,
+    pub endpoints: Vec<SocketAddr>,
+}
+
+impl Default for ManagedConfig {
+    fn default() -> Self {
+        Self {
+            url: defaults::COORDINATOR_URL.into(),
+            device_name: defaults::DEVICE_NAME.into(),
+            credential_file: defaults::CREDENTIAL_FILE.into(),
+            policy_file: defaults::POLICY_FILE.into(),
+            map_file: defaults::MAP_FILE.into(),
+            ca_file: None,
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileConfig {
+    pub tun_name: String,
+    pub private_key_file: PathBuf,
+    pub listen: SocketAddr,
+    pub mtu: u32,
+    pub workers: Option<usize>,
+    pub handshake_rate_limit: Option<u64>,
+    pub dual_stack: bool,
+    pub auto_routes: bool,
+    pub api_listen: SocketAddr,
+    pub api_token_file: PathBuf,
+    pub coordinator: ManagedConfig,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            tun_name: defaults::TUN_NAME.into(),
+            private_key_file: defaults::PRIVATE_KEY_FILE.into(),
+            listen: defaults::LISTEN.parse().expect("constant socket address"),
+            mtu: defaults::MTU,
+            // Device supplies CPU-dependent worker count and its handshake limit.
+            workers: None,
+            handshake_rate_limit: None,
+            dual_stack: defaults::DUAL_STACK,
+            auto_routes: defaults::AUTO_ROUTES,
+            api_listen: defaults::API_LISTEN
+                .parse()
+                .expect("constant socket address"),
+            api_token_file: defaults::API_TOKEN_FILE.into(),
+            coordinator: ManagedConfig::default(),
+        }
+    }
+}
+
+impl FileConfig {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("could not read runtime config: {e}"))?;
+        let mut config: Self =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid runtime config: {e}"))?;
+        let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        for value in [
+            &mut config.private_key_file,
+            &mut config.api_token_file,
+            &mut config.coordinator.credential_file,
+            &mut config.coordinator.policy_file,
+            &mut config.coordinator.map_file,
+        ] {
+            if value.is_relative() {
+                *value = base.join(&*value);
+            }
+        }
+        if let Some(ca) = &mut config.coordinator.ca_file
+            && ca.is_relative()
+        {
+            *ca = base.join(&*ca);
+        }
+        crate::validate_interface_name(&config.tun_name)?;
+        if !(1280..=65535).contains(&config.mtu) || !config.api_listen.ip().is_loopback() {
+            return Err("managed mode requires MTU 1280..65535 and a loopback local API".into());
+        }
+        if config.workers.is_some_and(|n| n == 0 || n > 256) {
+            return Err("workers must be between 1 and 256".into());
+        }
+        if config.handshake_rate_limit == Some(0) {
+            return Err("handshake_rate_limit must be greater than zero".into());
+        }
+        if config.coordinator.device_name.trim().is_empty()
+            || config.coordinator.device_name.len() > 128
+            || config.coordinator.device_name.chars().any(char::is_control)
+        {
+            return Err("invalid device name".into());
+        }
+        portal_net::policy::validate_endpoints(&config.coordinator.endpoints)?;
+        let mut files = std::collections::HashSet::new();
+        for file in [
+            &config.private_key_file,
+            &config.api_token_file,
+            &config.coordinator.credential_file,
+            &config.coordinator.policy_file,
+            &config.coordinator.map_file,
+            &config.coordinator.credential_file.with_extension("lock"),
+            &path.to_path_buf(),
+        ] {
+            let absolute = if file.is_absolute() {
+                file.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(file)
+            };
+            let mut normalized = PathBuf::new();
+            for component in absolute.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            if !files.insert(normalized) {
+                return Err("runtime configuration, keys, tokens, policy, map and lock must use distinct files".into());
+            }
+        }
+        Ok(config)
+    }
+
+    pub fn into_runtime(self, private_key: SecretKey) -> RuntimeConfig {
+        RuntimeConfig {
+            coordinator: Some(self.coordinator),
+            tun_name: self.tun_name,
+            private_key,
+            listen: self.listen,
+            addresses: Vec::new(),
+            mtu: self.mtu,
+            workers: self.workers,
+            handshake_rate_limit: self.handshake_rate_limit,
+            dual_stack: self.dual_stack,
+            auto_routes: self.auto_routes,
+            api_listen: self.api_listen,
+            api_token_file: self.api_token_file,
+        }
+    }
+}
+
+/// Secret device key that is cleared from memory when its owner is dropped.
+pub struct SecretKey(pub PeerKey);
+
 impl Drop for SecretKey {
+    // Erase the private key bytes when the owning configuration is discarded.
     fn drop(&mut self) {
         self.0.zeroize();
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    private_key_file: PathBuf,
-    listen: Option<SocketAddr>,
-    #[serde(default)]
-    relays: Vec<portal_net::RelayPeer>,
-    #[serde(default)]
-    relay_server: Option<crate::RelayServerConfig>,
-    #[serde(default = "default_api_listen")]
-    api_listen: SocketAddr,
-    #[serde(default)]
-    api_token_file: Option<PathBuf>,
-    #[serde(default)]
-    services: Vec<ServiceConfig>,
-}
-#[derive(serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ServiceConfig {
-    Files {
-        root: PathBuf,
-        allowed_downloaders: Vec<String>,
-    },
+/// Address and prefix assigned to the runtime's virtual interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceAddress {
+    pub address: IpAddr,
+    pub prefix_len: u8,
 }
 
-fn default_api_listen() -> SocketAddr {
-    "127.0.0.1:51821".parse().expect("constant address")
-}
-fn default_token_file() -> PathBuf {
-    #[cfg(unix)]
-    let name = format!("portal-{}.token", unsafe { libc::geteuid() });
-    #[cfg(not(unix))]
-    let name = "portal.token";
-    std::env::temp_dir().join(name)
-}
-fn read_settings(path: &Path) -> Result<FileConfig, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("invalid configuration {}: {e}", path.display()))
-}
-fn resolve(base: &Path, value: PathBuf) -> PathBuf {
-    if value.is_absolute() {
-        value
-    } else {
-        base.join(value)
+impl InterfaceAddress {
+    /// Parse an interface address in `IP/PREFIX` notation and validate its prefix length.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (address, prefix) = value
+            .rsplit_once('/')
+            .ok_or_else(|| format!("invalid interface address `{value}`; expected IP/PREFIX"))?;
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|error| format!("invalid interface address `{value}`: {error}"))?;
+        let prefix_len = prefix
+            .parse::<u8>()
+            .map_err(|error| format!("invalid interface prefix `{value}`: {error}"))?;
+        AllowedIp::new(address, prefix_len)
+            .map_err(|error| format!("invalid interface address `{value}`: {error}"))?;
+        Ok(Self {
+            address,
+            prefix_len,
+        })
     }
-}
-fn build_services(
-    configs: Vec<ServiceConfig>,
-    base: &Path,
-) -> Result<Vec<crate::ServiceRegistration>, String> {
-    let mut services = Vec::new();
-    for config in configs {
-        match config {
-            ServiceConfig::Files {
-                root,
-                allowed_downloaders,
-            } => {
-                let allowed_downloaders = allowed_downloaders
-                    .iter()
-                    .map(|key| portal_net::parse_key(key))
-                    .collect::<Result<std::collections::HashSet<_>, _>>()?;
-                if allowed_downloaders.is_empty() {
-                    return Err("files.allowed_downloaders must contain reader public keys".into());
-                }
-                services.push(crate::ServiceRegistration::files(
-                    portal_files::FileServiceConfig {
-                        root: resolve(base, root),
-                        allowed_downloaders,
-                    },
-                ));
-            }
-        }
-    }
-    Ok(services)
-}
-pub fn load_config(path: &Path) -> Result<RuntimeConfig, String> {
-    let path = std::fs::canonicalize(path)
-        .map_err(|e| format!("could not resolve configuration {}: {e}", path.display()))?;
-    let settings = read_settings(&path)?;
-    let base = path.parent().expect("absolute path");
-    if !settings.api_listen.ip().is_loopback() {
-        return Err("api_listen must use loopback".into());
-    }
-    let private_key = SecretKey(read_key_file(&resolve(base, settings.private_key_file))?);
-    let services = build_services(settings.services, base)?;
-    let relay_server = settings.relay_server;
-    if let Some(server) = &relay_server {
-        server.validate()?;
-    }
-    let relays = settings.relays;
-    for relay in &relays {
-        relay.validate()?;
-    }
-    if settings.listen.is_none() && relays.is_empty() && relay_server.is_none() {
-        return Err("listen or at least one relay is required".into());
-    }
-    Ok(RuntimeConfig {
-        config_path: Some(path.clone()),
-        private_key,
-        listen: settings.listen,
-        relays,
-        relay_server,
-        api_listen: settings.api_listen,
-        api_token_file: settings
-            .api_token_file
-            .map(|path| resolve(base, path))
-            .unwrap_or_else(default_token_file),
-        services,
-    })
-}
-pub(crate) fn load_services(path: &Path) -> Result<Vec<crate::ServiceRegistration>, String> {
-    build_services(
-        read_settings(path)?.services,
-        path.parent().unwrap_or_else(|| Path::new(".")),
-    )
 }
 
-// Read a 32-byte raw or 64-character hexadecimal key, clearing the file buffer afterward.
-fn read_key_file(path: &std::path::Path) -> Result<[u8; 32], String> {
-    let mut bytes = std::fs::read(path)
-        .map_err(|error| format!("could not read key file {}: {error}", path.display()))?;
-    if bytes.len() == 32 {
-        let key = bytes.as_slice().try_into().expect("length checked");
-        bytes.zeroize();
-        return Ok(key);
-    }
-    let mut start = 0;
-    let mut end = bytes.len();
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    let result = parse_key_hex(&bytes[start..end]);
-    bytes.zeroize();
-    result
-}
-
-// Decode an exact-length hexadecimal key and wipe partial output if a digit is invalid.
-fn parse_key_hex(value: &[u8]) -> Result<[u8; 32], String> {
-    if value.len() != 64 {
-        return Err("key must be exactly 64 hexadecimal characters".into());
-    }
-    let mut key = [0_u8; 32];
-    for index in 0..key.len() {
-        let offset = index * 2;
-        let high = match hex_nibble(value[offset]) {
-            Ok(nibble) => nibble,
-            Err(error) => {
-                key.zeroize();
-                return Err(error);
-            }
-        };
-        let low = match hex_nibble(value[offset + 1]) {
-            Ok(nibble) => nibble,
-            Err(error) => {
-                key.zeroize();
-                return Err(error);
-            }
-        };
-        key[index] = (high << 4) | low;
-    }
-    Ok(key)
-}
-
-// Convert one ASCII hexadecimal character to its four-bit value.
-fn hex_nibble(value: u8) -> Result<u8, String> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err("key contains a non-hexadecimal character".into()),
+impl std::fmt::Display for InterfaceAddress {
+    /// Format the address and prefix using the notation accepted by `iproute2`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix_len)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn config_uses_peer_keys_and_relative_paths() {
-        let directory = std::env::temp_dir().join(format!(
-            "portal-quic-config-{:032x}",
-            rand::random::<u128>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("device.key"), [7; 32]).unwrap();
-        let path = directory.join("portal.json");
-        let valid = serde_json::json!({"private_key_file":"device.key", "listen":"127.0.0.1:0", "api_token_file":"api.token", "services": [{"type":"files", "root":"share", "allowed_downloaders":[portal_net::encode_key(&portal_net::public_key(&[8;32]))]}]});
-        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
-        let config = load_config(&path).unwrap();
-        assert_eq!(config.private_key.0, [7; 32]);
-        assert_eq!(config.api_token_file, directory.join("api.token"));
-        assert_eq!(config.services.len(), 1);
-        let mut relay_only = valid.clone();
-        relay_only["listen"] = serde_json::Value::Null;
-        relay_only["relays"] = serde_json::json!([{"public_key":portal_net::encode_key(&portal_net::public_key(&[9;32])), "endpoint":"127.0.0.1:40000"}]);
-        std::fs::write(&path, serde_json::to_vec(&relay_only).unwrap()).unwrap();
-        let config = load_config(&path).unwrap();
-        assert!(config.listen.is_none());
-        assert_eq!(config.relays.len(), 1);
-        for (field, value) in [
-            ("addresses", serde_json::json!(["10.20.0.1/32"])),
-            ("api_listen", serde_json::json!("0.0.0.0:51821")),
-            ("listen", serde_json::Value::Null),
-            ("relays", serde_json::json!(["file:///tmp/relay"])),
-            ("relays", serde_json::json!(["http://relay.example.com"])),
-            (
-                "services",
-                serde_json::json!([{ "type":"files", "root":"share", "allowed_downloaders":["127.0.0.1"] }]),
-            ),
+    fn empty_and_partial_json_keep_shared_defaults_and_explicit_values() {
+        let empty: FileConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.tun_name, defaults::TUN_NAME);
+        assert_eq!(
+            empty.private_key_file,
+            PathBuf::from(defaults::PRIVATE_KEY_FILE)
+        );
+        assert_eq!(empty.listen.to_string(), defaults::LISTEN);
+        assert_eq!(empty.api_listen.to_string(), defaults::API_LISTEN);
+        assert_eq!(
+            empty.api_token_file,
+            PathBuf::from(defaults::API_TOKEN_FILE)
+        );
+        assert_eq!(empty.mtu, defaults::MTU);
+        assert!(empty.dual_stack && empty.auto_routes);
+        assert!(empty.workers.is_none() && empty.handshake_rate_limit.is_none());
+        assert_eq!(empty.coordinator.url, defaults::COORDINATOR_URL);
+        assert!(empty.coordinator.endpoints.is_empty() && empty.coordinator.ca_file.is_none());
+        let partial: FileConfig = serde_json::from_str(r#"{"tun_name":"test0","dual_stack":false,"coordinator":{"url":"https://example.test:9443"}}"#).unwrap();
+        assert_eq!(partial.tun_name, "test0");
+        assert!(!partial.dual_stack);
+        assert_eq!(partial.listen, empty.listen);
+        assert_eq!(partial.coordinator.url, "https://example.test:9443");
+        assert_eq!(
+            partial.coordinator.policy_file,
+            empty.coordinator.policy_file
+        );
+    }
+
+    #[test]
+    fn load_resolves_explicit_relative_paths_without_replacing_defaults_or_accepting_typos() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.json");
+        std::fs::write(
+            &path,
+            r#"{"private_key_file":"state/key","coordinator":{"policy_file":"state/policy.json"}}"#,
+        )
+        .unwrap();
+        let config = FileConfig::load(&path).unwrap();
+        assert_eq!(config.private_key_file, directory.path().join("state/key"));
+        assert_eq!(
+            config.coordinator.policy_file,
+            directory.path().join("state/policy.json")
+        );
+        assert_eq!(
+            config.api_token_file,
+            PathBuf::from(defaults::API_TOKEN_FILE)
+        );
+        for invalid in [
+            r#"{"worker":1}"#,
+            r#"{"coordinator":{"urll":"https://example.test"}}"#,
+            r#"{"workers":0}"#,
+            r#"{"handshake_rate_limit":0}"#,
         ] {
-            let mut invalid = valid.clone();
-            invalid[field] = value;
-            std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
-            assert!(load_config(&path).is_err(), "accepted invalid {field}");
+            std::fs::write(&path, invalid).unwrap();
+            assert!(FileConfig::load(&path).is_err());
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

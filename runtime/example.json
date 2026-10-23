@@ -1,0 +1,17 @@
+{
+  "tun_name": "portal0",
+  "private_key_file": "../runtime-state/device.key",
+  "listen": "0.0.0.0:51820",
+  "mtu": 1420,
+  "api_listen": "127.0.0.1:51821",
+  "api_token_file": "../runtime-state/api.token",
+  "coordinator": {
+    "url": "https://localhost:8443",
+    "device_name": "my-device",
+    "credential_file": "../runtime-state/device.json",
+    "policy_file": "../runtime-state/policy.json",
+    "map_file": "../runtime-state/network-map.json",
+    "ca_file": "../coordinator-tls/cert.pem",
+    "endpoints": ["192.0.2.10:51820"]
+  }
+}

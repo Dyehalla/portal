@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Portal — локальная сеть</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <section id="auth-view" class="auth-view" aria-labelledby="auth-title">
+      <div class="auth-card">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>portal<span
+            class="brand-label"
+            >LOCAL</span
+          >
+        </div>
+        <p class="eyebrow">ВАША СЕТЬ ПОД РУКОЙ</p>
+        <h1 id="auth-title">Открыть Portal</h1>
+        <p class="muted">
+          Устройства, доступ и состояние сети на этом компьютере.
+        </p>
+        <form id="auth-form">
+          <label for="token">Токен локального API</label>
+          <input
+            id="token"
+            type="password"
+            required
+            minlength="64"
+            maxlength="64"
+            pattern="[a-fA-F0-9]{64}"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Вставьте токен из файла агента"
+          />
+          <p class="field-hint">
+            Ссылку для входа можно получить командой
+            <code>sudo portal web</code>. По умолчанию:
+            <code>/run/portal.token</code>. Путь задаётся в настройке
+            <code>api_token_file</code> агента.
+          </p>
+          <p id="auth-error" class="form-error" role="alert" hidden></p>
+          <button id="sign-in" class="button primary wide" type="submit">
+            Открыть панель <span aria-hidden="true">→</span>
+          </button>
+          <button id="select-token" class="button secondary wide" type="button">
+            Выбрать файл токена
+          </button>
+          <input id="token-file" type="file" hidden />
+        </form>
+        <p class="privacy-note">
+          Вход сохраняется при обновлении страницы в этой вкладке.<br />
+          Кнопка «Выйти» удаляет сохранённый токен.
+        </p>
+        <div class="auth-footer">
+          <span class="status-dot" aria-hidden="true"></span
+          ><span id="auth-address">Локальный агент</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="app" class="app" hidden>
+      <main>
+        <header class="topbar">
+          <a class="brand" href="#overview" aria-label="Portal — обзор">
+            <span class="brand-mark" aria-hidden="true"></span>portal<span
+              class="brand-label"
+              >LOCAL</span
+            >
+          </a>
+          <div class="topbar-actions">
+            <code id="api-address"></code>
+            <button id="sign-out" class="text-button" type="button">
+              Выйти <span aria-hidden="true">↗</span>
+            </button>
+          </div>
+        </header>
+        <div class="content">
+          <section id="overview" aria-labelledby="page-title">
+            <div class="page-heading">
+              <div>
+                <p class="eyebrow">PORTAL NETWORK</p>
+                <h1 id="page-title">Моё устройство</h1>
+                <p id="device-subtitle" class="muted">
+                  Состояние сетевого агента
+                </p>
+              </div>
+              <div class="heading-actions">
+                <span id="agent-state" class="badge">Загрузка</span
+                ><button id="refresh" class="button secondary" type="button">
+                  <span aria-hidden="true">↻</span> Обновить
+                </button>
+              </div>
+            </div>
+            <div
+              id="connection-error"
+              class="notice error"
+              role="alert"
+              hidden
+            ></div>
+            <div
+              id="lease-warning"
+              class="notice warning"
+              role="status"
+              hidden
+            ></div>
+            <div class="summary-grid">
+              <article class="summary-card">
+                <span class="card-label">Адрес устройства</span
+                ><strong id="primary-ip" class="mono">—</strong
+                ><span id="secondary-ip" class="card-caption mono">—</span>
+              </article>
+              <article class="summary-card">
+                <span class="card-label">Координатор</span
+                ><strong id="coordinator-state">—</strong
+                ><span id="network-revision" class="card-caption">—</span>
+              </article>
+              <article class="summary-card">
+                <span class="card-label">Карта сети</span
+                ><strong id="lease-time">—</strong
+                ><span id="lease-caption" class="card-caption">—</span>
+              </article>
+              <article class="summary-card">
+                <span class="card-label">Устройства в карте</span
+                ><strong id="peer-count">0</strong
+                ><span id="peer-count-caption" class="card-caption"
+                  >В текущей карте сети</span
+                >
+              </article>
+            </div>
+            <section class="panel identity" aria-label="Локальное устройство">
+              <span class="device-icon" aria-hidden="true">▣</span>
+              <div class="identity-main">
+                <h2 id="device-name">Это устройство</h2>
+                <p>
+                  <span id="interface-name" class="mono"></span
+                  ><span class="separator">·</span><span id="mode-label"></span>
+                </p>
+              </div>
+              <div class="identity-key">
+                <span class="card-label">Публичный WireGuard-ключ</span
+                ><button
+                  id="copy-key"
+                  class="key-button mono"
+                  type="button"
+                  title="Скопировать публичный ключ"
+                >
+                  —
+                </button>
+              </div>
+            </section>
+          </section>
+
+          <section id="peers" class="section" aria-labelledby="peers-title">
+            <div class="section-heading">
+              <div>
+                <h2 id="peers-title">Устройства</h2>
+                <p class="muted">Разрешённые связи этого агента</p>
+              </div>
+              <label class="search"
+                ><span aria-hidden="true">⌕</span
+                ><input
+                  id="peer-search"
+                  type="search"
+                  placeholder="Найти имя, адрес или ключ"
+                  aria-label="Найти устройство"
+              /></label>
+            </div>
+            <div class="panel peer-panel">
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Устройство</th>
+                      <th scope="col">Адреса Portal</th>
+                      <th scope="col">TCP-доступ</th>
+                      <th scope="col">Трафик</th>
+                      <th scope="col"><span class="sr-only">Действия</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="peer-rows"></tbody>
+                </table>
+              </div>
+              <div id="empty-peers" class="empty-state" hidden>
+                <span class="empty-symbol" aria-hidden="true">▦</span>
+                <h3 id="empty-title">Пиров пока нет</h3>
+                <p id="empty-caption" class="muted">
+                  Пиры появятся после выдачи разрешений на устройствах.
+                </p>
+              </div>
+              <div class="panel-footer">
+                <span id="peer-result-count">0 устройств</span
+                ><span>Наличие в карте не подтверждает прямое соединение</span>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="diagnostics"
+            class="section"
+            aria-labelledby="diagnostics-title"
+          >
+            <div class="section-heading">
+              <div>
+                <h2 id="diagnostics-title">Диагностика</h2>
+                <p class="muted">Счётчики с момента запуска агента</p>
+              </div>
+              <span id="last-updated" class="updated" aria-live="off">—</span>
+            </div>
+            <div class="diagnostics-grid">
+              <div class="panel counter">
+                <span class="card-label">Входящие UDP-пакеты</span
+                ><strong id="udp-count">0</strong>
+              </div>
+              <div class="panel counter">
+                <span class="card-label">Пакеты из TUN</span
+                ><strong id="tun-count">0</strong>
+              </div>
+              <div class="panel counter">
+                <span class="card-label">Отброшенные пакеты</span
+                ><strong id="drop-count">0</strong>
+              </div>
+              <div class="panel counter">
+                <span class="card-label">Ошибки отправки UDP</span
+                ><strong id="send-error-count">0</strong>
+              </div>
+            </div>
+            <div class="panel details-panel">
+              <div>
+                <span class="card-label">UDP-сокет агента</span
+                ><code id="listen-address">—</code>
+              </div>
+              <div>
+                <span class="card-label">ID устройства</span
+                ><code id="device-id">—</code>
+              </div>
+              <div>
+                <span class="card-label">ID сети</span
+                ><code id="network-id">—</code>
+              </div>
+              <div>
+                <span class="card-label">Локальные разрешения</span
+                ><span id="policy-state">—</span>
+              </div>
+            </div>
+          </section>
+          <footer class="page-footer">
+            <span>Portal · локальная панель</span
+            ><span>Обновляется каждые 5 секунд</span>
+          </footer>
+        </div>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <noscript
+      >Для работы панели включите JavaScript. Локальный API также доступен через
+      CLI portal.</noscript
+    >
+  </body>
+</html>

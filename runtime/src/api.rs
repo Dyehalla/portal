@@ -1,47 +1,50 @@
-use std::future::IntoFuture;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::service::Runtime;
+use crate::runtime::Runtime;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_COMMAND_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 struct ApiState {
+    agent: Option<Arc<crate::managed::Agent>>,
     runtime: Arc<Mutex<Runtime>>,
     token: Arc<Zeroizing<String>>,
     listen_address: SocketAddr,
-    network: Option<portal_net::Net>,
 }
 
 /// JSON operations accepted by the local management API.
 #[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum ManagementRequest {
+    Connect {
+        peer_device_id: String,
+    },
     PeerUpsert {
         public_key: String,
         #[serde(default)]
+        preshared_key: Option<SecretText>,
+        #[serde(default)]
         endpoint: Option<SocketAddr>,
         #[serde(default)]
-        relay: Option<portal_net::RelayPeer>,
+        keepalive_seconds: Option<u64>,
         #[serde(default)]
-        allow_relay: Option<bool>,
+        allowed_ips: Vec<String>,
     },
     PeerRemove {
         public_key: String,
@@ -53,19 +56,26 @@ pub(crate) enum ManagementRequest {
     EndpointClear {
         public_key: String,
     },
-    Stats,
     PeerStats {
         public_key: String,
     },
     Status,
     Health,
+    Stats,
     List,
-    ServicesReload,
-    RelayAccessSet {
-        public_key: String,
-        allowed: bool,
-    },
     Shutdown,
+}
+
+/// String wrapper that clears a deserialized preshared key when it is dropped.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(crate) struct SecretText(pub(crate) String);
+
+impl Drop for SecretText {
+    /// Erase the preshared key bytes from the request model.
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 /// JSON response returned for a successful or rejected management command.
@@ -76,24 +86,22 @@ struct CommandResponse {
 
 /// Serve the local HTTP API and remove its token file when it stops.
 pub(crate) struct LocalApi {
-    executor: Handle,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), String>>,
     address: SocketAddr,
-    token_file: crate::platform::linux::api_token::TokenFile,
+    token_file: PathBuf,
 }
 
 impl LocalApi {
     /// Bind the loopback listener, create its bearer token, and start the API task.
     pub(crate) fn start(
-        executor: &Handle,
         address: SocketAddr,
         token_file: PathBuf,
         runtime: Arc<Mutex<Runtime>>,
-        network: Option<portal_net::Net>,
+        agent: Option<Arc<crate::managed::Agent>>,
     ) -> Result<Self, String> {
         if !address.ip().is_loopback() {
-            return Err("api_listen must use a loopback address".into());
+            return Err("--api-listen must use a loopback address".into());
         }
         let listener = match StdTcpListener::bind(address) {
             Ok(listener) => listener,
@@ -112,59 +120,46 @@ impl LocalApi {
                 return Err(format!("could not inspect local API listener: {error}"));
             }
         };
-        let listener = {
-            let _guard = executor.enter();
-            TcpListener::from_std(listener)
-                .map_err(|error| format!("could not start local API listener: {error}"))?
-        };
-        let (token, token_file) = crate::platform::linux::api_token::create(&token_file)?;
+        let token = crate::platform::linux::api_token::create(&token_file)?;
 
         let state = ApiState {
+            agent,
             runtime,
             token: Arc::new(Zeroizing::new(token)),
             listen_address: address,
-            network,
         };
         let (shutdown, shutdown_receiver) = oneshot::channel();
-        let task = executor.spawn(async move {
-            let app = Router::new()
-                .route("/", get(handle_web))
-                .route("/app.js", get(handle_web))
-                .route("/styles.css", get(handle_web))
-                .route("/favicon.svg", get(handle_web))
-                .route("/api/v1/state", post(handle_state))
-                .route("/api/v1/peers/info", post(handle_peer_info))
+        let task = tokio::spawn(async move {
+            let listener = TcpListener::from_std(listener)
+                .map_err(|error| format!("could not start local API listener: {error}"))?;
+            println!(
+                "web panel: http://{address}/#token={}",
+                state.token.as_str()
+            );
+            let api = Router::new()
                 .route("/api/v1/command", post(handle_command))
-                .route("/api/v1/files/:operation", post(handle_files))
+                .route("/api/v1/snapshot", get(handle_snapshot))
+                .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
+            let app = Router::new()
+                .route("/", get(index))
+                .route("/app.js", get(javascript))
+                .route("/style.css", get(stylesheet))
+                .merge(api)
                 .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+                .layer(middleware::from_fn_with_state(state.clone(), local_request))
                 .with_state(state);
-            let (drain, mut draining) = tokio::sync::watch::channel(false);
-            let server = axum::serve(
+            axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .with_graceful_shutdown(async move {
-                while !*draining.borrow() {
-                    if draining.changed().await.is_err() {
-                        break;
-                    }
-                }
+            .with_graceful_shutdown(async {
+                let _ = shutdown_receiver.await;
             })
-            .into_future();
-            tokio::pin!(server);
-            tokio::select! {
-                result = &mut server => result.map_err(|e| format!("local API server failed: {e}")),
-                _ = shutdown_receiver => {
-                    let _ = drain.send(true);
-                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await
-                        .map_err(|_| "local API exceeded shutdown grace period".to_owned())?
-                        .map_err(|e| format!("local API server failed: {e}"))
-                }
-            }
+            .await
+            .map_err(|error| format!("local API server failed: {error}"))
         });
 
         Ok(Self {
-            executor: executor.clone(),
             shutdown: Some(shutdown),
             task,
             address,
@@ -182,179 +177,23 @@ impl LocalApi {
         self.task.is_finished()
     }
 
-    /// Stop the HTTP task on the shared executor and remove its bearer token file.
-    pub(crate) fn stop(mut self) -> Result<(), String> {
+    /// Stop the HTTP server, await its task, and remove the bearer token file.
+    pub(crate) async fn stop(mut self) -> Result<(), String> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let task_result = self.executor.block_on(async {
-            match tokio::time::timeout(std::time::Duration::from_secs(6), &mut self.task).await {
-                Ok(result) => result.map_err(|error| format!("local API task failed: {error}"))?,
-                Err(_) => {
-                    self.task.abort();
-                    let _ = self.task.await;
-                    Err("local API exceeded shutdown grace period; task was cancelled".into())
-                }
-            }
-        });
-        let token_result = self.token_file.remove();
+        let task_result = match self.task.await {
+            Ok(result) => result,
+            Err(_) => Err("local API task failed".to_owned()),
+        };
+        let token_result = crate::platform::linux::api_token::remove(&self.token_file);
         task_result.and(token_result)
     }
-}
-
-/// Static assets contain no credentials. The browser authenticates API calls separately.
-async fn handle_web(
-    State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
-    if !remote.ip().is_loopback()
-        || !valid_host(&headers, state.listen_address)
-        || !valid_origin(&headers, state.listen_address)
-    {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "request must target the local API",
-        ));
-    }
-    let (content_type, body) = crate::web::asset(uri.path())
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "asset not found"))?;
-    let mut response = Response::new(axum::body::Body::from(body));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    headers.insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
-    Ok(response)
-}
-
-async fn handle_state(
-    State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
-    authenticate(&state, remote, &headers)?;
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StateRequest {}
-    serde_json::from_slice::<StateRequest>(&body).map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "state request must be an empty JSON object",
-        )
-    })?;
-    let snapshot = state
-        .runtime
-        .lock()
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "runtime state is unavailable",
-            )
-        })?
-        .snapshot()
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, &e))?;
-    Ok(([("cache-control", "no-store")], Json(snapshot)).into_response())
-}
-
-/// Query authenticated capabilities over QUIC without holding the runtime lock during IO.
-async fn handle_peer_info(
-    State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
-    use tokio::io::AsyncReadExt;
-    authenticate(&state, remote, &headers)?;
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct InfoRequest {
-        peer: String,
-    }
-    let request: InfoRequest = serde_json::from_slice(&body)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "expected a peer public key"))?;
-    let key = state
-        .runtime
-        .lock()
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "runtime state is unavailable",
-            )
-        })?
-        .registered_peer(&request.peer)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
-    let network = state
-        .network
-        .as_ref()
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "network unavailable"))?;
-    let mut response = network
-        .request(
-            key,
-            portal_net::Request {
-                service: "portal".into(),
-                operation: "info".into(),
-                payload: serde_json::json!({}),
-            },
-        )
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, &e))?;
-    if response.header.status != 200 || response.header.length > 4096 {
-        return Err(api_error(
-            StatusCode::BAD_GATEWAY,
-            "peer did not return supported capabilities",
-        ));
-    }
-    let mut bytes = Vec::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        response.body.read_to_end(&mut bytes),
-    )
-    .await
-    .map_err(|_| api_error(StatusCode::GATEWAY_TIMEOUT, "peer info timed out"))?
-    .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "could not read peer info"))?;
-    let info: crate::service::PeerInfo = serde_json::from_slice(&bytes)
-        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid peer info"))?;
-    if portal_net::parse_key(&info.public_key).ok() != Some(key) {
-        return Err(api_error(
-            StatusCode::BAD_GATEWAY,
-            "peer info identity mismatch",
-        ));
-    }
-    if let Some(relay) = &info.relay_server {
-        if relay.public_key != key {
-            return Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                "relay capability identity mismatch",
-            ));
-        }
-        relay
-            .validate()
-            .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid advertised peer relay"))?;
-    }
-    let mut runtime = state.runtime.lock().map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime state is unavailable",
-        )
-    })?;
-    runtime
-        .registered_peer(&request.peer)
-        .map_err(|e| api_error(StatusCode::CONFLICT, &e))?;
-    runtime.peer_info.insert(key, info.clone());
-    Ok(([("cache-control", "no-store")], Json(info)).into_response())
 }
 
 /// Authenticate a loopback request, dispatch its command, and return a JSON result.
 async fn handle_command(
     State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<CommandResponse>, (StatusCode, Json<CommandResponse>)> {
@@ -362,98 +201,6 @@ async fn handle_command(
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request is too large",
-        ));
-    }
-    authenticate(&state, remote, &headers)?;
-
-    let request: ManagementRequest = serde_json::from_slice(&body).map_err(|error| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid JSON request: {error}"),
-        )
-    })?;
-    if matches!(request, ManagementRequest::ServicesReload) {
-        let sender = {
-            let runtime = state.runtime.lock().map_err(|_| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "runtime state is unavailable",
-                )
-            })?;
-            runtime.reload.clone().ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    "reload requires a configuration file",
-                )
-            })?
-        };
-        let (response, receiver) = oneshot::channel();
-        sender
-            .try_send(crate::service::ReloadRequest { response })
-            .map_err(|_| {
-                api_error(
-                    StatusCode::CONFLICT,
-                    "service reload is busy or unavailable",
-                )
-            })?;
-        let result = receiver.await.map_err(|_| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "runtime stopped during reload",
-            )
-        })?;
-        return result
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
-            .and_then(command_response);
-    }
-    let mut runtime = state.runtime.lock().map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime state is unavailable",
-        )
-    })?;
-    let result = runtime.handle_api_request(request);
-    result
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
-        .and_then(command_response)
-}
-
-fn command_response(
-    message: String,
-) -> Result<Json<CommandResponse>, (StatusCode, Json<CommandResponse>)> {
-    let response = CommandResponse { message };
-    let size = serde_json::to_vec(&response)
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not encode command response",
-            )
-        })?
-        .len();
-    if size > MAX_COMMAND_RESPONSE_BYTES {
-        return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "command response exceeds the 256 KiB limit",
-        ));
-    }
-    Ok(Json(response))
-}
-
-fn authenticate(
-    state: &ApiState,
-    remote: SocketAddr,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<CommandResponse>)> {
-    if !remote.ip().is_loopback() || !valid_host(headers, state.listen_address) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "request must target the local API",
-        ));
-    }
-    if !valid_origin(headers, state.listen_address) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "request origin is not allowed",
         ));
     }
     if headers
@@ -466,111 +213,106 @@ fn authenticate(
             "Content-Type must be application/json",
         ));
     }
-    if !valid_token(headers, state.token.as_str()) {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid API bearer token",
-        ));
-    }
-
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileRequest {
-    peer: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "portal_files::models::default_page_size")]
-    limit: usize,
-}
-async fn handle_files(
-    State(state): State<ApiState>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    Path(operation): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, (StatusCode, Json<CommandResponse>)> {
-    authenticate(&state, remote, &headers)?;
-    let request: FileRequest = serde_json::from_slice(&body)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid file API request"))?;
-    let payload = match operation.as_str() {
-        "resources" => serde_json::json!({}),
-        "list" => {
-            serde_json::json!({"path": request.path, "offset": request.offset, "limit": request.limit})
-        }
-        "metadata" | "download" => serde_json::json!({"path": request.path}),
-        _ => {
-            return Err(api_error(
-                StatusCode::NOT_FOUND,
-                "unknown file API operation",
-            ));
-        }
-    };
-    let peer_request = portal_net::Request {
-        service: "files".into(),
-        operation,
-        payload,
-    };
-    peer_request
-        .validate_size()
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
-    // Release the runtime lock before any network IO.
-    let address = state
-        .runtime
-        .lock()
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "runtime state is unavailable",
-            )
-        })?
-        .registered_peer(&request.peer)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
-    let network = state.network.clone().ok_or_else(|| {
+    let request: ManagementRequest = serde_json::from_slice(&body).map_err(|error| {
         api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "QUIC transport unavailable",
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON request: {error}"),
         )
     })?;
-    let response = network
-        .request(address, peer_request)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, &error))?;
-    let header = response.header.clone();
-    let mut result = Response::new(axum::body::Body::from_stream(
-        portal_files::response_stream(response),
-    ));
-    *result.status_mut() = StatusCode::from_u16(header.status)
-        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid peer status"))?;
-    result.headers_mut().insert(
-        axum::http::header::CONTENT_LENGTH,
-        axum::http::HeaderValue::from_str(&header.length.to_string()).expect("numeric size"),
-    );
-    result.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    result.headers_mut().insert(
-        CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(if header.file_name.is_some() {
-            "application/octet-stream"
-        } else {
-            "application/json"
-        }),
-    );
-    if let Some(name) = header.file_name {
-        let encoded: String = name.bytes().map(|b| format!("%{b:02X}")).collect();
-        result.headers_mut().insert(
-            axum::http::header::CONTENT_DISPOSITION,
-            axum::http::HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}"))
-                .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "invalid filename"))?,
-        );
+    if let ManagementRequest::Connect { peer_device_id } = request {
+        let agent = state.agent.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "P2P signaling requires managed mode",
+            )
+        })?;
+        return agent
+            .connect(peer_device_id)
+            .await
+            .map(|message| Json(CommandResponse { message }))
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e));
     }
-    Ok(result)
+    let mut runtime = state.runtime.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state is unavailable",
+        )
+    })?;
+    let result = runtime.handle_api_request(request);
+    result
+        .map(|message| Json(CommandResponse { message }))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+}
+
+async fn handle_snapshot(
+    State(state): State<ApiState>,
+) -> Result<Json<crate::snapshot::Snapshot>, (StatusCode, Json<CommandResponse>)> {
+    let runtime = state.runtime.lock().map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state is unavailable",
+        )
+    })?;
+    runtime
+        .snapshot()
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, &e))
+}
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../web/index.html"))
+}
+
+async fn javascript() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/app.js"),
+    )
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/style.css"),
+    )
+}
+
+/// Assets are public; every endpoint containing device data requires the API token.
+async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if !valid_token(request.headers(), state.token.as_str()) {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid API bearer token").into_response();
+    }
+    next.run(request).await
+}
+
+async fn local_request(
+    State(state): State<ApiState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let mut response = if !remote.ip().is_loopback() || !valid_host(headers, state.listen_address) {
+        api_error(StatusCode::FORBIDDEN, "request must target the local API").into_response()
+    } else if !valid_origin(headers, state.listen_address) {
+        api_error(StatusCode::FORBIDDEN, "request origin is not allowed").into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        (
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    ] {
+        headers.insert(name, value.parse().expect("constant response header"));
+    }
+    response
 }
 
 /// Build a JSON error response with the matching HTTP status.
@@ -613,6 +355,9 @@ fn allowed_authority(authority: &str, port: u16) -> bool {
 
 /// Compare the supplied bearer token without data-dependent early exit.
 fn valid_token(headers: &HeaderMap, expected: &str) -> bool {
+    if headers.get_all(AUTHORIZATION).iter().count() != 1 {
+        return false;
+    }
     let Some(supplied) = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -630,93 +375,4 @@ fn valid_token(headers: &HeaderMap, expected: &str) -> bool {
             difference | (left ^ right)
         })
         == 0
-}
-
-#[cfg(test)]
-mod file_api_tests {
-    use super::*;
-    #[tokio::test]
-    async fn file_routes_require_local_host_origin_and_bearer_token() {
-        let state = ApiState {
-            runtime: Arc::new(Mutex::new(crate::service::test_runtime())),
-            token: Arc::new(Zeroizing::new("secret".into())),
-            listen_address: "127.0.0.1:51821".parse().unwrap(),
-            network: None,
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert(HOST, "127.0.0.1:51821".parse().unwrap());
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        let body = Bytes::from_static(
-            br#"{"peer":"0101010101010101010101010101010101010101010101010101010101010101"}"#,
-        );
-        let result = handle_files(
-            State(state.clone()),
-            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
-            Path("resources".into()),
-            headers.clone(),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::UNAUTHORIZED);
-        headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
-        headers.insert(ORIGIN, "http://example.com".parse().unwrap());
-        let result = handle_files(
-            State(state.clone()),
-            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
-            Path("resources".into()),
-            headers.clone(),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
-        headers.remove(ORIGIN);
-        headers.insert(HOST, "example.com:51821".parse().unwrap());
-        let result = handle_files(
-            State(state.clone()),
-            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
-            Path("resources".into()),
-            headers.clone(),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
-        headers.insert(HOST, "127.0.0.1:51821".parse().unwrap());
-        let result = handle_files(
-            State(state.clone()),
-            ConnectInfo("10.20.0.3:1234".parse().unwrap()),
-            Path("resources".into()),
-            headers.clone(),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
-        let result = handle_files(State(state.clone()), ConnectInfo("127.0.0.1:1234".parse().unwrap()), Path("resources".into()), headers.clone(), Bytes::from_static(br#"{"peer":"0101010101010101010101010101010101010101010101010101010101010101","url":"http://127.0.0.1"}"#)).await;
-        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
-        // Valid local JSON can exceed the QUIC frame limit after encoding its envelope.
-        let result = handle_files(
-            State(state.clone()),
-            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
-            Path("download".into()),
-            headers.clone(),
-            Bytes::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "peer": "01".repeat(32), "path": "\u{0001}".repeat(3000)
-                }))
-                .unwrap(),
-            ),
-        )
-        .await;
-        let (status, Json(error)) = result.err().unwrap();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(error.message.contains("16 KiB"));
-        let result = handle_files(
-            State(state),
-            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
-            Path("unknown".into()),
-            headers,
-            body,
-        )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::NOT_FOUND);
-    }
 }
