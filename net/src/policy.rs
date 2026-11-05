@@ -133,6 +133,12 @@ pub fn compile(
     {
         return Err("network map identity changed or revision went backwards".into());
     }
+    if let Some(stun) = &map.stun {
+        if stun.port == 0 {
+            return Err("invalid coordinator STUN port".into());
+        }
+        validate_endpoints(&stun.endpoints)?;
+    }
     validate_device(&map.device)?;
     if normalize_permissions(map.policy.permissions.clone())? != map.policy.permissions {
         return Err("noncanonical published policy".into());
@@ -201,11 +207,23 @@ pub fn validate_signal(
     local: &Permissions,
     incoming: bool,
 ) -> Result<PeerKey, String> {
+    validate_signal_at(signal, map, local, incoming, unix_now()?)
+}
+
+/// Validate expiry against the coordinator clock projected from a live map.
+/// The caller must retain the map receipt Instant across local policy edits.
+pub fn validate_signal_at(
+    signal: &ConnectionInfo,
+    map: &NetworkMap,
+    local: &Permissions,
+    incoming: bool,
+    coordinator_now: u64,
+) -> Result<PeerKey, String> {
     if signal.protocol_version != PROTOCOL_VERSION
         || signal.network_id != map.network_id
         || signal.generation != map.generation
-        || signal.expires_at <= unix_now()?
-        || signal.expires_at > unix_now()?.saturating_add(15)
+        || signal.expires_at <= coordinator_now
+        || signal.expires_at > coordinator_now.saturating_add(15)
         || signal.revision > map.revision
     {
         return Err("stale or unknown P2P signal".into());
@@ -284,6 +302,7 @@ mod tests {
             revision: 5,
             generated_at: unix_now().unwrap(),
             expires_at: unix_now().unwrap() + 30,
+            stun: None,
             user: User {
                 id: "owner".into(),
                 name: "owner".into(),
@@ -302,6 +321,24 @@ mod tests {
                 outgoing: PeerPermissions::default(),
             }],
         }
+    }
+
+    #[test]
+    fn discovery_descriptor_is_validated_before_map_application() {
+        let mut map = map();
+        let own = public_key(&map.device.public_key).unwrap();
+        map.stun = Some(StunService {
+            port: 3478,
+            endpoints: vec![],
+        });
+        assert!(compile(&map, &Permissions::new(), own, None).is_ok());
+        map.stun.as_mut().unwrap().port = 0;
+        assert!(compile(&map, &Permissions::new(), own, None).is_err());
+        map.stun = Some(StunService {
+            port: 3478,
+            endpoints: vec!["0.0.0.0:3478".parse().unwrap()],
+        });
+        assert!(compile(&map, &Permissions::new(), own, None).is_err());
     }
 
     #[test]
@@ -363,6 +400,44 @@ mod tests {
             expires_at: unix_now().unwrap() + 10,
         };
         assert!(validate_signal(&signal, &map, &map.policy.permissions, true).is_ok());
+        // A valid signal must survive a 21-second host clock difference while
+        // its ten-second server-side lifetime and future bound remain enforced.
+        for skew in [-21i64, 21] {
+            let server_now = (unix_now().unwrap() as i64 + skew) as u64;
+            let mut remote_signal = signal.clone();
+            remote_signal.expires_at = server_now + 10;
+            assert!(
+                validate_signal_at(
+                    &remote_signal,
+                    &map,
+                    &map.policy.permissions,
+                    true,
+                    server_now
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_signal_at(
+                    &remote_signal,
+                    &map,
+                    &map.policy.permissions,
+                    true,
+                    server_now + 10
+                )
+                .is_err()
+            );
+            remote_signal.expires_at = server_now + 16;
+            assert!(
+                validate_signal_at(
+                    &remote_signal,
+                    &map,
+                    &map.policy.permissions,
+                    true,
+                    server_now
+                )
+                .is_err()
+            );
+        }
         assert!(validate_signal(&signal, &map, &Permissions::new(), true).is_err());
         signal.permissions.tcp.push(22);
         assert!(validate_signal(&signal, &map, &map.policy.permissions, true).is_err());

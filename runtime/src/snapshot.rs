@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 #[derive(Serialize)]
 pub(crate) struct Snapshot {
+    pub setup_available: bool,
     pub mode: &'static str,
     pub healthy: bool,
     pub interface: Interface,
@@ -24,6 +25,8 @@ pub(crate) struct Interface {
 pub(crate) struct Network {
     pub device_id: String,
     pub device_name: String,
+    pub user_id: String,
+    pub user_name: String,
     pub network_id: String,
     pub revision: u64,
     pub policy_revision: u64,
@@ -38,7 +41,10 @@ pub(crate) struct Peer {
     pub public_key: String,
     pub device_id: Option<String>,
     pub name: Option<String>,
+    /// Ownership is unknown for manually configured peers.
+    pub owned: Option<bool>,
     pub endpoint: Option<SocketAddr>,
+    pub path: &'static str,
     pub allowed_ips: Vec<String>,
     pub keepalive_seconds: Option<u64>,
     /// None denotes ordinary WireGuard mode, where Portal TCP ACLs do not apply.

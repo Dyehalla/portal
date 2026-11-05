@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -7,46 +6,19 @@ use std::path::{Path, PathBuf};
 use portal_runtime::{FileConfig, InterfaceAddress, RuntimeConfig, SecretKey, defaults};
 use zeroize::Zeroize;
 
-// Run the selected command and report failures using a nonzero process exit code.
-fn main() {
-    if let Err(error) = entry() {
-        eprintln!("portal-runtime: {error}");
-        std::process::exit(1);
-    }
-}
-
-// Parse the runtime subcommand and dispatch to startup or key generation.
-fn entry() -> Result<(), String> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let Some(command) = args.first().map(String::as_str) else {
-        return run_command(&[]);
-    };
-    match command {
-        "help" | "--help" | "-h" => {
-            print_usage();
-            Ok(())
-        }
-        "run" => run_command(&args[1..]),
-        "keygen" => keygen_command(&args[1..]),
-        "enroll" => enroll_command(&args[1..]),
-        other => Err(format!(
-            "unknown command `{other}`; use `portal-runtime help`"
-        )),
-    }
-}
-
 // Print supported runtime commands and their startup options.
 fn print_usage() {
     println!(
         "\
-portal-runtime — Linux WireGuard runtime with a local HTTP management API
+portal — Linux WireGuard runtime with a local HTTP management API
 
 Commands:
-  portal-runtime                             Start with defaults
-  portal-runtime run [options]                Manual startup, or default config
-  portal-runtime run --config PATH            Managed startup from JSON
-  portal-runtime keygen [--private-key-file PATH]
-  portal-runtime enroll [--config PATH] [--user-token-file PATH]
+  portal                                     Open panel or start agent
+  portal start [options]                     Manual startup, or default config
+  portal run [options]                       Same as portal start
+  portal start --config PATH                 Managed startup from JSON
+  portal keygen [--private-key-file PATH]
+  portal enroll [--config PATH] [--user-token-file PATH]
 
 Run options:
   --tun NAME                TUN interface (default: {tun})
@@ -79,7 +51,7 @@ The runtime stays in the foreground. Web panel: http://{api}/",
 }
 
 // Validate runtime options, build the device configuration, and start the foreground service.
-fn run_command(args: &[String]) -> Result<(), String> {
+pub(crate) fn run_command(args: &[String]) -> Result<(), String> {
     if matches!(args, [arg] if matches!(arg.as_str(), "--help" | "-h")) {
         print_usage();
         return Ok(());
@@ -174,8 +146,16 @@ fn run_command(args: &[String]) -> Result<(), String> {
         "private-key-file",
         defaults::PRIVATE_KEY_FILE,
     ));
-    let private_key = load_startup_key(private_key_file, true)?;
+    let profile_exists = options.is_empty()
+        && private_key_file
+            .with_extension("profile.json")
+            .try_exists()
+            .map_err(|e| e.to_string())?;
+    let private_key = load_startup_key(private_key_file, !profile_exists)?;
     portal_runtime::run(RuntimeConfig {
+        web_profile_file: options
+            .is_empty()
+            .then(|| private_key_file.with_extension("profile.json")),
         coordinator: None,
         tun_name: tun_name.to_owned(),
         private_key,
@@ -191,7 +171,7 @@ fn run_command(args: &[String]) -> Result<(), String> {
     })
 }
 
-fn enroll_command(args: &[String]) -> Result<(), String> {
+pub(crate) fn enroll_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args, &[])?;
     validate_options(&options, &["config", "user-token-file"], &[])?;
     let config = FileConfig::load(Path::new(option_or(
@@ -226,7 +206,7 @@ fn enroll_command(args: &[String]) -> Result<(), String> {
 }
 
 // Create a protected private-key file and print the corresponding public key.
-fn keygen_command(args: &[String]) -> Result<(), String> {
+pub(crate) fn keygen_command(args: &[String]) -> Result<(), String> {
     let options = parse_options(args, &[])?;
     validate_options(&options, &["private-key-file"], &[])?;
     let path = PathBuf::from(option_or(

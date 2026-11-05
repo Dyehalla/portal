@@ -29,6 +29,7 @@ struct ApiState {
     map_polls: KeyedLimiter,
     incoming_polls: KeyedLimiter,
     signaling: Signaling,
+    stun: Option<StunService>,
 }
 
 impl ApiState {
@@ -41,8 +42,11 @@ impl ApiState {
 
     async fn network_map(&self, credential: Credential) -> Result<NetworkMap> {
         let lease_seconds = self.lease_seconds;
-        self.call(move |store| store.network_map(credential, lease_seconds))
-            .await
+        let mut map = self
+            .call(move |store| store.network_map(credential, lease_seconds))
+            .await?;
+        map.stun = self.stun.clone();
+        Ok(map)
     }
 }
 
@@ -63,6 +67,7 @@ pub struct Coordinator {
     listen: std::net::SocketAddr,
     tls: RustlsConfig,
     state: ApiState,
+    stun: Option<crate::stun::Server>,
 }
 
 impl Coordinator {
@@ -72,6 +77,24 @@ impl Coordinator {
         let tls = RustlsConfig::from_pem_file(&config.tls.cert_file, &config.tls.key_file)
             .await
             .map_err(|e| format!("could not load coordinator TLS certificate/key: {e}"))?;
+        let stun = if config.stun.enabled {
+            Some(
+                crate::stun::Server::bind(config.stun.listen.unwrap_or(config.listen))
+                    .await
+                    .map_err(|e| format!("could not bind coordinator STUN UDP socket: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let stun_service = stun
+            .as_ref()
+            .map(|server| -> std::result::Result<StunService, String> {
+                Ok(StunService {
+                    port: server.local_addr().map_err(|e| e.to_string())?.port(),
+                    endpoints: config.stun.endpoints.clone(),
+                })
+            })
+            .transpose()?;
         let store_config = config.clone();
         let db =
             tokio::task::spawn_blocking(move || Store::open(&store_config).and_then(Database::new))
@@ -84,11 +107,13 @@ impl Coordinator {
             map_polls: KeyedLimiter::new(256),
             incoming_polls: KeyedLimiter::new(128),
             signaling: Signaling::new(),
+            stun: stun_service,
         };
         Ok(Self {
             listen: config.listen,
             tls,
             state,
+            stun,
         })
     }
 
@@ -96,10 +121,19 @@ impl Coordinator {
         Router::new()
             .route("/health", get(health))
             .route("/api/v1/users", post(register_user).get(find_user))
+            .route("/api/v1/registration", post(register_retryable))
+            .route("/api/v1/enrollment", post(enroll_retryable))
             .route("/api/v1/me", get(me))
             .route("/api/v1/devices", post(register_device).get(devices))
             .route("/api/v1/devices/:id", axum::routing::delete(revoke_device))
             .route("/api/v1/devices/:id/token", post(rotate_device_token))
+            .route(
+                "/api/v1/devices/:id/policy",
+                get(owner_policy).put(save_owner_policy),
+            )
+            .route("/api/v1/devices/:id/name", put(rename_device))
+            .route("/api/v1/device/desired-policy", get(desired_policy))
+            .route("/api/v1/device/policy-ack", post(ack_policy))
             .route("/api/v1/device", get(own_device))
             .route("/api/v1/device/endpoints", put(update_endpoints))
             .route("/api/v1/device/policy", put(publish_policy))
@@ -126,11 +160,27 @@ impl Coordinator {
         self.router()
     }
 
+    pub fn stun_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stun
+            .as_ref()
+            .and_then(|server| server.local_addr().ok())
+    }
+
     pub async fn serve(self, handle: Handle<std::net::SocketAddr>) -> std::io::Result<()> {
-        axum_server::bind_rustls(self.listen, self.tls.clone())
-            .handle(handle)
-            .serve(self.router().into_make_service())
-            .await
+        let router = self.router();
+        let https = axum_server::bind_rustls(self.listen, self.tls)
+            .handle(handle.clone())
+            .serve(router.into_make_service());
+        let discovery = async {
+            match self.stun {
+                Some(stun) => stun.run().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = https => result,
+            result = discovery => { handle.shutdown(); result }
+        }
     }
 }
 
@@ -167,6 +217,45 @@ async fn register_user(
                 .call(move |store| store.register_user(request))
                 .await?,
         ),
+    ))
+}
+
+async fn register_retryable(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RegisterUser>,
+) -> Result<Json<RegisteredUser>> {
+    credentials::from_headers(&headers)?;
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or_else(Error::unauthorized)?
+        .to_owned();
+    Ok(Json(
+        state
+            .call(move |store| store.register_user_token(request, Some(token)))
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enrollment {
+    device: RegisterDevice,
+    access_token: String,
+}
+async fn enroll_retryable(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Json(request): Json<Enrollment>,
+) -> Result<Json<RegisteredDevice>> {
+    Ok(Json(
+        state
+            .call(move |store| {
+                store.register_device_token(credential, request.device, Some(request.access_token))
+            })
+            .await?,
     ))
 }
 
@@ -213,6 +302,64 @@ async fn devices(
 ) -> Result<Json<Vec<Device>>> {
     Ok(Json(
         state.call(move |store| store.devices(credential)).await?,
+    ))
+}
+
+async fn owner_policy(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Path(id): Path<String>,
+) -> Result<Json<DesiredPolicy>> {
+    Ok(Json(
+        state.call(move |s| s.owner_policy(credential, &id)).await?,
+    ))
+}
+async fn save_owner_policy(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Path(id): Path<String>,
+    Json(request): Json<PublishPolicy>,
+) -> Result<Json<DesiredPolicy>> {
+    Ok(Json(
+        state
+            .call(move |s| s.save_owner_policy(credential, &id, request))
+            .await?,
+    ))
+}
+async fn desired_policy(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+) -> Result<Json<Option<DesiredPolicy>>> {
+    Ok(Json(
+        state.call(move |s| s.desired_policy(credential)).await?,
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Revision {
+    revision: u64,
+}
+async fn ack_policy(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Json(request): Json<Revision>,
+) -> Result<Json<DesiredPolicy>> {
+    Ok(Json(
+        state
+            .call(move |s| s.acknowledge_policy(credential, request.revision))
+            .await?,
+    ))
+}
+async fn rename_device(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Path(id): Path<String>,
+    Json(request): Json<RegisterUser>,
+) -> Result<Json<Device>> {
+    Ok(Json(
+        state
+            .call(move |s| s.rename_device(credential, &id, &request.name))
+            .await?,
     ))
 }
 

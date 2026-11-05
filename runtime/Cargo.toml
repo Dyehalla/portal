@@ -5,10 +5,6 @@ edition = "2024"
 description = "Linux WireGuard runtime with a local HTTP management API"
 rust-version = "1.89"
 
-[[bin]]
-name = "portal-runtime"
-path = "src/main.rs"
-
 [dependencies]
 portal = { path = "../wireguard" }
 portal-net = { path = "../net", features = ["agent"] }

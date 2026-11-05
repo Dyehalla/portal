@@ -54,6 +54,7 @@ impl Store {
             network_id,
             generation,
             revision,
+            stun: None,
             generated_at,
             expires_at: generated_at + lease_seconds,
             user: owner,

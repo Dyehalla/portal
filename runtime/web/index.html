@@ -7,21 +7,56 @@
     <title>Portal — локальная сеть</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/style.css" />
-    <script type="module" src="/app.js"></script>
+    <script src="/map.js" defer></script>
+    <script src="/app.js" defer></script>
   </head>
   <body>
+    <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <symbol id="i-devices" viewBox="0 0 24 24">
+          <rect x="2" y="4" width="15" height="12" rx="2" />
+          <path d="M6 20h7m-4-4v4" />
+          <rect x="17" y="10" width="5" height="10" rx="1" />
+        </symbol>
+        <symbol id="i-pulse" viewBox="0 0 24 24">
+          <path d="M2 12h5l3-8 4 16 3-8h5" />
+        </symbol>
+        <symbol id="i-arrow" viewBox="0 0 24 24">
+          <path d="M4 12h16m-6-6 6 6-6 6" />
+        </symbol>
+        <symbol id="i-server" viewBox="0 0 24 24">
+          <rect x="4" y="3" width="16" height="18" rx="3" />
+          <path d="M4 12h16M8 7h.01M8 16h.01m4-9h4m-4 9h4" />
+        </symbol>
+        <symbol id="i-laptop" viewBox="0 0 24 24">
+          <path d="M4 16V5h16v11M2 16h20l-2 4H4Z" />
+        </symbol>
+        <symbol id="i-power" viewBox="0 0 24 24">
+          <path d="M12 3v9m-5-7a9 9 0 1 0 10 0" />
+        </symbol>
+        <symbol id="i-lock" viewBox="0 0 24 24">
+          <rect x="5" y="10" width="14" height="11" rx="3" />
+          <path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" />
+        </symbol>
+        <symbol id="i-search" viewBox="0 0 24 24">
+          <circle cx="10" cy="10" r="6" />
+          <path d="m15 15 6 6" />
+        </symbol>
+        <symbol id="i-close" viewBox="0 0 24 24">
+          <path d="m6 6 12 12M6 18 18 6" />
+        </symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24">
+          <path d="m9 5 7 7-7 7" />
+        </symbol>
+      </defs>
+    </svg>
+
     <section id="auth-view" class="auth-view" aria-labelledby="auth-title">
       <div class="auth-card">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true"></span>portal<span
-            class="brand-label"
-            >LOCAL</span
-          >
-        </div>
-        <p class="eyebrow">ВАША СЕТЬ ПОД РУКОЙ</p>
-        <h1 id="auth-title">Открыть Portal</h1>
+        <div class="brand">portal</div>
+        <h1 id="auth-title">Подключиться к клиенту</h1>
         <p class="muted">
-          Устройства, доступ и состояние сети на этом компьютере.
+          Откройте панель из установленного приложения Portal. Ссылка приложения подключает браузер к этому компьютеру автоматически.
         </p>
         <form id="auth-form">
           <label for="token">Токен локального API</label>
@@ -34,7 +69,7 @@
             pattern="[a-fA-F0-9]{64}"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Вставьте токен из файла агента"
+            placeholder="Токен локальной сессии"
           />
           <p class="field-hint">
             Ссылку для входа можно получить командой
@@ -53,7 +88,7 @@
         </form>
         <p class="privacy-note">
           Вход сохраняется при обновлении страницы в этой вкладке.<br />
-          Кнопка «Выйти» удаляет сохранённый токен.
+          Выход из панели завершает сессию браузера. VPN продолжает работать.
         </p>
         <div class="auth-footer">
           <span class="status-dot" aria-hidden="true"></span
@@ -62,201 +97,233 @@
       </div>
     </section>
 
-    <div id="app" class="app" hidden>
-      <main>
-        <header class="topbar">
-          <a class="brand" href="#overview" aria-label="Portal — обзор">
-            <span class="brand-mark" aria-hidden="true"></span>portal<span
-              class="brand-label"
-              >LOCAL</span
-            >
-          </a>
-          <div class="topbar-actions">
-            <code id="api-address"></code>
-            <button id="sign-out" class="text-button" type="button">
-              Выйти <span aria-hidden="true">↗</span>
-            </button>
+    <div id="app" hidden>
+      <aside class="sidebar">
+        <a href="#devices" class="brand" aria-label="Portal — главная">portal</a>
+        <div class="workspace">
+          <div>
+            <strong id="workspace-name">Сеть Portal</strong
+            ><span id="workspace-mode">Локальная панель</span>
           </div>
-        </header>
-        <div class="content">
-          <section id="overview" aria-labelledby="page-title">
+          <svg class="icon"><use href="#i-lock" /></svg>
+        </div>
+        <nav aria-label="Основная навигация">
+          <a href="#devices" data-page="devices" class="nav-link"
+            ><svg class="icon"><use href="#i-devices" /></svg>Устройства<span
+              class="nav-count"
+              >0</span
+            ></a
+          >
+          <a href="#network" data-page="network" class="nav-link"><svg class="icon"><use href="#i-server" /></svg>Сеть и аккаунт</a>
+          <a href="#map" data-page="map" class="nav-link"><svg class="icon"><use href="#i-lock" /></svg>Карта разрешений</a>
+          <a href="#diagnostics" data-page="diagnostics" class="nav-link"
+            ><svg class="icon"><use href="#i-pulse" /></svg>Диагностика</a
+          >
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-device">
+            <span class="local-icon"
+              ><svg class="icon"><use href="#i-laptop" /></svg
+            ></span>
+            <div>
+              <strong id="local-name">Это устройство</strong
+              ><span id="local-status">Локальный агент</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="shell">
+        <main id="main">
+          <div
+            id="connection-error"
+            class="notice error"
+            role="alert"
+            hidden
+          ></div>
+          <div
+            id="lease-warning"
+            class="notice warning"
+            role="status"
+            hidden
+          ></div>
+          <section id="devices" class="page" aria-labelledby="devices-title">
             <div class="page-heading">
               <div>
-                <p class="eyebrow">PORTAL NETWORK</p>
-                <h1 id="page-title">Моё устройство</h1>
-                <p id="device-subtitle" class="muted">
-                  Состояние сетевого агента
+                <h1 id="devices-title">Устройства <span class="small-count" id="device-count">0</span></h1>
+                <p class="subtitle">
+                  <span id="network-context">Состояние локальной сети</span>
                 </p>
               </div>
-              <div class="heading-actions">
-                <span id="agent-state" class="badge">Загрузка</span
-                ><button id="refresh" class="button secondary" type="button">
-                  <span aria-hidden="true">↻</span> Обновить
-                </button>
-              </div>
+              <span class="network-badge" id="agent-state">Загрузка</span>
             </div>
-            <div
-              id="connection-error"
-              class="notice error"
-              role="alert"
-              hidden
-            ></div>
-            <div
-              id="lease-warning"
-              class="notice warning"
-              role="status"
-              hidden
-            ></div>
-            <div class="summary-grid">
-              <article class="summary-card">
-                <span class="card-label">Адрес устройства</span
-                ><strong id="primary-ip" class="mono">—</strong
-                ><span id="secondary-ip" class="card-caption mono">—</span>
-              </article>
-              <article class="summary-card">
-                <span class="card-label">Координатор</span
-                ><strong id="coordinator-state">—</strong
-                ><span id="network-revision" class="card-caption">—</span>
-              </article>
-              <article class="summary-card">
-                <span class="card-label">Карта сети</span
-                ><strong id="lease-time">—</strong
-                ><span id="lease-caption" class="card-caption">—</span>
-              </article>
-              <article class="summary-card">
-                <span class="card-label">Устройства в карте</span
-                ><strong id="peer-count">0</strong
-                ><span id="peer-count-caption" class="card-caption"
-                  >В текущей карте сети</span
-                >
-              </article>
-            </div>
-            <section class="panel identity" aria-label="Локальное устройство">
-              <span class="device-icon" aria-hidden="true">▣</span>
-              <div class="identity-main">
-                <h2 id="device-name">Это устройство</h2>
-                <p>
-                  <span id="interface-name" class="mono"></span
-                  ><span class="separator">·</span><span id="mode-label"></span>
-                </p>
-              </div>
-              <div class="identity-key">
-                <span class="card-label">Публичный WireGuard-ключ</span
-                ><button
-                  id="copy-key"
-                  class="key-button mono"
-                  type="button"
-                  title="Скопировать публичный ключ"
-                >
-                  —
-                </button>
-              </div>
-            </section>
+
+
+
+            <label class="search"
+              ><svg class="icon"><use href="#i-search" /></svg
+              ><input
+                id="peer-search"
+                type="search"
+                placeholder="Найти имя, адрес или ключ"
+                aria-label="Поиск устройств"
+            /></label>
+            <p class="scope-note">Собственные устройства показаны из реестра аккаунта, включая устройства без разрешений. Чужие узлы видны только из разрешённой карты текущего агента.</p>
+            <div id="current-device" class="diagnostic-card" tabindex="-1"></div>
+            <div id="device-list" class="device-list"></div>
           </section>
 
-          <section id="peers" class="section" aria-labelledby="peers-title">
-            <div class="section-heading">
-              <div>
-                <h2 id="peers-title">Устройства</h2>
-                <p class="muted">Разрешённые связи этого агента</p>
+          <section id="network" class="page" aria-labelledby="network-title" hidden>
+            <div class="page-heading"><div><h1 id="network-title">Подключиться к сети</h1>
+            <p class="subtitle">Войдите с токеном аккаунта или зарегистрируйтесь на своём координаторе.</p></div></div>
+            <div class="diagnostic-card setup-card">
+              <p id="network-error" class="form-error" role="alert" hidden></p>
+              <form id="network-form">
+                <div class="setup-tabs" role="group" aria-label="Способ подключения"><button id="login-mode" type="button" class="button primary" aria-pressed="true">Войти</button><button id="register-mode" type="button" class="button secondary" aria-pressed="false">Регистрация</button></div>
+                <label>Адрес координатора<input id="coordinator" required placeholder="vpn.example.com или 192.0.2.1:9443" autocomplete="url" spellcheck="false" /></label>
+                <p class="field-hint" id="normalized-address">Используется HTTPS. Без указанного порта — стандартный порт 443.</p>
+                <label id="user-token-label">Токен входа<input id="user-token" type="password" autocomplete="off" spellcheck="false" placeholder="usr_…" required /></label>
+                <button id="toggle-user-token" class="text-link plain-button" type="button" aria-pressed="false">Показать токен</button>
+                <div id="registration-key-label" hidden><label>Публичный ключ этого устройства<input id="registration-key" readonly /></label><button id="copy-registration-key" class="text-link plain-button" type="button">Скопировать публичный ключ</button></div>
+                <label id="user-name-label" hidden>Имя пользователя<input id="user-name" maxlength="128" autocomplete="username" /></label>
+                <details><summary>Доверенный сертификат / CA</summary><p class="field-hint">Для собственного центра сертификации выберите доверенный PEM-файл. Проверка сертификата и имени сервера остаётся включённой.</p><input id="ca-file" type="file" accept=".pem,.crt" /></details>
+                <button id="network-submit" class="button primary" type="submit">Войти в сеть</button>
+                <button id="no-token" class="text-link plain-button" type="button">Нет токена? Зарегистрироваться</button>
+              </form>
+              <form id="add-device-form" hidden>
+                <h2>Добавить это устройство</h2><p class="scope-note">Ключ создан локальным агентом. Имя можно изменить перед добавлением.</p>
+                <label>Имя устройства<input id="device-name" required maxlength="128" /></label>
+                <label>Публичный ключ WireGuard<input id="device-public-key" readonly /></label><button id="copy-device-key" class="text-link plain-button" type="button">Скопировать публичный ключ</button>
+                <p id="device-error" class="form-error" role="alert" hidden></p>
+                <button id="add-device-submit" class="button primary" type="submit">Добавить и подключиться</button>
+              </form>
+              <p id="activation-error" class="form-error" role="alert" hidden></p>
+              <div id="account-summary" hidden><dl id="account-details" class="detail-list"></dl>
+                <div class="setup-tabs"><button id="copy-user-token" class="button secondary" type="button">Скопировать токен</button><button id="save-user-token" class="button secondary" type="button">Сохранить токен в файл</button><button id="resume-network" class="button primary" type="button">Подключить это устройство</button></div>
               </div>
-              <label class="search"
-                ><span aria-hidden="true">⌕</span
-                ><input
-                  id="peer-search"
-                  type="search"
-                  placeholder="Найти имя, адрес или ключ"
-                  aria-label="Найти устройство"
-              /></label>
             </div>
-            <div class="panel peer-panel">
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th scope="col">Устройство</th>
-                      <th scope="col">Адреса Portal</th>
-                      <th scope="col">TCP-доступ</th>
-                      <th scope="col">Трафик</th>
-                      <th scope="col"><span class="sr-only">Действия</span></th>
-                    </tr>
-                  </thead>
-                  <tbody id="peer-rows"></tbody>
-                </table>
-              </div>
-              <div id="empty-peers" class="empty-state" hidden>
-                <span class="empty-symbol" aria-hidden="true">▦</span>
-                <h3 id="empty-title">Пиров пока нет</h3>
-                <p id="empty-caption" class="muted">
-                  Пиры появятся после выдачи разрешений на устройствах.
-                </p>
-              </div>
-              <div class="panel-footer">
-                <span id="peer-result-count">0 устройств</span
-                ><span>Наличие в карте не подтверждает прямое соединение</span>
+            <div class="session-actions" role="group" aria-label="Локальная сессия">
+              <span>Локальный агент <code id="api-address"></code></span>
+              <button class="button secondary" id="refresh" type="button">Обновить</button>
+              <button class="button secondary" id="sign-out" type="button">Выйти из панели</button>
+            </div>
+          </section>
+          <section id="map" class="page" aria-labelledby="map-title" hidden>
+            <div class="page-heading"><div><h1 id="map-title">Карта разрешений</h1>
+            </div></div>
+            <div class="map-canvas">
+              <div id="map-list" aria-label="Карта устройств и разрешений"></div>
+              <p id="map-empty" class="map-empty" hidden>Сеть не подключена</p>
+              <div class="map-controls" aria-label="Масштаб графа">
+                <button id="map-zoom-out" type="button" aria-label="Уменьшить масштаб">−</button>
+                <output id="map-zoom-level">100%</output>
+                <button id="map-zoom-in" type="button" aria-label="Увеличить масштаб">＋</button>
+                <button id="map-fit" type="button" aria-label="Показать весь граф" title="Показать весь граф">⛶</button>
               </div>
             </div>
           </section>
-
           <section
             id="diagnostics"
-            class="section"
+            class="page"
             aria-labelledby="diagnostics-title"
+            hidden
           >
-            <div class="section-heading">
+            <div class="page-heading">
               <div>
-                <h2 id="diagnostics-title">Диагностика</h2>
-                <p class="muted">Счётчики с момента запуска агента</p>
-              </div>
-              <span id="last-updated" class="updated" aria-live="off">—</span>
-            </div>
-            <div class="diagnostics-grid">
-              <div class="panel counter">
-                <span class="card-label">Входящие UDP-пакеты</span
-                ><strong id="udp-count">0</strong>
-              </div>
-              <div class="panel counter">
-                <span class="card-label">Пакеты из TUN</span
-                ><strong id="tun-count">0</strong>
-              </div>
-              <div class="panel counter">
-                <span class="card-label">Отброшенные пакеты</span
-                ><strong id="drop-count">0</strong>
-              </div>
-              <div class="panel counter">
-                <span class="card-label">Ошибки отправки UDP</span
-                ><strong id="send-error-count">0</strong>
+                <h1 id="diagnostics-title">Состояние сети</h1>
+                <p class="subtitle" id="last-updated">
+                  Технические подробности, когда они нужны.
+                </p>
               </div>
             </div>
-            <div class="panel details-panel">
-              <div>
-                <span class="card-label">UDP-сокет агента</span
-                ><code id="listen-address">—</code>
-              </div>
-              <div>
-                <span class="card-label">ID устройства</span
-                ><code id="device-id">—</code>
-              </div>
-              <div>
-                <span class="card-label">ID сети</span
-                ><code id="network-id">—</code>
-              </div>
-              <div>
-                <span class="card-label">Локальные разрешения</span
-                ><span id="policy-state">—</span>
-              </div>
+            <div class="diagnostic-card">
+              <div class="section-heading"><h2>Локальный агент</h2></div>
+              <dl class="detail-list" id="diagnostic-summary"></dl>
+              <details>
+                <summary>Ключ и технические параметры</summary>
+                <dl class="detail-list" id="diagnostic-details"></dl>
+                <button
+                  class="text-link plain-button"
+                  id="copy-key"
+                  type="button"
+                >
+                  Скопировать публичный ключ
+                </button>
+              </details>
             </div>
+            <div class="section-heading counters-heading">
+              <h2>Счётчики с момента запуска</h2>
+            </div>
+            <div class="stats-grid" id="stats-grid"></div>
           </section>
-          <footer class="page-footer">
-            <span>Portal · локальная панель</span
-            ><span>Обновляется каждые 5 секунд</span>
-          </footer>
+        </main>
+      </div>
+
+      <dialog id="details-dialog" aria-labelledby="details-title">
+        <div class="dialog-heading">
+          <h2 id="details-title">Параметры устройства</h2>
+          <button class="icon-button" id="close-details" aria-label="Закрыть">
+            <svg class="icon"><use href="#i-close" /></svg>
+          </button>
         </div>
-      </main>
+        <article class="connection-card" id="connection-card">
+          <div class="connection-content">
+            <span class="status-pill" id="connection-status" role="status"
+              ><i class="dot"></i> Получаем состояние</span
+            >
+            <h2 id="connection-title">Подключение</h2>
+            <p class="connection-caption" id="connection-caption">
+              Выберите устройство для просмотра состояния.
+            </p>
+
+            <p id="selected-access" class="connection-caption"></p>
+            <button class="primary-button" id="connect">
+              <svg class="icon"><use href="#i-power" /></svg
+              ><span>Подключиться</span
+              ><svg class="icon button-arrow"><use href="#i-arrow" /></svg>
+            </button>
+            <button id="grant-access" class="text-link plain-button" type="button" hidden>Открыть разрешения этого устройства</button>
+            <p class="connection-footnote">
+              <svg class="icon"><use href="#i-lock" /></svg>Туннель
+              WireGuard между устройствами
+            </p>
+          </div>
+          <div class="connection-stats" id="connection-stats" hidden>
+            <span>Отправлено <strong id="peer-tx">—</strong></span
+            ><span>Получено <strong id="peer-rx">—</strong></span
+            >
+          </div>
+        </article>
+        <dl class="detail-list" id="peer-detail-list"></dl>
+        <div class="setup-tabs"><button class="text-link plain-button" id="copy-peer-key" type="button">Скопировать публичный ключ</button><button class="text-link plain-button" id="copy-peer-addresses" type="button">Скопировать адреса</button></div>
+        <div id="owner-actions" hidden>
+          <button id="edit-permissions" class="button primary" type="button">Кто может подключаться к этому устройству</button>
+          <form id="rename-form" class="setup-card"><label>Имя устройства<input id="rename-name" required maxlength="128" /></label><button id="rename-submit" class="button secondary" type="submit">Сохранить имя</button></form>
+          <details><summary>Удалить устройство из сети</summary><p class="scope-note">Устройство будет отозвано на координаторе. Его подключения перестанут работать после получения отзыва или истечения карты. Локальный профиль и аккаунт сохраняются.</p><button id="revoke-device" class="button secondary" type="button">Подтвердить удаление из сети</button></details>
+          <p id="owner-error" class="form-error" role="alert" hidden></p>
+        </div>
+      </dialog>
+      <dialog id="policy-dialog" aria-labelledby="policy-title">
+        <div class="dialog-heading"><h2 id="policy-title">Кто может подключаться к этому устройству</h2><button id="close-policy" class="icon-button" aria-label="Закрыть">×</button></div>
+        <p id="policy-target" class="scope-note"></p>
+        <p class="scope-note">Выберите устройство и доступные ему сервисы внутри туннеля WireGuard. Обратный доступ задаётся отдельно.</p>
+        <p class="scope-note">Сам туннель WireGuard не требует отдельного разрешения в этом списке.</p>
+        <form id="policy-form"><div id="policy-rules"></div><button id="add-rule" class="button secondary" type="button">Добавить устройство</button>
+        <p id="policy-status" role="status" class="scope-note"></p><p id="policy-error" class="form-error" role="alert" hidden></p>
+        <div class="setup-tabs"><button id="save-policy" class="button primary" type="submit">Сохранить разрешения</button><button id="reload-policy" class="button secondary" type="button">Загрузить актуальную ревизию</button></div></form>
+      </dialog>
+      <dialog id="bulk-dialog" aria-labelledby="bulk-title">
+        <div class="dialog-heading"><h2 id="bulk-title">Применить разрешение ко всем моим устройствам</h2><button id="close-bulk" class="icon-button" aria-label="Закрыть">×</button></div>
+        <p id="bulk-rule" class="scope-note"></p>
+        <p class="scope-note">Разрешение заменит порты этого источника на каждом указанном устройстве. Остальные источники сохранятся. Сам источник исключён. Будущие устройства не наследуют разрешение. Черновик открытого редактора остаётся без изменений.</p>
+        <div id="bulk-results" aria-live="polite"></div>
+        <p id="bulk-error" class="form-error" role="alert" hidden></p>
+        <button id="confirm-bulk" class="button primary" type="button" disabled>Применить к перечисленным устройствам</button>
+      </dialog>
     </div>
-    <div id="toast" class="toast" role="status" hidden></div>
+    <div class="toast" id="toast" role="status" hidden></div>
     <noscript
-      >Для работы панели включите JavaScript. Локальный API также доступен через
+      >Для работы панели включите JavaScript. Управление также доступно через
       CLI portal.</noscript
     >
   </body>

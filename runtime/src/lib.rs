@@ -10,6 +10,8 @@ mod private_file;
 mod runtime;
 #[cfg(target_os = "linux")]
 mod snapshot;
+#[cfg(target_os = "linux")]
+mod web_account;
 
 pub use config::{FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey, defaults};
 

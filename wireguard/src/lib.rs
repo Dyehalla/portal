@@ -5,6 +5,9 @@
 
 mod access;
 mod device;
+mod discovery;
+mod path;
+pub use path::PeerPath;
 mod platform;
 mod runtime;
 

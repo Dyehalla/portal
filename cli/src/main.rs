@@ -1,4 +1,5 @@
 mod http_api;
+mod runtime_command;
 
 mod cli {
     use std::collections::HashMap;
@@ -10,8 +11,7 @@ mod cli {
     pub(super) fn entry() -> Result<(), String> {
         let args = env::args().skip(1).collect::<Vec<_>>();
         let Some(command) = args.first().map(String::as_str) else {
-            print_usage();
-            return Ok(());
+            return web_command(&[]);
         };
 
         match command {
@@ -21,14 +21,10 @@ mod cli {
             }
             "peer" => peer_command(&args[1..]),
             "endpoint" => endpoint_command(&args[1..]),
-            "web" => {
-                let options = parse_options(&args[1..], &[])?;
-                validate_options(&options, &["api", "token-file"], &[])?;
-                let (address, token_file) = api_target(&options);
-                let url = crate::http_api::web_url(address, token_file)?;
-                println!("{}", url.as_str());
-                Ok(())
-            }
+            "start" | "run" => crate::runtime_command::run_command(&args[1..]),
+            "keygen" => crate::runtime_command::keygen_command(&args[1..]),
+            "enroll" => crate::runtime_command::enroll_command(&args[1..]),
+            "web" => web_command(&args[1..]),
             "connect" => {
                 let options = parse_options(&args[1..], &[])?;
                 validate_options(&options, &["api", "token-file", "device-id"], &[])?;
@@ -47,12 +43,14 @@ mod cli {
     fn print_usage() {
         println!(
             "\
-portal — control CLI for a running portal runtime
+portal — start and manage Portal
 
 Commands:
-  portal-runtime
-  portal-runtime run [options]
-  portal-runtime keygen [--private-key-file PATH]
+  portal                                     Same as portal web
+  portal start [options]                      Start runtime in this terminal
+  portal run [options]                        Same as portal start
+  portal keygen [--private-key-file PATH]
+  portal enroll [--config PATH] [--user-token-file PATH]
   portal peer upsert [--api IP:PORT] [--token-file PATH] --public-key HEX [--preshared-key-file PATH]
       [--endpoint ADDR] [--keepalive SECONDS] [--allowed-ip PREFIX ...]
   portal peer remove [--api IP:PORT] [--token-file PATH] --public-key HEX
@@ -60,11 +58,39 @@ Commands:
   portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
   portal connect --device-id ID [--api IP:PORT] [--token-file PATH]
-  portal web [--api IP:PORT] [--token-file PATH]  Print a web panel login link
+  portal web [--api IP:PORT] [--token-file PATH]  Get a login link; start if needed
 
-Keys are 32 raw bytes or 64 hexadecimal characters. Start portal-runtime separately.
+portal web starts runtime with defaults if no agent is listening and no options were given.
+Keep its terminal open; Ctrl+C stops the agent. Run with sudo for TUN setup.
+Use portal start --help for agent options (including --config PATH).
+Keys are 32 raw bytes or 64 hexadecimal characters.
 The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
         );
+    }
+
+    fn web_command(args: &[String]) -> Result<(), String> {
+        if matches!(args, [arg] if matches!(arg.as_str(), "--help" | "-h")) {
+            print_usage();
+            return Ok(());
+        }
+        let options = parse_options(args, &[])?;
+        validate_options(&options, &["api", "token-file"], &[])?;
+        let (address, token_file) = api_target(&options);
+        if !crate::http_api::is_listening(address)? {
+            if options.is_empty() {
+                eprintln!("Portal is not running. Starting the agent in this terminal…");
+                return crate::runtime_command::run_command(&[]);
+            }
+            return Err(format!(
+                "No agent is listening at {address}. Start it with `sudo portal start` (or `sudo portal start --config PATH`), then retry with its API address and token file."
+            ));
+        }
+        let url = crate::http_api::web_url(address, token_file)?;
+        let mut request = serde_json::to_string(&crate::http_api::ManagementRequest::Health)
+            .map_err(|error| error.to_string())?;
+        crate::http_api::send(address, token_file, &mut request)?;
+        println!("{}", url.as_str());
+        Ok(())
     }
 
     fn peer_command(args: &[String]) -> Result<(), String> {

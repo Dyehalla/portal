@@ -246,6 +246,7 @@ struct PeerCounters {
 }
 
 pub(crate) struct PeerRuntime {
+    pub path: crate::path::DirectPath,
     pub tunnel: Tunn,
     pub endpoint: Option<SocketAddr>,
     pub preshared_key: Option<PeerKey>,

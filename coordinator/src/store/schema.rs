@@ -9,7 +9,7 @@ pub(super) fn initialize(
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if !matches!(version, 0 | 2 | 3 | 4) {
+    if !matches!(version, 0 | 2 | 3 | 4 | 5) {
         return Err(
             "unsupported coordinator database schema; explicit migration is required".into(),
         );
@@ -66,7 +66,8 @@ pub(super) fn initialize(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.pragma_update(None, "user_version", 4)
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS desired_policies(device_id TEXT PRIMARY KEY REFERENCES devices(id), revision INTEGER NOT NULL CHECK(revision>=0), permissions TEXT NOT NULL, applied_revision INTEGER NOT NULL CHECK(applied_revision>=0));").map_err(|e| e.to_string())?;
+    tx.pragma_update(None, "user_version", 5)
         .map_err(|e| e.to_string())?;
     let exists: bool = tx
         .query_row("SELECT EXISTS(SELECT 1 FROM network)", [], |r| r.get(0))

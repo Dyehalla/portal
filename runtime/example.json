@@ -12,6 +12,6 @@
     "policy_file": "../runtime-state/policy.json",
     "map_file": "../runtime-state/network-map.json",
     "ca_file": "../coordinator-tls/cert.pem",
-    "endpoints": ["192.0.2.10:51820"]
+    "endpoints": []
   }
 }

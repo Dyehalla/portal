@@ -41,11 +41,35 @@ impl Store {
         credential: Credential,
         request: RegisterDevice,
     ) -> Result<RegisteredDevice> {
+        self.register_device_token(credential, request, None)
+    }
+
+    pub fn register_device_token(
+        &mut self,
+        credential: Credential,
+        request: RegisterDevice,
+        token: Option<String>,
+    ) -> Result<RegisteredDevice> {
         let name = name(&request.name)?;
         let public_key = public_key(&request.public_key)?;
         let endpoints = endpoints(request.endpoints)?;
         let tx = self.connection.transaction()?;
         let owner = authenticated_user(&tx, credential)?;
+        if let Some(ref token) = token {
+            let parsed = credentials::parse(token)?;
+            if parsed.role != Role::Device {
+                return Err(Error::unauthorized());
+            }
+            if let Ok(existing) = authenticated_device(&tx, parsed) {
+                if existing.owner_user_id != owner.id || existing.public_key != public_key {
+                    return Err(Error::conflict("enrollment identity mismatch"));
+                }
+                return Ok(RegisteredDevice {
+                    device: existing,
+                    access_token: token.clone(),
+                });
+            }
+        }
         let total: i64 = tx.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))?;
         let owned: i64 = tx.query_row(
             "SELECT COUNT(*) FROM devices WHERE owner_user_id=? AND revoked=0",
@@ -86,7 +110,13 @@ impl Store {
             endpoints,
             created_at: timestamp as u64,
         };
-        let (access_token, hash) = credentials::issue(Role::Device);
+        let (access_token, hash) = match token {
+            Some(token) => {
+                let parsed = credentials::parse(&token)?;
+                (token, parsed.hash)
+            }
+            None => credentials::issue(Role::Device),
+        };
         tx.execute("INSERT INTO devices(id,owner_user_id,name,public_key,token_hash,ipv4,ipv6,endpoints,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             params![device.id,device.owner_user_id,device.name,device.public_key,hash.as_slice(),
                 device.ipv4.to_string(),device.ipv6.to_string(),serde_json::to_string(&device.endpoints).map_err(|_| Error::internal())?,timestamp])?;

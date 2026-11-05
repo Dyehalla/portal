@@ -27,6 +27,7 @@ struct PeerRecord {
 pub(crate) struct Runtime {
     pub(crate) managed: Option<ManagedState>,
     access_control: Option<Arc<AccessControl>>,
+    web_setup: bool,
     pub(crate) dual_stack: bool,
     device: Option<Device>,
     tun_name: String,
@@ -74,9 +75,8 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
             },
         ];
     }
-    let access_control = prepared
-        .as_ref()
-        .map(|_| Arc::new(AccessControl::default()));
+    let access_control = (prepared.is_some() || options.web_profile_file.is_some())
+        .then(|| Arc::new(AccessControl::default()));
 
     let mut device_config = DeviceConfig::new(
         options.private_key.0,
@@ -120,6 +120,7 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
     let tun_name = options.tun_name.clone();
     let runtime = Runtime {
         managed: None,
+        web_setup: options.web_profile_file.is_some(),
         access_control: access_control.clone(),
         dual_stack: options.dual_stack,
         device: Some(device),
@@ -167,6 +168,7 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
         options.api_token_file.clone(),
         Arc::clone(&runtime),
         agent.clone(),
+        options.web_profile_file.clone(),
     ) {
         Ok(api) => api,
         Err(error) => {
@@ -220,12 +222,17 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
         }
         if agent_task.as_ref().is_some_and(|t| t.is_finished()) {
             let task = agent_task.take().expect("agent task present");
-            serve_result = task
-                .await
-                .map_err(|e| format!("network agent failed: {e}"))
-                .and_then(|r| r)
-                .and(Err("network agent exited unexpectedly".into()));
-            break;
+            let _ = task.await;
+            if let Some(access) = &access_control {
+                access.block();
+            }
+            if let Ok(mut runtime) = runtime.lock() {
+                if let Some(state) = &mut runtime.managed {
+                    state.connected = false;
+                    state.deadline = Instant::now();
+                }
+            }
+            eprintln!("portal: network agent stopped; account management remains available");
         }
         tokio::time::sleep(LOOP_INTERVAL).await;
     }
@@ -251,6 +258,37 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
 }
 
 impl Runtime {
+    pub(crate) fn prepare_web_network(
+        &mut self,
+        map: &NetworkMap,
+    ) -> Result<Arc<AccessControl>, String> {
+        if self.managed.is_some() {
+            return Err("Сеть уже активна".into());
+        }
+        let access = self
+            .access_control
+            .clone()
+            .ok_or("Запустите Portal без параметров ручного WireGuard")?;
+        access.block();
+        for address in [
+            InterfaceAddress {
+                address: map.device.ipv4.into(),
+                prefix_len: 32,
+            },
+            InterfaceAddress {
+                address: map.device.ipv6.into(),
+                prefix_len: 128,
+            },
+        ] {
+            if !self.addresses.contains(&address) {
+                self.platform
+                    .add_interface_address(&self.tun_name, address)?;
+                self.addresses.push(address);
+            }
+        }
+        Ok(access)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<crate::snapshot::Snapshot, String> {
         use crate::snapshot;
         let device = self.device.as_ref().ok_or("runtime has stopped")?;
@@ -284,11 +322,26 @@ impl Runtime {
                         })
                         .unwrap_or_default()
                 });
+                let path = device.peer_path(key).ok();
                 snapshot::Peer {
                     public_key,
                     device_id: remote.map(|p| p.device.id.clone()),
                     name: remote.map(|p| p.device.name.clone()),
-                    endpoint: peer.endpoint,
+                    owned: remote.and_then(|p| {
+                        self.managed
+                            .as_ref()
+                            .map(|state| p.device.owner_user_id == state.map.user.id)
+                    }),
+                    endpoint: path.and_then(|p| p.endpoint).or(peer.endpoint),
+                    path: if self
+                        .managed
+                        .as_ref()
+                        .is_some_and(|s| s.deadline <= Instant::now())
+                    {
+                        "offline"
+                    } else {
+                        path.map(|p| p.state).unwrap_or("offline")
+                    },
                     allowed_ips: peer.allowed_ips.iter().map(ToString::to_string).collect(),
                     keepalive_seconds: peer.keepalive.map(|v| v.as_secs()),
                     incoming_tcp,
@@ -311,6 +364,7 @@ impl Runtime {
                 .then_with(|| a.public_key.cmp(&b.public_key))
         });
         Ok(snapshot::Snapshot {
+            setup_available: self.web_setup,
             mode: if self.managed.is_some() {
                 "managed"
             } else {
@@ -326,6 +380,8 @@ impl Runtime {
             network: self.managed.as_ref().map(|state| snapshot::Network {
                 device_id: state.map.device.id.clone(),
                 device_name: state.map.device.name.clone(),
+                user_id: state.map.user.id.clone(),
+                user_name: state.map.user.name.clone(),
                 network_id: state.map.network_id.clone(),
                 revision: state.map.revision,
                 policy_revision: state.map.policy.revision,
@@ -398,33 +454,28 @@ impl Runtime {
             }
             for peer in &map.peers {
                 let key = policy::public_key(&peer.device.public_key)?;
-                let endpoint_changed = self
-                    .managed
-                    .as_ref()
-                    .and_then(|s| s.map.peers.iter().find(|p| p.device.id == peer.device.id))
-                    .is_none_or(|p| p.device.endpoints != peer.device.endpoints);
-                let endpoint = endpoint_changed
-                    .then(|| {
-                        peer.device
-                            .endpoints
-                            .iter()
-                            .copied()
-                            .find(|e| self.endpoint_supported(*e))
-                    })
-                    .flatten();
                 self.upsert_peer(
                     key,
                     None,
-                    endpoint,
+                    None,
                     Some(Duration::from_secs(25)),
                     vec![
                         AllowedIp::new(peer.device.ipv4.into(), 32).map_err(|e| e.to_string())?,
                         AllowedIp::new(peer.device.ipv6.into(), 128).map_err(|e| e.to_string())?,
                     ],
                 )?;
-                if endpoint_changed && endpoint.is_none() {
-                    self.clear_endpoint(key)?;
-                }
+                let candidates = peer
+                    .device
+                    .endpoints
+                    .iter()
+                    .copied()
+                    .filter(|e| self.endpoint_supported(*e))
+                    .collect();
+                self.device
+                    .as_ref()
+                    .expect("running device")
+                    .set_peer_candidates(&key, candidates)
+                    .map_err(|e| e.to_string())?;
             }
             let desired = self.desired_routes(&self.peers);
             let errors = self.remove_stale_routes(&desired);
@@ -439,8 +490,18 @@ impl Runtime {
             self.shutdown_requested = true;
         }
         result?;
+        // Local policy edits reuse the same map; they must not restart its clock.
+        let map_received_at = self
+            .managed
+            .as_ref()
+            .filter(|state| {
+                state.map.generation == map.generation && state.map.generated_at == map.generated_at
+            })
+            .map(|state| state.map_received_at)
+            .unwrap_or_else(Instant::now);
         self.managed = Some(ManagedState {
             map,
+            map_received_at,
             local,
             deadline,
             connected: true,
@@ -448,12 +509,52 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn set_managed_endpoint(
-        &mut self,
+    pub(crate) fn start_managed_probe(
+        &self,
         key: PeerKey,
-        endpoint: SocketAddr,
+        candidates: Vec<SocketAddr>,
     ) -> Result<(), String> {
-        self.set_endpoint(key, endpoint).map(|_| ())
+        let device = self.device.as_ref().ok_or("device stopped")?;
+        device
+            .set_peer_candidates(&key, candidates)
+            .map_err(|e| e.to_string())?;
+        device.request_peer_probe(&key).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn managed_path(&self, key: &PeerKey) -> Result<portal::PeerPath, String> {
+        self.device
+            .as_ref()
+            .ok_or("device stopped")?
+            .peer_path(key)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn start_discovery(&self, servers: &[SocketAddr]) -> Result<(), String> {
+        self.device
+            .as_ref()
+            .ok_or("device stopped")?
+            .discover_endpoints(servers)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn retry_discovery(&self) -> Result<(), String> {
+        self.device
+            .as_ref()
+            .ok_or("device stopped")?
+            .retry_discovery()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn discovered_endpoints(&self) -> Result<Vec<SocketAddr>, String> {
+        self.device
+            .as_ref()
+            .ok_or("device stopped")?
+            .discovered_endpoints()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn listen_addr(&self) -> Result<SocketAddr, String> {
+        Ok(self.device.as_ref().ok_or("device stopped")?.listen_addr())
     }
 
     pub(crate) fn endpoint_supported(&self, endpoint: SocketAddr) -> bool {
@@ -587,10 +688,27 @@ impl Runtime {
                                 .collect::<Vec<_>>()
                                 .join(",")
                         };
+                        let path = self
+                            .device
+                            .as_ref()
+                            .expect("running device")
+                            .peer_path(key)
+                            .ok();
+                        let state = if self
+                            .managed
+                            .as_ref()
+                            .is_some_and(|s| s.deadline <= Instant::now())
+                        {
+                            "offline"
+                        } else {
+                            path.map(|p| p.state).unwrap_or("offline")
+                        };
                         format!(
-                            "{} endpoint={} keepalive={} allowed_ips={}",
+                            "{} path={} endpoint={} keepalive={} allowed_ips={}",
                             encode_hex(key),
-                            peer.endpoint
+                            state,
+                            path.and_then(|p| p.endpoint)
+                                .or(peer.endpoint)
                                 .map(|endpoint| endpoint.to_string())
                                 .unwrap_or_else(|| "-".into()),
                             peer.keepalive

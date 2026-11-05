@@ -1046,8 +1046,10 @@ dependencies = [
 name = "portal-cli"
 version = "0.1.0"
 dependencies = [
+ "portal-runtime",
  "serde",
  "serde_json",
+ "tempfile",
  "zeroize",
 ]
 
@@ -1067,9 +1069,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tower",
+ "url",
  "x25519-dalek",
  "zeroize",
 ]

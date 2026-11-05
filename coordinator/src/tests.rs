@@ -1005,7 +1005,7 @@ async fn migration_preserves_identities_but_archives_user_grants_without_expandi
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            4
+            5
         );
         #[cfg(unix)]
         {
@@ -1843,4 +1843,323 @@ async fn migration_does_not_overwrite_a_conflicting_policy_archive() {
     fs::write(&archive, b"{}\n").unwrap();
     let _coordinator = fixture.open().await;
     assert_eq!(fs::read(&archive).unwrap(), b"{}\n");
+}
+
+#[tokio::test]
+async fn integrated_stun_is_advertised_over_https_and_stops_with_coordinator() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.open().await;
+    let stun_address = coordinator.stun_addr().unwrap();
+    let app = coordinator.test_router();
+    let device = device(&app, &fixture.admin_token(), 42).await;
+    drop(app);
+    let handle = axum_server::Handle::new();
+    let task = tokio::spawn(coordinator.serve(handle.clone()));
+    let address = timeout(Duration::from_secs(2), handle.listening())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(fixture.certificate.clone()).unwrap();
+    let (status, map) = https_authorized_request(
+        address,
+        roots,
+        "GET",
+        "/api/v1/network-map?wait_seconds=0",
+        "",
+        Some(token(&device)),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(map["stun"]["port"], stun_address.port());
+    assert_eq!(map["stun"]["endpoints"], json!([]));
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let request = [
+        0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    ];
+    client.send_to(&request, stun_address).await.unwrap();
+    let mut buffer = [0; 512];
+    let (length, source) = timeout(Duration::from_secs(1), client.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source, stun_address);
+    assert_eq!(length, 32);
+    assert_eq!(&buffer[8..20], &request[8..]);
+    assert_eq!(
+        u16::from_be_bytes(buffer[26..28].try_into().unwrap()) ^ 0x2112,
+        client.local_addr().unwrap().port()
+    );
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(tokio::net::UdpSocket::bind(stun_address).await.is_ok());
+}
+
+#[tokio::test]
+async fn stun_bind_failure_precedes_state_creation_and_disabled_service_has_no_descriptor() {
+    let mut fixture = Fixture::new();
+    let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    fixture.config.stun.listen = Some(occupied.local_addr().unwrap());
+    let result = Coordinator::open(fixture.config.clone()).await;
+    assert!(result.err().unwrap().contains("STUN UDP"));
+    assert!(!fixture.config.state_dir.exists());
+    fixture.config.stun.enabled = false;
+    fixture.config.stun.listen = None;
+    let coordinator = fixture.open().await;
+    assert!(coordinator.stun_addr().is_none());
+    let app = coordinator.test_router();
+    let device = device(&app, &fixture.admin_token(), 43).await;
+    assert!(map(&app, &device).await["stun"].is_null());
+}
+
+#[tokio::test]
+async fn stun_external_endpoints_are_validated_and_published() {
+    let mut fixture = Fixture::new();
+    fixture.config.stun.endpoints = vec!["198.51.100.7:3478".parse().unwrap()];
+    let coordinator = fixture.open().await;
+    let app = coordinator.test_router();
+    let device = device(&app, &fixture.admin_token(), 44).await;
+    assert_eq!(
+        map(&app, &device).await["stun"]["endpoints"],
+        json!(["198.51.100.7:3478"])
+    );
+    for endpoint in ["0.0.0.0:3478", "224.0.0.1:3478", "192.0.2.1:0"] {
+        fixture.config.stun.endpoints = vec![endpoint.parse().unwrap()];
+        assert!(fixture.config.validate().is_err());
+    }
+    fixture.config.stun.endpoints = vec![];
+    fixture.config.stun.enabled = false;
+    fixture.config.stun.listen = Some("0.0.0.0:3478".parse().unwrap());
+    assert!(fixture.config.validate().is_err());
+}
+
+#[tokio::test]
+async fn retryable_registration_and_enrollment_preserve_identity_and_credentials() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.open().await;
+    let app = coordinator.test_router();
+    let user_secret = format!("usr_{}", "a".repeat(64));
+    let (status, first) = request(
+        &app,
+        "POST",
+        "/api/v1/registration",
+        Some(&user_secret),
+        json!({"name":"Лена"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, second) = request(
+        &app,
+        "POST",
+        "/api/v1/registration",
+        Some(&user_secret),
+        json!({"name":"Лена"}),
+    )
+    .await;
+    assert_eq!(first, second);
+    assert_eq!(token(&first), user_secret);
+    let key = x25519_dalek::x25519([19; 32], x25519_dalek::X25519_BASEPOINT_BYTES);
+    let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let device_secret = format!("dev_{}", "b".repeat(64));
+    let body =
+        json!({"device":{"name":"device-test","public_key":key},"access_token":device_secret});
+    let (status, a) = request(
+        &app,
+        "POST",
+        "/api/v1/enrollment",
+        Some(&user_secret),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, b) = request(
+        &app,
+        "POST",
+        "/api/v1/enrollment",
+        Some(&user_secret),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(a, b);
+    let other = user(&app, "Другой").await;
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/enrollment",
+            Some(token(&other)),
+            body
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/v1/devices",
+            Some(&user_secret),
+            Value::Null
+        )
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .len(),
+        1
+    );
+    let (_, me) = request(&app, "GET", "/api/v1/me", Some(&user_secret), Value::Null).await;
+    assert_eq!(me, first["user"]);
+}
+
+#[tokio::test]
+async fn owner_policy_requires_target_ack_and_detects_conflicts_and_foreign_mutations() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.open().await;
+    let app = coordinator.test_router();
+    let owner = user(&app, "Owner").await;
+    let other = user(&app, "Other").await;
+    let a = device(&app, token(&owner), 41).await;
+    let b = device(&app, token(&owner), 42).await;
+    let source = a["device"]["public_key"].as_str().unwrap();
+    let uri = format!("/api/v1/devices/{}/policy", id(&b));
+    let body = json!({"base_revision":0,"permissions":{source:{"tcp":[443,8080]}}});
+    assert_eq!(
+        request(&app, "PUT", &uri, Some(token(&other)), body.clone())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "PUT", &uri, Some(token(&a)), body.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, pending) = request(&app, "PUT", &uri, Some(token(&owner)), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending["revision"], 1);
+    assert_eq!(pending["applied_revision"], 0);
+    assert_eq!(
+        request(&app, "PUT", &uri, Some(token(&owner)), body.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (_, map) = request(
+        &app,
+        "GET",
+        "/api/v1/network-map",
+        Some(token(&a)),
+        Value::Null,
+    )
+    .await;
+    assert!(map["peers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        request(&app, "PUT", "/api/v1/device/policy", Some(token(&b)), body)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/device/policy-ack",
+            Some(token(&b)),
+            json!({"revision":0})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (status, applied) = request(
+        &app,
+        "POST",
+        "/api/v1/device/policy-ack",
+        Some(token(&b)),
+        json!({"revision":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(applied["applied_revision"], 1);
+    let (_, map) = request(
+        &app,
+        "GET",
+        "/api/v1/network-map",
+        Some(token(&a)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(map["peers"][0]["outgoing"]["tcp"], json!([443, 8080]));
+    let (_, revoke) = request(
+        &app,
+        "PUT",
+        &uri,
+        Some(token(&owner)),
+        json!({"base_revision":1,"permissions":{}}),
+    )
+    .await;
+    assert_eq!(revoke["revision"], 2);
+    assert_eq!(revoke["applied_revision"], 1);
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/device/policy-ack",
+            Some(token(&b)),
+            json!({"revision":1})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    request(
+        &app,
+        "POST",
+        "/api/v1/device/policy-ack",
+        Some(token(&b)),
+        json!({"revision":2}),
+    )
+    .await;
+    let (_, map) = request(
+        &app,
+        "GET",
+        "/api/v1/network-map",
+        Some(token(&a)),
+        Value::Null,
+    )
+    .await;
+    assert!(map["peers"].as_array().unwrap().is_empty());
+    let rename = format!("/api/v1/devices/{}/name", id(&b));
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &rename,
+            Some(token(&other)),
+            json!({"name":"forged"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &rename,
+            Some(token(&owner)),
+            json!({"name":"Сервер"})
+        )
+        .await
+        .1["name"],
+        "Сервер"
+    );
 }

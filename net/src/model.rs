@@ -78,6 +78,13 @@ pub struct DevicePolicy {
     pub permissions: Permissions,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesiredPolicy {
+    pub revision: u64,
+    pub permissions: Permissions,
+    pub applied_revision: u64,
+}
+
 /// Published by the destination agent only after applying its local policy.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +103,16 @@ pub struct Peer {
     pub outgoing: PeerPermissions,
 }
 
+/// Discovery service owned by this coordinator. Empty endpoints use the HTTPS
+/// origin's resolved IP addresses with this UDP port (including wildcard binds).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StunService {
+    pub port: u16,
+    #[serde(default)]
+    pub endpoints: Vec<SocketAddr>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkMap {
     pub protocol_version: u32,
@@ -104,6 +121,8 @@ pub struct NetworkMap {
     pub revision: u64,
     pub generated_at: u64,
     pub expires_at: u64,
+    #[serde(default)]
+    pub stun: Option<StunService>,
     pub user: User,
     pub device: Device,
     pub policy: DevicePolicy,

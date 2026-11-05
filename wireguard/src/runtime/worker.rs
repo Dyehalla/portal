@@ -165,6 +165,9 @@ fn handle_udp(
     scratch: &mut [u8],
     mut access: Option<&mut AccessGuard<'_>>,
 ) -> bool {
+    if lock(&io.discovery).receive(source, datagram) {
+        return true;
+    }
     let parsed = match Tunn::parse_packet(datagram) {
         Ok(packet) => packet,
         Err(_) => return false,
@@ -187,7 +190,7 @@ fn handle_udp(
             let Some(peer) = peer else {
                 return false;
             };
-            Some((peer, PacketKind::Handshake))
+            Some((peer, PacketKind::Initiation))
         }
         Packet::HandshakeResponse(response) => {
             lookup_indexed_peer(state, response.receiver_idx, PacketKind::Handshake)
@@ -212,6 +215,9 @@ fn handle_udp(
         let result = runtime.tunnel.handle_prepared_packet(prepared, scratch);
         let accepted = !matches!(&result, TunnResult::Err(_));
         let flush_queue = accepted && matches!(&result, TunnResult::WriteToNetwork(_));
+        if accepted && matches!(packet_kind, PacketKind::Handshake | PacketKind::Data) {
+            runtime.path.received(source, Instant::now());
+        }
         if accepted && packet_kind != PacketKind::Cookie {
             runtime.endpoint = Some(source);
             runtime.pending_handshake = false;
@@ -346,6 +352,7 @@ fn lookup_indexed_peer(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PacketKind {
     Handshake,
+    Initiation,
     Cookie,
     Data,
 }
@@ -429,6 +436,19 @@ fn run_timers(
             .is_some_and(|a| !a.peer_allowed(&peer.public_key))
         {
             continue;
+        }
+        let probes = lock(&peer.runtime).path.probes(Instant::now());
+        if !probes.is_empty() {
+            let mut runtime = lock(&peer.runtime);
+            if let TunnResult::WriteToNetwork(packet) =
+                runtime.tunnel.format_handshake_initiation(scratch, true)
+            {
+                for endpoint in probes {
+                    if io.send_udp(endpoint, packet).is_err() {
+                        stats.udp_send_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
         }
         let (endpoint, output) = {
             let mut runtime = lock(&peer.runtime);

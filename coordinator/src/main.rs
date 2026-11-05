@@ -1,3 +1,5 @@
+mod setup;
+
 use portal_coordinator::{Coordinator, config::Config};
 use std::{path::Path, time::Duration};
 
@@ -13,16 +15,33 @@ async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
         println!(
-            "Usage: portal-coordinator --config PATH\n\nStarts an HTTPS coordinator; initializes a network and admin account on first start.\nThe administrator token is saved in STATE_DIR/admin.token."
+            "Usage:\n  portal-coordinator setup [--dir PATH]  Interactive installation wizard\n  portal-coordinator --config PATH      Start an existing coordinator\n\nThe administrator token is saved in STATE_DIR/admin.token."
         );
         return Ok(());
     }
-    if args.len() != 2 || args[0] != "--config" {
-        return Err("usage: portal-coordinator --config PATH".into());
+    if args.first().is_some_and(|arg| arg == "setup") {
+        if let Some((config, coordinator)) = setup::run(&args[1..]).await? {
+            return serve_ready(config, coordinator).await;
+        }
+        return Ok(());
     }
-    let config = Config::load(Path::new(&args[1]))?;
+    if args.len() != 2 || args[0] != "--config" {
+        return Err("usage: portal-coordinator setup [--dir PATH] | --config PATH".into());
+    }
+    serve(Config::load(Path::new(&args[1]))?).await
+}
+
+async fn serve(config: Config) -> Result<(), String> {
+    let coordinator = Coordinator::open(config.clone()).await?;
+    serve_ready(config, coordinator).await
+}
+
+async fn serve_ready(config: Config, coordinator: Coordinator) -> Result<(), String> {
     let token_path = config.state_dir.join("admin.token");
-    let coordinator = Coordinator::open(config).await?;
+    let stun = coordinator
+        .stun_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "disabled".into());
     let handle = axum_server::Handle::new();
     let server = coordinator.serve(handle.clone());
     tokio::pin!(server);
@@ -30,7 +49,7 @@ async fn run() -> Result<(), String> {
         result = &mut server => return result.map_err(|e| e.to_string()),
         listening = handle.listening() => {
             let listening = listening.ok_or("HTTPS listener did not start")?;
-            println!("READY https={} admin_token_file={}", listening, token_path.display());
+            println!("READY https={} stun_udp={} admin_token_file={}", listening, stun, token_path.display());
         }
     }
     tokio::select! {

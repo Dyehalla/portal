@@ -25,8 +25,33 @@ pub(super) fn authenticated_user(db: &Connection, credential: Credential) -> Res
 
 impl Store {
     pub fn register_user(&mut self, request: RegisterUser) -> Result<RegisteredUser> {
+        self.register_user_token(request, None)
+    }
+
+    // A high-entropy client token makes a lost registration response retryable.
+    // Only its hash is stored; replay requires the same secret and account name.
+    pub fn register_user_token(
+        &mut self,
+        request: RegisterUser,
+        token: Option<String>,
+    ) -> Result<RegisteredUser> {
         let name = name(&request.name)?;
         let tx = self.connection.transaction()?;
+        if let Some(ref token) = token {
+            let credential = credentials::parse(token)?;
+            if credential.role != Role::User {
+                return Err(Error::unauthorized());
+            }
+            if let Ok(user) = authenticated_user(&tx, credential) {
+                if user.name != name {
+                    return Err(Error::conflict("registration account mismatch"));
+                }
+                return Ok(RegisteredUser {
+                    user,
+                    access_token: token.clone(),
+                });
+            }
+        }
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
         if count >= MAX_USERS {
             return Err(Error::conflict("user limit reached"));
@@ -46,7 +71,13 @@ impl Store {
             is_admin: false,
             created_at: timestamp as u64,
         };
-        let (access_token, hash) = credentials::issue(Role::User);
+        let (access_token, hash) = match token {
+            Some(token) => {
+                let credential = credentials::parse(&token)?;
+                (token, credential.hash)
+            }
+            None => credentials::issue(Role::User),
+        };
         tx.execute(
             "INSERT INTO users(id,name,token_hash,created_at) VALUES(?,?,?,?)",
             params![user.id, user.name, hash.as_slice(), timestamp],

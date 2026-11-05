@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check zero-argument startup without changing the host's /etc, /run or network.
 
-cargo build -p portal-runtime
+cargo build -p portal-cli
 unshare --user --map-root-user --net --mount python3 runtime/scripts/check-defaults.py
 """
 import hashlib
@@ -9,13 +9,18 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
-BIN = Path(__file__).resolve().parents[2] / "target/debug/portal-runtime"
+# Copy only the application to prove startup needs no adjacent runtime binary.
+application_directory = tempfile.TemporaryDirectory(prefix="portal-single-binary-")
+BIN = Path(application_directory.name) / "portal"
+shutil.copy2(Path(__file__).resolve().parents[2] / "target/debug/portal", BIN)
+CLI = BIN
 assert os.geteuid() == 0 and Path("/proc/self/uid_map").read_text().split()[2] == "1", "run in an isolated user, mount and network namespace"
 # The mount operations require a mount namespace owned by this user namespace.
 # Refuse to continue on any failure, before writing the tested default paths.
@@ -27,9 +32,9 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 key = Path("/etc/portal/device.key")
 
 
-def start_and_check(arguments, interface="portal0", port=51821):
+def start_and_check(arguments, interface="portal0", port=51821, executable=BIN):
     with tempfile.TemporaryFile(mode="w+") as log:
-        process = subprocess.Popen([str(BIN), *arguments], stdout=log, stderr=log)
+        process = subprocess.Popen([str(executable), *arguments], stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 10
             while True:
@@ -39,10 +44,10 @@ def start_and_check(arguments, interface="portal0", port=51821):
                     output = os.pread(log.fileno(), 65536, 0).decode()
                     links = [line.removeprefix("web panel: ") for line in output.splitlines() if line.startswith("web panel: ")]
                     if not links:
-                        raise ValueError("waiting for startup login link")
-                    assert len(links) == 1, "startup printed multiple login links"
+                        raise ValueError("waiting for startup panel address")
+                    assert len(links) == 1, "startup printed multiple panel addresses"
                     login = urlsplit(links[0])
-                    assert login.fragment == "token=" + token, "startup link uses a different token"
+                    assert not login.fragment and token not in output, "runtime log must not contain the local API token"
                     assert login.hostname == "127.0.0.1" and login.port and login.scheme == "http"
                     if port:
                         assert login.port == port, "startup link uses a different port"
@@ -61,6 +66,11 @@ def start_and_check(arguments, interface="portal0", port=51821):
             assert key.stat().st_size == 32 and key.stat().st_mode & 0o777 == 0o600
             assert key.parent.stat().st_mode & 0o777 == 0o700
             assert Path("/run/portal.token").stat().st_mode & 0o777 == 0o600
+            if port == 51821:
+                link = subprocess.run([str(CLI), "web"], capture_output=True, text=True, timeout=5)
+                assert link.returncode == 0, f"CLI did not reuse the running agent: {link.stderr}"
+                exported = urlsplit(link.stdout.strip())
+                assert exported.fragment == "token=" + token and exported.netloc == login.netloc
             return data
         except BaseException:
             log.seek(0)
@@ -84,6 +94,11 @@ assert second["interface"]["public_key"] == first["interface"]["public_key"]
 assert hashlib.sha256(key.read_bytes()).digest() == fingerprint
 print("PASS: bare startup and run use default TUN, UDP, API and token paths; random private key survives restart", flush=True)
 
+start_and_check(["web"], executable=CLI)
+start_and_check([], executable=CLI)
+start_and_check(["start"], executable=CLI)
+print("PASS: portal web, portal and portal start launch runtime without a pre-existing token; a second web command reuses the agent", flush=True)
+
 config = Path("/etc/portal/runtime.json")
 config.write_text("{}")
 failed = subprocess.run([str(BIN), "run"], capture_output=True, text=True, timeout=10)
@@ -91,13 +106,21 @@ assert failed.returncode != 0 and "/etc/portal/device.json" in failed.stderr
 assert not Path("/sys/class/net/portal0").exists(), "managed configuration silently fell back to manual mode"
 print("PASS: default JSON configuration is discovered and missing enrollment does not start an unprotected manual agent", flush=True)
 
+failed = subprocess.run([str(CLI), "web"], capture_output=True, text=True, timeout=10)
+assert failed.returncode != 0 and "/etc/portal/device.json" in failed.stderr
+assert not Path("/sys/class/net/portal0").exists(), "CLI ignored managed configuration"
+failed = subprocess.run([str(CLI), "web", "--api", "127.0.0.1:51999"], capture_output=True, text=True, timeout=5)
+assert failed.returncode != 0 and "portal start" in failed.stderr
+assert not Path("/sys/class/net/portal0").exists(), "custom web command launched an unintended agent"
+print("PASS: CLI respects managed configuration and does not auto-start for explicit API options", flush=True)
+
 overridden = start_and_check(["run", "--tun", "custom0", "--listen", "127.0.0.1:51900", "--api-listen", "127.0.0.1:51901"], "custom0", 51901)
 assert overridden["interface"]["listen"] == "127.0.0.1:51900"
 assert overridden["interface"]["public_key"] == first["interface"]["public_key"]
 print("PASS: explicit manual options override startup defaults", flush=True)
 
 start_and_check(["run", "--api-listen", "127.0.0.1:0"], port=0)
-print("PASS: startup login link uses the current token and the actual bound port, including port 0", flush=True)
+print("PASS: startup logs omit the token and use the actual bound port; explicit web export uses the current token", flush=True)
 
 key.unlink()
 failed = subprocess.run([str(BIN), "run"], capture_output=True, text=True, timeout=10)

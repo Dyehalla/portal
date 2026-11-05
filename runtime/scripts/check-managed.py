@@ -4,6 +4,7 @@
 Build with cargo build --workspace, then run:
   unshare --user --map-root-user --net python3 runtime/scripts/check-managed.py
 Requires Linux user namespaces, iproute2, nsenter, openssl and Python 3.
+Set PORTAL_TEST_NAT=1 to also exercise STUN and a stateful NAT (requires nft).
 """
 import json
 import os
@@ -59,10 +60,11 @@ def command(config, operation, **values):
     body = json.dumps(dict(operation=operation, **values))
     # Execute in the device's network namespace, keeping the parent client's
     # sockets and routes independent of the destination's local routing table.
-    code = """import json,sys,urllib.request,pathlib
+    code = """import json,sys,urllib.request,urllib.error,pathlib
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
 request=urllib.request.Request('http://127.0.0.1:51821/api/v1/command',sys.argv[2].encode(),headers={'Authorization':'Bearer '+pathlib.Path(sys.argv[1]).read_text().strip(),'Content-Type':'application/json'})
-print(opener.open(request,timeout=15).read().decode())
+try:print(opener.open(request,timeout=32).read().decode())
+except urllib.error.HTTPError as error:sys.exit(error.read().decode())
 """
     return json.loads(run("python3", "-c", code, config["api_token_file"], body, prefix=config.get("_namespace", ())))["message"]
 
@@ -101,6 +103,17 @@ for headers,status in [({},401),({'Authorization':'Bearer '+token,'Origin':'http
  try:request('/api/v1/snapshot',headers)
  except urllib.error.HTTPError as error:assert error.code==status
  else:raise AssertionError('unprotected snapshot')
+# SSH forwarding changes the browser-facing Host and Origin ports, not the listener.
+forwarded={'Host':'127.0.0.1:51822','Origin':'http://127.0.0.1:51822'}
+assert request('/',forwarded).status==200
+try:request('/api/v1/snapshot',forwarded)
+except urllib.error.HTTPError as error:assert error.code==401
+else:raise AssertionError('forwarded port bypassed token authentication')
+assert request('/api/v1/snapshot',dict(forwarded,Authorization='Bearer '+token)).status==200
+for origin in ['http://127.0.0.1:51821','http://localhost:51822','http://untrusted.example']:
+ try:request('/api/v1/snapshot',dict(forwarded,Authorization='Bearer '+token,Origin=origin))
+ except urllib.error.HTTPError as error:assert error.code==403
+ else:raise AssertionError('forwarded port allowed cross-origin access')
 response=request('/api/v1/snapshot',{'Authorization':'Bearer '+token})
 raw=response.read().decode()
 assert token not in raw and 'access_token' not in raw and 'credential_file' not in raw and 'private_key' not in raw
@@ -111,6 +124,41 @@ assert data['peers'][0]['incoming_tcp']==[8080] or data['peers'][0]['outgoing_tc
 print(json.dumps(data['network']['device_id']))
 """
     return json.loads(run("python3", "-c", code, config["api_token_file"], prefix=config.get("_namespace", ())))
+
+
+def setup_nat(directory, namespace):
+    gateway = spawn("nat-namespace", ["unshare", "--net", "sleep", "infinity"], directory)
+    gateway_ns = ("nsenter", "--target", str(gateway.pid), "--net", "--")
+    wait_for(lambda: Path(f"/proc/{gateway.pid}/ns/net").readlink() != Path("/proc/self/ns/net").readlink(), "NAT namespace")
+    run("ip", "link", "set", "pb", "netns", gateway.pid, prefix=namespace)
+    run("ip", "addr", "add", "192.0.2.2/24", "dev", "pb", prefix=gateway_ns)
+    run("ip", "link", "set", "lo", "up", prefix=gateway_ns)
+    run("ip", "link", "set", "pb", "up", prefix=gateway_ns)
+    run("ip", "link", "add", "lan", "type", "veth", "peer", "name", "client", prefix=gateway_ns)
+    # Enter B via its persistent namespace process rather than a global netns mount.
+    peer_pid = namespace[2]
+    run("ip", "link", "set", "client", "netns", peer_pid, prefix=gateway_ns)
+    run("ip", "addr", "add", "10.77.0.1/24", "dev", "lan", prefix=gateway_ns)
+    run("ip", "link", "set", "lan", "up", prefix=gateway_ns)
+    run("ip", "addr", "add", "10.77.0.2/24", "dev", "client", prefix=namespace)
+    run("ip", "link", "set", "client", "up", prefix=namespace)
+    run("ip", "route", "add", "default", "via", "10.77.0.1", prefix=namespace)
+    run("sysctl", "-qw", "net.ipv4.ip_forward=1", prefix=gateway_ns)
+    rules = """table ip portal_test {
+ chain forward {
+  type filter hook forward priority 0; policy drop;
+  ct state established,related accept
+  iifname "lan" accept
+ }
+ chain postrouting {
+  type nat hook postrouting priority srcnat; policy accept;
+  oifname "pb" ip saddr 10.77.0.2 udp sport 51820 snat to 192.0.2.2:45678
+  oifname "pb" ip saddr 10.77.0.2 masquerade
+ }
+}
+"""
+    subprocess.run([*gateway_ns, "nft", "-f", "-"], input=rules, text=True, check=True)
+
 
 
 def main(directory):
@@ -127,6 +175,9 @@ def main(directory):
     run("ip", "link", "set", "lo", "up", prefix=namespace)
     run("ip", "addr", "add", "192.0.2.2/24", "dev", "pb", prefix=namespace)
     run("ip", "link", "set", "pb", "up", prefix=namespace)
+    nat = os.environ.get("PORTAL_TEST_NAT") == "1"
+    if nat:
+        setup_nat(directory, namespace)
 
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=portal-test", "-addext", "subjectAltName=IP:192.0.2.1", "-addext", "basicConstraints=critical,CA:FALSE", "-keyout", directory / "tls.key", "-out", directory / "tls.pem")
     coordinator_config = directory / "coordinator.json"
@@ -142,11 +193,14 @@ def main(directory):
     for name, endpoint in [("a", "192.0.2.1:51820"), ("b", "192.0.2.2:51820")]:
         state = directory / name
         state.mkdir(mode=0o700)
-        run(BIN / "portal-runtime", "keygen", "--private-key-file", state / "device.key")
+        run(BIN / "portal", "keygen", "--private-key-file", state / "device.key")
         write_json(state / "policy.json", {})
         config = {"tun_name": "portal0", "private_key_file": str(state / "device.key"), "listen": "0.0.0.0:51820", "workers": 2, "api_token_file": str(state / "api.token"), "coordinator": {"url": "https://192.0.2.1:8443", "device_name": name, "credential_file": str(state / "device.json"), "policy_file": str(state / "policy.json"), "map_file": str(state / "map.json"), "ca_file": str(directory / "tls.pem"), "endpoints": [endpoint]}}
+        if nat and name == "b":
+            config["coordinator"]["endpoints"] = []
+
         write_json(state / "runtime.json", config)
-        run(BIN / "portal-runtime", "enroll", "--config", state / "runtime.json", "--user-token-file", owner_token)
+        run(BIN / "portal", "enroll", "--config", state / "runtime.json", "--user-token-file", owner_token)
         config["_path"] = state / "runtime.json"
         configs.append(config)
     a, b = configs
@@ -156,9 +210,15 @@ def main(directory):
     grant = {identity_a["public_key"]: {"tcp": [8080]}}
     write_json(Path(b["coordinator"]["policy_file"]), grant)
 
+    if nat:
+        # Block all WireGuard replies before either agent can establish a session.
+        subprocess.run(["nft", "-f", "-"], input="""table inet portal_block {
+ chain input { type filter hook input priority -10; policy accept; udp dport 51820 drop; }
+}
+""", text=True, check=True)
     agents = []
     for name, config in zip(("a", "b"), configs):
-        agents.append(spawn("agent-" + name, [BIN / "portal-runtime", "run", "--config", config["_path"]], directory, prefix=config.get("_namespace", ())))
+        agents.append(spawn("agent-" + name, [BIN / "portal", "run", "--config", config["_path"]], directory, prefix=config.get("_namespace", ())))
     wait_for(lambda: all("peers=1" in command(c, "status") for c in configs), "applied peer maps")
     assert web_probe(a) == identity_a["id"]
     assert web_probe(b) == identity_b["id"]
@@ -182,7 +242,20 @@ time.sleep(3600)
 """
     spawn("echo-b", ["python3", "-c", echo_server], directory, prefix=namespace)
     spawn("echo-a", ["python3", "-c", echo_server], directory)
-    assert "signaling=accepted" in command(a, "connect", peer_device_id=identity_b["id"])
+    if nat:
+        wait_for(lambda: "192.0.2.2:45678" in Path(b["coordinator"]["map_file"]).read_text(), "STUN-discovered external port")
+        try:
+            command(a, "connect", peer_device_id=identity_b["id"])
+        except subprocess.CalledProcessError as error:
+            assert "P2P direct path timed out" in error.stderr, error.stderr
+        else:
+            raise AssertionError("signaling ACK falsely reported a working blocked UDP path")
+        run("nft", "delete", "table", "inet", "portal_block")
+        print("PASS: blocked UDP path times out despite signaling ACK", flush=True)
+    assert "path=direct" in command(a, "connect", peer_device_id=identity_b["id"])
+    assert "path=direct" in command(a, "list")
+    if nat:
+        print("PASS: integrated coordinator STUN discovered via HTTPS map, translated UDP port, NAT hole punching and UDP recovery", flush=True)
     wait_for(lambda: echo(identity_b["ipv4"]).close() is None, "IPv4 TCP")
     wait_for(lambda: echo(identity_b["ipv6"]).close() is None, "IPv6 TCP")
     assert denied(identity_b["ipv4"], 8081), "ungranted port was reachable"
@@ -224,7 +297,7 @@ else:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
     request = urllib.request.Request("https://192.0.2.1:8443/api/v1/devices/" + identity_b["id"], method="DELETE", headers={"Authorization": "Bearer " + owner_token.read_text().strip()})
     assert opener.open(request, timeout=5).status == 204
-    wait_for(lambda: "peers=0" in command(a, "status") and agents[1].poll() is not None, "online device revocation")
+    wait_for(lambda: "peers=0" in command(a, "status") and agents[1].poll() is None and "lease_active=false" in command(b, "status"), "online device revocation")
     assert denied(identity_b["ipv4"])
     print("PASS: restart recovery and online device revocation", flush=True)
 

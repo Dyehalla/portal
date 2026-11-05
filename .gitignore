@@ -4,3 +4,7 @@
 /coordinator-tls/
 /runtime-state/
 /runtime.json
+
+/coordinator-config/
+
+/runtime/node_modules/

@@ -20,6 +20,11 @@ impl Store {
     ) -> Result<DevicePolicy> {
         let tx = self.connection.transaction()?;
         let device = authenticated_device(&tx, credential)?;
+        if desired(&tx, &device.id)?.is_some() {
+            return Err(Error::conflict(
+                "policy is managed by the owner; agent acknowledgement required",
+            ));
+        }
         let current = policy(&tx, &device.id)?;
         if request.base_revision != current.revision {
             return Err(Error::conflict("policy revision mismatch"));
@@ -67,5 +72,159 @@ impl Store {
         }
         tx.commit()?;
         Ok(result)
+    }
+}
+
+fn owned_device(db: &Connection, credential: Credential, id: &str) -> Result<Device> {
+    let owner = authenticated_user(db, credential)?;
+    db.query_row(
+        &format!(
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE id=? AND owner_user_id=? AND revoked=0"
+        ),
+        params![id, owner.id],
+        device,
+    )
+    .optional()?
+    .ok_or_else(Error::not_found)
+}
+fn desired(db: &Connection, id: &str) -> Result<Option<DesiredPolicy>> {
+    db.query_row(
+        "SELECT revision,permissions,applied_revision FROM desired_policies WHERE device_id=?",
+        [id],
+        |r| {
+            let json: String = r.get(1)?;
+            Ok((counter(r, 0)?, json, counter(r, 2)?))
+        },
+    )
+    .optional()?
+    .map(|(revision, json, applied_revision)| {
+        Ok(DesiredPolicy {
+            revision,
+            permissions: serde_json::from_str(&json).map_err(|_| Error::internal())?,
+            applied_revision,
+        })
+    })
+    .transpose()
+}
+impl Store {
+    pub fn desired_policy(&self, credential: Credential) -> Result<Option<DesiredPolicy>> {
+        let device = authenticated_device(&self.connection, credential)?;
+        desired(&self.connection, &device.id)
+    }
+    pub fn owner_policy(&self, credential: Credential, id: &str) -> Result<DesiredPolicy> {
+        owned_device(&self.connection, credential, id)?;
+        if let Some(policy) = desired(&self.connection, id)? {
+            return Ok(policy);
+        }
+        let policy = policy(&self.connection, id)?;
+        Ok(DesiredPolicy {
+            revision: policy.revision,
+            applied_revision: policy.revision,
+            permissions: policy.permissions,
+        })
+    }
+    pub fn save_owner_policy(
+        &mut self,
+        credential: Credential,
+        id: &str,
+        request: PublishPolicy,
+    ) -> Result<DesiredPolicy> {
+        let tx = self.connection.transaction()?;
+        let target = owned_device(&tx, credential, id)?;
+        let current = match desired(&tx, id)? {
+            Some(p) => p,
+            None => {
+                let p = policy(&tx, id)?;
+                DesiredPolicy {
+                    revision: p.revision,
+                    applied_revision: p.revision,
+                    permissions: p.permissions,
+                }
+            }
+        };
+        if request.base_revision != current.revision {
+            return Err(Error::conflict("policy revision mismatch"));
+        }
+        if request.permissions.len() > 256 {
+            return Err(Error::bad_request("at most 256 peer entries"));
+        }
+        let mut permissions = Permissions::new();
+        for (key, mut allowed) in request.permissions {
+            let key = public_key(&key)?;
+            if key == target.public_key {
+                return Err(Error::bad_request("cannot grant access to itself"));
+            }
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE public_key=? AND revoked=0)",
+                [&key],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::bad_request("unknown or revoked source device"));
+            }
+            allowed.tcp = validate::tcp_ports(allowed.tcp)?;
+            if !allowed.tcp.is_empty() && permissions.insert(key, allowed).is_some() {
+                return Err(Error::bad_request("duplicate source"));
+            }
+        }
+        let revision = current.revision + 1;
+        tx.execute("INSERT INTO desired_policies(device_id,revision,permissions,applied_revision) VALUES(?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET revision=excluded.revision,permissions=excluded.permissions", params![id,i64::try_from(revision).map_err(|_| Error::internal())?,serde_json::to_string(&permissions).map_err(|_| Error::internal())?,i64::try_from(current.applied_revision).map_err(|_| Error::internal())?])?;
+        bump(&tx)?;
+        tx.commit()?;
+        Ok(DesiredPolicy {
+            revision,
+            permissions,
+            applied_revision: current.applied_revision,
+        })
+    }
+    pub fn acknowledge_policy(
+        &mut self,
+        credential: Credential,
+        revision: u64,
+    ) -> Result<DesiredPolicy> {
+        let tx = self.connection.transaction()?;
+        let target = authenticated_device(&tx, credential)?;
+        let mut current = desired(&tx, &target.id)?.ok_or_else(Error::not_found)?;
+        if revision != current.revision {
+            return Err(Error::conflict("desired policy changed"));
+        }
+        if current.applied_revision != revision {
+            tx.execute(
+                "UPDATE devices SET policy_revision=?,permissions=? WHERE id=?",
+                params![
+                    i64::try_from(revision).map_err(|_| Error::internal())?,
+                    serde_json::to_string(&current.permissions).map_err(|_| Error::internal())?,
+                    target.id
+                ],
+            )?;
+            tx.execute(
+                "UPDATE desired_policies SET applied_revision=? WHERE device_id=?",
+                params![
+                    i64::try_from(revision).map_err(|_| Error::internal())?,
+                    target.id
+                ],
+            )?;
+            bump(&tx)?;
+        }
+        current.applied_revision = revision;
+        tx.commit()?;
+        Ok(current)
+    }
+    pub fn rename_device(
+        &mut self,
+        credential: Credential,
+        id: &str,
+        requested: &str,
+    ) -> Result<Device> {
+        let tx = self.connection.transaction()?;
+        let mut target = owned_device(&tx, credential, id)?;
+        target.name = name(requested)?;
+        tx.execute(
+            "UPDATE devices SET name=? WHERE id=?",
+            params![target.name, id],
+        )?;
+        bump(&tx)?;
+        tx.commit()?;
+        Ok(target)
     }
 }

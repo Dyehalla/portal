@@ -25,6 +25,7 @@ pub mod defaults {
 
 /// Configuration for one foreground runtime instance.
 pub struct RuntimeConfig {
+    pub web_profile_file: Option<PathBuf>,
     pub coordinator: Option<ManagedConfig>,
     pub tun_name: String,
     pub private_key: SecretKey,
@@ -40,7 +41,7 @@ pub struct RuntimeConfig {
 }
 
 /// Persistent managed-mode configuration. Relative paths resolve beside this file.
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManagedConfig {
     pub url: String,
@@ -50,6 +51,8 @@ pub struct ManagedConfig {
     pub map_file: PathBuf,
     pub ca_file: Option<PathBuf>,
     pub endpoints: Vec<SocketAddr>,
+    /// Optional extra STUN servers; the coordinator service is discovered from the map.
+    pub stun_servers: Vec<SocketAddr>,
 }
 
 impl Default for ManagedConfig {
@@ -62,6 +65,7 @@ impl Default for ManagedConfig {
             map_file: defaults::MAP_FILE.into(),
             ca_file: None,
             endpoints: Vec::new(),
+            stun_servers: Vec::new(),
         }
     }
 }
@@ -143,6 +147,7 @@ impl FileConfig {
             return Err("invalid device name".into());
         }
         portal_net::policy::validate_endpoints(&config.coordinator.endpoints)?;
+        portal_net::policy::validate_endpoints(&config.coordinator.stun_servers)?;
         let mut files = std::collections::HashSet::new();
         for file in [
             &config.private_key_file,
@@ -179,6 +184,7 @@ impl FileConfig {
 
     pub fn into_runtime(self, private_key: SecretKey) -> RuntimeConfig {
         RuntimeConfig {
+            web_profile_file: Some(self.private_key_file.with_extension("profile.json")),
             coordinator: Some(self.coordinator),
             tun_name: self.tun_name,
             private_key,

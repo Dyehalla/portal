@@ -192,7 +192,16 @@ enum WorkerFailure {
 
 impl Device {
     /// Create the interface, bind UDP and start the configured workers.
-    pub fn new(mut config: DeviceConfig) -> Result<Self, DeviceError> {
+    pub fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
+        Self::with_io(config, |config| {
+            PacketIo::open(config.listen, &config.tun_name, config.dual_stack)
+        })
+    }
+
+    fn with_io(
+        mut config: DeviceConfig,
+        open: impl FnOnce(&DeviceConfig) -> io::Result<PacketIo>,
+    ) -> Result<Self, DeviceError> {
         if config.workers == 0 || config.workers > MAX_WORKERS {
             return Err(DeviceError::InvalidWorkerCount);
         }
@@ -207,11 +216,7 @@ impl Device {
         let public_key = *public.as_bytes();
         drop(private);
 
-        let io = Arc::new(PacketIo::open(
-            config.listen,
-            &config.tun_name,
-            config.dual_stack,
-        )?);
+        let io = Arc::new(open(&config)?);
         let listen_addr = io.local_addr()?;
         let rate_limiter = Arc::new(RateLimiter::new(&public, config.handshake_rate_limit));
         let state = Arc::new(RwLock::new(DeviceState::default()));
@@ -331,6 +336,7 @@ impl Device {
                     key,
                     index,
                     PeerRuntime {
+                        path: crate::path::DirectPath::default(),
                         tunnel: self.make_tunnel(key, psk, keepalive, index),
                         endpoint: requested_endpoint.or(old_endpoint),
                         preshared_key: psk,
@@ -375,6 +381,7 @@ impl Device {
             key,
             index,
             PeerRuntime {
+                path: crate::path::DirectPath::default(),
                 tunnel: self.make_tunnel(key, config.preshared_key, keepalive, index),
                 endpoint: config.endpoint,
                 preshared_key: config.preshared_key,
@@ -385,6 +392,94 @@ impl Device {
         write_lock(&self.state).insert(peer, std::mem::take(&mut config.allowed_ips));
         drop(_management);
         Ok(())
+    }
+
+    /// Update the bounded candidate set. Only authenticated WireGuard replies verify a path.
+    pub fn set_peer_candidates(
+        &self,
+        key: &PeerKey,
+        candidates: Vec<SocketAddr>,
+    ) -> Result<(), DeviceError> {
+        if candidates.len() > 8
+            || candidates.iter().any(|e| {
+                e.port() == 0
+                    || e.ip().is_unspecified()
+                    || e.ip().is_multicast()
+                    || e.ip() == std::net::Ipv4Addr::BROADCAST
+            })
+        {
+            return Err(DeviceError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid endpoint candidates",
+            )));
+        }
+        let _management = lock(&self.management);
+        let peer = self.peer(key)?;
+        lock(&peer.runtime)
+            .path
+            .configure(candidates, std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Wake an offline peer's next bounded probe round after a rendezvous signal.
+    pub fn request_peer_probe(&self, key: &PeerKey) -> Result<(), DeviceError> {
+        let peer = self.peer(key)?;
+        lock(&peer.runtime)
+            .path
+            .request_probe(std::time::Instant::now());
+        Ok(())
+    }
+
+    pub fn peer_path(&self, key: &PeerKey) -> Result<crate::PeerPath, DeviceError> {
+        let peer = self.peer(key)?;
+        let runtime = lock(&peer.runtime);
+        let mut path = runtime.path.snapshot(std::time::Instant::now());
+        // Manual WireGuard endpoints remain visible even before a handshake.
+        if path.endpoint.is_none() {
+            path.endpoint = runtime.endpoint;
+        }
+        Ok(path)
+    }
+
+    /// Start STUN transactions without opening or replacing any transport socket.
+    pub fn discover_endpoints(&self, servers: &[SocketAddr]) -> Result<(), DeviceError> {
+        self.ensure_running()?;
+        if servers.len() > 8
+            || servers
+                .iter()
+                .any(|e| e.port() == 0 || e.ip().is_unspecified() || e.ip().is_multicast())
+        {
+            return Err(DeviceError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid STUN servers",
+            )));
+        }
+        let io = self.io.as_ref().expect("running backend");
+        let requests = lock(&io.discovery).start(servers)?;
+        for (server, packet) in requests {
+            if io.send_udp(server, &packet).is_err() {
+                self.stats.udp_send_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retry outstanding STUN transactions; answered or expired requests are excluded.
+    pub fn retry_discovery(&self) -> Result<(), DeviceError> {
+        self.ensure_running()?;
+        let io = self.io.as_ref().expect("running backend");
+        let requests = lock(&io.discovery).retransmit();
+        for (server, packet) in requests {
+            if io.send_udp(server, &packet).is_err() {
+                self.stats.udp_send_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn discovered_endpoints(&self) -> Result<Vec<SocketAddr>, DeviceError> {
+        self.ensure_running()?;
+        Ok(lock(&self.io.as_ref().expect("running backend").discovery).results())
     }
 
     /// Remove a peer and all of its route and receiver-index entries.
@@ -605,5 +700,123 @@ fn prepare_pending_handshake(peer: &Arc<Peer>) -> Option<Vec<u8>> {
     {
         TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod p2p_tests {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Instant;
+
+    fn device(key: PeerKey) -> (Device, UnixDatagram) {
+        let (io, tun) = PacketIo::test_backend();
+        let mut config = DeviceConfig::new(key, "127.0.0.1:0".parse().unwrap(), "test");
+        config.workers = 2;
+        (Device::with_io(config, |_| Ok(io)).unwrap(), tun)
+    }
+    fn peer(device: &Device, key: PeerKey, address: &str) {
+        device
+            .upsert_peer(PeerConfig {
+                public_key: key,
+                preshared_key: None,
+                endpoint: None,
+                persistent_keepalive: Some(Duration::from_secs(25)),
+                allowed_ips: vec![address.parse().unwrap()],
+            })
+            .unwrap();
+    }
+    fn wait_direct(device: &Device, key: &PeerKey, endpoint: SocketAddr) {
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            device.health().unwrap();
+            let path = device.peer_path(key).unwrap();
+            if path.state == "direct" && path.endpoint == Some(endpoint) {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "path was {path:?}, expected {endpoint}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
+    fn shared_socket_stun_candidate_fanout_data_and_endpoint_recovery() {
+        use std::net::UdpSocket;
+        let (mut a, tun_a) = device([7; 32]);
+        let (mut b, tun_b) = device([8; 32]);
+        peer(&a, b.public_key(), "10.0.0.2/32");
+        peer(&b, a.public_key(), "10.0.0.1/32");
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        a.discover_endpoints(&[server.local_addr().unwrap()])
+            .unwrap();
+        let mut request = [0; 100];
+        let (len, source) = server.recv_from(&mut request).unwrap();
+        assert_eq!(len, 20);
+        assert_eq!(
+            source,
+            a.listen_addr(),
+            "STUN must use the WireGuard source port"
+        );
+        let mut response = request[..20].to_vec();
+        response[0..4].copy_from_slice(&[1, 1, 0, 12]);
+        response.extend_from_slice(&[0, 0x20, 0, 8, 0, 1]);
+        response.extend_from_slice(&(source.port() ^ 0x2112).to_be_bytes());
+        response.extend_from_slice(&[127 ^ 0x21, 0x12, 0xa4, 1 ^ 0x42]);
+        server.send_to(&response, source).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while a.discovered_endpoints().unwrap().is_empty() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.discovered_endpoints().unwrap(), [source]);
+        assert_eq!(a.peer_path(&b.public_key()).unwrap().state, "offline");
+        // A forged transport packet with a real receiver index cannot verify or redirect a path.
+        let mut forged = vec![0; 32];
+        forged[..4].copy_from_slice(&4u32.to_le_bytes());
+        let index = read_lock(&a.state).peers[&b.public_key()].index << 8;
+        forged[4..8].copy_from_slice(&index.to_le_bytes());
+        server.send_to(&forged, source).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(a.peer_path(&b.public_key()).unwrap().state, "offline");
+        assert!(a.peer_path(&b.public_key()).unwrap().endpoint.is_none());
+        // An unreachable first candidate must not prevent the second from working.
+        let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.set_peer_candidates(
+            &b.public_key(),
+            vec![blackhole.local_addr().unwrap(), b.listen_addr()],
+        )
+        .unwrap();
+        b.set_peer_candidates(&a.public_key(), vec![a.listen_addr()])
+            .unwrap();
+        wait_direct(&a, &b.public_key(), b.listen_addr());
+        wait_direct(&b, &a.public_key(), a.listen_addr());
+        let mut packet = vec![0; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        tun_a.send(&packet).unwrap();
+        tun_b
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut received = [0; 100];
+        let len = tun_b.recv(&mut received).unwrap();
+        assert_eq!(&received[..len], &packet);
+        let key_b = b.public_key();
+        b.shutdown().unwrap();
+        let (mut replacement, _tun) = device([8; 32]);
+        peer(&replacement, a.public_key(), "10.0.0.1/32");
+        a.set_peer_candidates(&key_b, vec![replacement.listen_addr()])
+            .unwrap();
+        wait_direct(&a, &key_b, replacement.listen_addr());
+        wait_direct(&replacement, &a.public_key(), a.listen_addr());
+        replacement.shutdown().unwrap();
+        a.shutdown().unwrap();
     }
 }

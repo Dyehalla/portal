@@ -1,11 +1,11 @@
 use ipnet::{Ipv4Net, Ipv6Net};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -17,13 +17,33 @@ pub struct Config {
     #[serde(default = "default_lease")]
     pub lease_seconds: u64,
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub stun: StunConfig,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
+}
+
+/// By default UDP shares the HTTPS listen address and numeric port.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StunConfig {
+    pub enabled: bool,
+    pub listen: Option<SocketAddr>,
+    pub endpoints: Vec<SocketAddr>,
+}
+impl Default for StunConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: None,
+            endpoints: Vec::new(),
+        }
+    }
 }
 
 fn default_v4() -> Ipv4Net {
@@ -59,6 +79,21 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.tls.cert_file.as_os_str().is_empty() || self.tls.key_file.as_os_str().is_empty() {
             return Err("TLS certificate and key files are required".into());
+        }
+        if self.stun.endpoints.len() > 8
+            || self.stun.endpoints.iter().any(|e| {
+                e.port() == 0
+                    || e.ip().is_unspecified()
+                    || e.ip().is_multicast()
+                    || e.ip() == std::net::Ipv4Addr::BROADCAST
+            })
+        {
+            return Err(
+                "STUN endpoints must contain at most eight unicast IP:port addresses".into(),
+            );
+        }
+        if !self.stun.enabled && (!self.stun.endpoints.is_empty() || self.stun.listen.is_some()) {
+            return Err("disabled STUN must not specify listen or endpoints".into());
         }
         if self.state_dir.as_os_str().is_empty() {
             return Err("state_dir is required".into());

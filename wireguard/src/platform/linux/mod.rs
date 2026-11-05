@@ -19,6 +19,7 @@ const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
 pub(crate) struct PacketIo {
+    pub(crate) discovery: Mutex<crate::discovery::Discovery>,
     udp_v4: Option<UdpSocket>,
     udp_v6: Option<UdpSocket>,
     listen_addr: SocketAddr,
@@ -49,6 +50,7 @@ impl PacketIo {
         let (udp_v4, udp_v6, listen_addr) = bind_udp_pair(listen, dual_stack)?;
         let tun = open_tun(tun_name)?;
         Ok(Self {
+            discovery: Mutex::new(crate::discovery::Discovery::new()),
             udp_v4,
             udp_v6,
             listen_addr,
@@ -57,6 +59,27 @@ impl PacketIo {
             stopped: AtomicBool::new(false),
         })
     }
+    #[cfg(test)]
+    pub(crate) fn test_backend() -> (Self, std::os::unix::net::UnixDatagram) {
+        let (tun, remote) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        tun.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let listen_addr = socket.local_addr().unwrap();
+        (
+            Self {
+                udp_v4: Some(socket),
+                udp_v6: None,
+                listen_addr,
+                tun: unsafe { File::from_raw_fd(tun.into_raw_fd()) },
+                discovery: Mutex::new(crate::discovery::Discovery::new()),
+                wakes: Mutex::new(Vec::new()),
+                stopped: AtomicBool::new(false),
+            },
+            remote,
+        )
+    }
+
     /// Return the address bound in the configured primary family.
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.listen_addr)

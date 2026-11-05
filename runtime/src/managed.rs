@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -147,6 +150,7 @@ impl Prepared {
 
 pub(crate) struct ManagedState {
     pub map: NetworkMap,
+    pub map_received_at: Instant,
     pub local: Permissions,
     pub deadline: Instant,
     pub connected: bool,
@@ -159,6 +163,7 @@ pub(crate) struct Agent {
     client: CoordinatorClient,
     changes: watch::Sender<u64>,
     _identity_lock: File,
+    owner_managed: AtomicBool,
 }
 
 impl Agent {
@@ -175,6 +180,7 @@ impl Agent {
             client: prepared.client,
             changes,
             _identity_lock: prepared.identity_lock,
+            owner_managed: AtomicBool::new(false),
         });
         agent
             .runtime
@@ -194,6 +200,8 @@ impl Agent {
             result = self.maps() => result,
             result = self.policies() => result,
             result = self.incoming() => result,
+            result = self.discovery() => result,
+            result = self.desired_policies() => result,
         };
         self.access.block();
         result
@@ -245,7 +253,10 @@ impl Agent {
         ) {
             self.access.block();
             if let Ok(mut runtime) = self.runtime.lock() {
-                runtime.shutdown_requested = true;
+                if let Some(state) = &mut runtime.managed {
+                    state.connected = false;
+                    state.deadline = Instant::now();
+                }
             }
             return Err(error.to_string());
         }
@@ -254,7 +265,7 @@ impl Agent {
         {
             state.connected = false;
         }
-        eprintln!("portal-runtime: {error}; retrying");
+        eprintln!("portal: {error}; retrying");
         Ok(())
     }
 
@@ -264,7 +275,7 @@ impl Agent {
         loop {
             changes.borrow_and_update();
             let (map, local, deadline) = self.snapshot()?;
-            if local != map.policy.permissions {
+            if local != map.policy.permissions && !self.owner_managed.load(Ordering::Acquire) {
                 match self
                     .client
                     .publish_policy(&PublishPolicy {
@@ -278,7 +289,7 @@ impl Agent {
                         // local policy monitoring. The packet gate still expires the lease.
                         if let Err(e) = self.refresh().await {
                             resync = true;
-                            eprintln!("portal-runtime: {e}");
+                            eprintln!("portal: {e}");
                             tokio::time::sleep(Duration::from_secs(2)).await;
                         }
                         continue;
@@ -311,9 +322,64 @@ impl Agent {
         }
     }
 
+    async fn desired_policies(&self) -> Result<(), String> {
+        loop {
+            match self.client.desired_policy().await {
+                Ok(Some(desired)) => {
+                    self.owner_managed.store(true, Ordering::Release);
+                    let permissions = policy::normalize_permissions(desired.permissions)?;
+                    {
+                        // Read and apply under one runtime lock: a newer long poll must
+                        // not make this apply a no-op before we acknowledge the revision.
+                        let mut runtime = self
+                            .runtime
+                            .lock()
+                            .map_err(|_| "runtime state unavailable")?;
+                        let state = runtime
+                            .managed
+                            .as_ref()
+                            .ok_or("managed state unavailable")?;
+                        if state.local != permissions {
+                            let map = state.map.clone();
+                            let deadline = state.deadline;
+                            private_file::write(
+                                &self.config.policy_file,
+                                &serde_json::to_vec(&permissions).map_err(|e| e.to_string())?,
+                                false,
+                            )?;
+                            runtime.apply_managed_map(
+                                map,
+                                permissions,
+                                deadline,
+                                &self.config.map_file,
+                            )?;
+                        }
+                    }
+                    if desired.applied_revision != desired.revision {
+                        match self.client.acknowledge_policy(desired.revision).await {
+                            Ok(_) => {
+                                self.changes.send_modify(|v| *v = v.wrapping_add(1));
+                                let _ = self.refresh().await;
+                            }
+                            Err(ClientError::Http(409)) => {}
+                            Err(e) => self.transient(&e)?,
+                        }
+                    }
+                }
+                // Compatibility: old coordinators keep the existing local policy mode.
+                Ok(None) | Err(ClientError::Http(404)) => {}
+                Err(e) => self.transient(&e)?,
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     async fn policies(&self) -> Result<(), String> {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            if self.owner_managed.load(Ordering::Acquire) {
+                continue;
+            }
             let local = read_policy(&self.config.policy_file)?;
             let (map, old, deadline) = self.snapshot()?;
             if local != old {
@@ -323,6 +389,97 @@ impl Agent {
                     .apply_managed_map(map, local, deadline, &self.config.map_file)?;
                 self.changes.send_modify(|v| *v = v.wrapping_add(1));
             }
+        }
+    }
+
+    async fn discovery(&self) -> Result<(), String> {
+        loop {
+            let listen = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime state unavailable")?
+                .listen_addr()?;
+            let mut endpoints = self.config.endpoints.clone();
+            let (map, _, _) = self.snapshot()?;
+            let mut servers = self.config.stun_servers.clone();
+            if let Some(stun) = &map.stun {
+                if stun.endpoints.is_empty() {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::net::lookup_host((
+                            self.client.coordinator_host().as_str(),
+                            stun.port,
+                        )),
+                    )
+                    .await
+                    {
+                        Ok(Ok(addresses)) => {
+                            for address in addresses {
+                                if !servers.contains(&address) && servers.len() < 8 {
+                                    servers.push(address);
+                                }
+                            }
+                        }
+                        _ => eprintln!("portal: could not resolve coordinator STUN host; retrying"),
+                    }
+                } else {
+                    for address in &stun.endpoints {
+                        if !servers.contains(address) && servers.len() < 8 {
+                            servers.push(*address);
+                        }
+                    }
+                }
+            }
+            servers.retain(|address| {
+                self.runtime
+                    .lock()
+                    .is_ok_and(|runtime| runtime.endpoint_supported(*address))
+            });
+            // Independent servers share the real WireGuard socket. Retry the same
+            // transactions with exponential backoff, preserving slower responses.
+            if !servers.is_empty() {
+                self.runtime
+                    .lock()
+                    .map_err(|_| "runtime state unavailable")?
+                    .start_discovery(&servers)?;
+                for delay in [500, 1000, 2000] {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let runtime = self
+                        .runtime
+                        .lock()
+                        .map_err(|_| "runtime state unavailable")?;
+                    for endpoint in runtime.discovered_endpoints()? {
+                        if !endpoints.contains(&endpoint) && endpoints.len() < 8 {
+                            endpoints.push(endpoint);
+                        }
+                    }
+                    if delay != 2000 {
+                        runtime.retry_discovery()?;
+                    }
+                }
+            }
+            let (map, _, _) = self.snapshot()?;
+            for endpoint in local_candidates(listen, &map) {
+                let supported = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "runtime state unavailable")?
+                    .endpoint_supported(endpoint);
+                if supported && !endpoints.contains(&endpoint) && endpoints.len() < 8 {
+                    endpoints.push(endpoint);
+                }
+            }
+            endpoints.sort();
+            endpoints.dedup();
+            if endpoints != map.device.endpoints {
+                match self.client.endpoints(endpoints).await {
+                    Ok(_) => {
+                        self.changes.send_modify(|v| *v = v.wrapping_add(1));
+                    }
+                    Err(e) => self.transient(&e)?,
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
 
@@ -358,7 +515,7 @@ impl Agent {
     }
 
     fn apply_signal(&self, signal: &ConnectionInfo, incoming: bool) -> Result<(), String> {
-        let mut runtime = self
+        let runtime = self
             .runtime
             .lock()
             .map_err(|_| "runtime state unavailable")?;
@@ -369,18 +526,39 @@ impl Agent {
         if state.deadline <= Instant::now() {
             return Err("network map lease expired".into());
         }
-        let key = policy::validate_signal(signal, &state.map, &state.local, incoming)?;
-        let endpoint = signal
+        let coordinator_now = state
+            .map
+            .generated_at
+            .saturating_add(state.map_received_at.elapsed().as_secs());
+        let key = policy::validate_signal_at(
+            signal,
+            &state.map,
+            &state.local,
+            incoming,
+            coordinator_now,
+        )?;
+        let candidates: Vec<_> = signal
             .peer
             .endpoints
             .iter()
             .copied()
-            .find(|e| runtime.endpoint_supported(*e))
-            .ok_or("peer has no supported endpoint candidate")?;
-        runtime.set_managed_endpoint(key, endpoint)
+            .filter(|e| runtime.endpoint_supported(*e))
+            .collect();
+        if candidates.is_empty() {
+            return Err("peer has no supported endpoint candidate".into());
+        }
+        runtime.start_managed_probe(key, candidates)
     }
 
     pub(crate) async fn connect(&self, peer_device_id: String) -> Result<String, String> {
+        tokio::time::timeout(Duration::from_secs(28), self.connect_inner(peer_device_id))
+            .await
+            .map_err(|_| {
+                "P2P connection deadline exceeded; background retries continue".to_string()
+            })?
+    }
+
+    async fn connect_inner(&self, peer_device_id: String) -> Result<String, String> {
         let (map, _, deadline) = self.snapshot()?;
         if deadline <= Instant::now()
             || !map
@@ -404,11 +582,90 @@ impl Agent {
             self.refresh().await?;
         }
         self.apply_signal(&signal, false)?;
-        Ok(format!(
-            "peer={} signaling=accepted path=unverified",
-            signal.peer.id
-        ))
+        let key = policy::public_key(&signal.peer.public_key)?;
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "runtime state unavailable")?;
+                let state = runtime
+                    .managed
+                    .as_ref()
+                    .ok_or("managed state unavailable")?;
+                if state.deadline <= Instant::now() {
+                    return Err("network map lease expired".into());
+                }
+                if !state.map.peers.iter().any(|p| {
+                    p.device.id == signal.peer.id
+                        && p.device.public_key == signal.peer.public_key
+                        && !p.outgoing.tcp.is_empty()
+                }) {
+                    return Err("peer access revoked".into());
+                }
+                let path = runtime.managed_path(&key)?;
+                if path.state == "direct" {
+                    return Ok(format!(
+                        "peer={} signaling=accepted path=direct endpoint={}",
+                        signal.peer.id,
+                        path.endpoint.expect("verified endpoint")
+                    ));
+                }
+            }
+            if Instant::now() >= until {
+                return Err("P2P direct path timed out; background retries continue".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
+}
+
+// iproute2 is already a runtime prerequisite. Never advertise the overlay itself,
+// loopback, link-local IPv6 (which needs an interface scope), or down interfaces.
+fn local_candidates(listen: std::net::SocketAddr, map: &NetworkMap) -> Vec<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+    if !listen.ip().is_unspecified() {
+        return vec![listen];
+    }
+    let Ok(output) = std::process::Command::new("ip")
+        .args(["-j", "address", "show", "up"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(interfaces) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for interface in interfaces {
+        let Some(addresses) = interface["addr_info"].as_array() else {
+            continue;
+        };
+        for address in addresses {
+            if address["scope"] != "global" {
+                continue;
+            }
+            let Some(ip) = address["local"]
+                .as_str()
+                .and_then(|s| s.parse::<IpAddr>().ok())
+            else {
+                continue;
+            };
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip == IpAddr::V4(map.device.ipv4)
+                || ip == IpAddr::V6(map.device.ipv6)
+            {
+                continue;
+            }
+            result.push(SocketAddr::new(ip, listen.port()));
+        }
+    }
+    result.sort();
+    result.dedup();
+    result
 }
 
 fn read_policy(path: &Path) -> Result<Permissions, String> {
@@ -455,6 +712,7 @@ mod tests {
                 map_file: state.join("map.json"),
                 ca_file: Some(ca.clone()),
                 endpoints: vec!["127.0.0.1:51820".parse().unwrap()],
+                stun_servers: Vec::new(),
             });
         }
         enroll(configs[0].clone(), SecretKey([7; 32]), &owner_file)
@@ -516,7 +774,7 @@ mod tests {
             CoordinatorClient::new(&url, creds.access_token.clone(), Some(&wrong_ca)).unwrap();
         assert!(matches!(
             untrusted.network_map(None).await,
-            Err(ClientError::Transport)
+            Err(ClientError::Tls)
         ));
         assert!(
             CoordinatorClient::new("http://127.0.0.1", creds.access_token.clone(), None).is_err()

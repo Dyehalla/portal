@@ -82,10 +82,6 @@ fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, 
             .and_then(|()| stream.write_all(&body))
             .and_then(|()| stream.flush())
             .map_err(|error| format!("could not send API request: {error}"))?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(|error| format!("could not finish API request: {error}"))?;
-
         let mut response = Vec::new();
         (&mut stream)
             .take((MAX_RESPONSE_BYTES + 1) as u64)
@@ -110,6 +106,15 @@ pub(crate) fn web_url(address: &str, token_file: &str) -> Result<Zeroizing<Strin
     )))
 }
 
+pub(crate) fn is_listening(address: &str) -> Result<bool, String> {
+    let address = parse_address(address)?;
+    match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(false),
+        Err(error) => Err(format!("Could not reach local API {address}: {error}")),
+    }
+}
+
 fn parse_address(address: &str) -> Result<SocketAddr, String> {
     let address = address
         .parse::<SocketAddr>()
@@ -121,8 +126,15 @@ fn parse_address(address: &str) -> Result<SocketAddr, String> {
 }
 
 fn read_token(token_file: &str) -> Result<Zeroizing<String>, String> {
-    let mut token_bytes = fs::read(token_file)
-        .map_err(|error| format!("could not read API token file {token_file}: {error}"))?;
+    let mut token_bytes = fs::read(token_file).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "API token file {token_file} was not found. Use `sudo portal web` to start the default agent, or --token-file PATH matching a running agent's api_token_file. Its startup output also contains a login link."
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "Cannot read API token file {token_file}. Run `sudo portal web` or use --token-file PATH for this agent."
+        ),
+        _ => format!("could not read API token file {token_file}: {error}"),
+    })?;
     let token_text = String::from_utf8_lossy(&token_bytes);
     let token_text = token_text.trim();
     if token_text.len() != 64 || !token_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
