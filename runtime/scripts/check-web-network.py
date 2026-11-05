@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import ssl
 import tempfile
 import time
 import urllib.error
@@ -101,6 +102,34 @@ with tempfile.TemporaryDirectory(prefix='portal-web-network-') as directory:
             saved = api('account/device', {'operation': 'save_policy', 'device_id': device_id,
                                            'base_revision': policy['revision'], 'permissions': {}})
             wait(lambda: api('account/device', {'operation': 'policy', 'device_id': device_id})['applied_revision'] == saved['revision'], 'running agent acknowledges desired policy revision')
+            # A second user can discover this device and ask its owner for TCP access.
+            remote = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(state / 'ca.pem'))))
+            def coordinator(path, token=None, body=None):
+                headers = {'Content-Type':'application/json'}
+                if token: headers['Authorization'] = 'Bearer ' + token
+                request = urllib.request.Request('https://127.0.0.1:8443/api/v1/' + path, data=json.dumps(body).encode() if body is not None else None, headers=headers)
+                return json.load(remote.open(request, timeout=10))
+            colleague = coordinator('users', body={'name':'colleague'})
+            generated = subprocess.check_output([str(ROOT / 'target/debug/portal'), 'keygen', '--private-key-file', str(state / 'foreign.key')], text=True)
+            foreign_key = generated.split('public key: ')[1].strip()
+            foreign = coordinator('devices', colleague['access_token'], {'name':'foreign-device','public_key':foreign_key})
+            common = api('account')['devices']
+            assert len(common) == 2 and any(d['id'] == foreign['device']['id'] for d in common)
+            assert api('snapshot')['peers'] == [], 'visibility must not grant access'
+            body = {'source_device_id':foreign['device']['id'],'target_device_id':device_id,'tcp':[443]}
+            pending = coordinator('access-requests', colleague['access_token'], body)
+            inbox = api('account')['access_requests']
+            assert any(r['id'] == pending['id'] and r['status'] == 'pending' for r in inbox)
+            rejected = api('account/device', {'operation':'decide_access','request_id':pending['id'],'accept':False})
+            assert rejected['status'] == 'declined' and api('snapshot')['peers'] == []
+            pending = coordinator('access-requests', colleague['access_token'], body)
+            accepted = api('account/device', {'operation':'decide_access','request_id':pending['id'],'accept':True})
+            wait(lambda: api('account/device', {'operation':'policy','device_id':device_id})['applied_revision'] == accepted['policy_revision'], 'accepted access request reaches the real destination agent and is acknowledged')
+            foreign_map = coordinator('network-map', foreign['access_token'])
+            assert foreign_map['peers'][0]['outgoing']['tcp'] == [443]
+            outgoing = api('account/device', {'operation':'request_access','source_device_id':device_id,'target_device_id':foreign['device']['id'],'tcp':[22]})
+            assert any(r['id'] == outgoing['id'] for r in coordinator('access-requests', colleague['access_token']))
+            print('PASS: common registry, incoming decline/accept and outgoing access requests through local API and real HTTPS', flush=True)
             api('account/device', {'operation': 'revoke', 'device_id': device_id})
             wait(lambda: not api('snapshot')['network']['lease_active'], 'revoked device closes traffic while local API remains available')
             assert api('account')['user']['name'] == 'web-owner'

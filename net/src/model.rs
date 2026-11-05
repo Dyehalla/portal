@@ -176,3 +176,29 @@ mod tests {
         );
     }
 }
+
+/// Human approval of TCP access; separate from automatic P2P rendezvous.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestAccess {
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub tcp: Vec<u16>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideAccess {
+    pub accept: bool,
+}
+#[derive(Serialize, Deserialize)]
+pub struct AccessRequest {
+    pub id: String,
+    pub source: Device,
+    pub target: Device,
+    pub requester_name: String,
+    pub tcp: Vec<u16>,
+    pub status: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub policy_revision: Option<u64>,
+}

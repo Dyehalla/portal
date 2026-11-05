@@ -92,6 +92,9 @@ async function api(path, body, credential = token) {
 function signOut(message = "") {
   session++;
   token = "";
+  accessSignature = ""; seenAccessRequests.clear();
+  $("access-notifications").hidden = true; $("access-request-list").replaceChildren();
+  $("request-access-form").hidden = true; $("request-ports").value = ""; $("request-access-submit").disabled = false;
   try {
     sessionStorage.removeItem(tokenStorageKey);
   } catch {
@@ -333,7 +336,7 @@ function currentDevice() {
 }
 function networkDevices() {
   const devices = new Map();
-  for (const device of [currentDevice(), ...snapshot.peers.filter(peer => peer.owned), ...(account?.devices || []).map(registryPeer), ...snapshot.peers]) {
+  for (const device of [currentDevice(), ...snapshot.peers, ...(account?.devices || []).map(registryPeer)]) {
     if (!devices.has(device.public_key)) devices.set(device.public_key, device);
   }
   return [...devices.values()];
@@ -690,6 +693,8 @@ function renderPeerDetails() {
   }
   $("details-title").textContent = nameOf(peer);
   $("owner-actions").hidden = !account?.user || !peer.owned;
+  $("request-access-form").hidden = !account?.user || peer.owned !== false || !snapshot?.network?.device_id;
+  showError($("request-access-error"), "");
   $("copy-peer-addresses").disabled = !peer.allowed_ips.length;
   if (document.activeElement !== $("rename-name")) $("rename-name").value ||= nameOf(peer);
   details($("peer-detail-list"), [
@@ -837,8 +842,11 @@ function accessLabel(peer) {
   if (peer.incoming_tcp?.length) parts.push(`${nameOf(peer)} → Это устройство · TCP ${ports(peer.incoming_tcp)}`);
   return parts.join("; ") || "Доступа от текущего устройства нет";
 }
+function isOwnDevice(device) {
+  return !!account?.user && device.owner_user_id === account.user.id;
+}
 function registryPeer(device) {
-  return { public_key: device.public_key, device_id: device.id, name: device.name, owned: true, registryOnly: true, allowed_ips: [device.ipv4, device.ipv6], incoming_tcp: [], outgoing_tcp: [], path: "unknown" };
+  return { public_key: device.public_key, device_id: device.id, name: device.name, owned: isOwnDevice(device), registryOnly: true, allowed_ips: [device.ipv4, device.ipv6], incoming_tcp: [], outgoing_tcp: [], path: "unknown" };
 }
 const permissionMap = new window.PortalMap($("map-list"), {
   onDevice(key) {
@@ -930,11 +938,12 @@ async function loadAccount(current = session) {
   try {
     const data = await api("account");
     if (current !== session) return;
-    if (data.error && account) data.devices = account.devices;
+    if (data.error && account) { data.devices = account.devices; data.access_requests = account.access_requests; }
     account = data;
     accountStale = !!data.error;
     showError($("network-error"), data.error || "");
     renderAccount();
+    renderAccessRequests();
     renderPeers();
     refreshBulkResults(current);
     refreshMapPolicies(current);
@@ -942,7 +951,7 @@ async function loadAccount(current = session) {
     if (current !== session) return;
     accountStale = true;
     if (account) renderAccount();
-    showError($("network-error"), error.message + (account ? " Показан последний полученный реестр аккаунта." : ""));
+    showError($("network-error"), error.message + (account ? " Показан последний полученный реестр сети." : ""));
   } finally { if (current === session) accountBusy = false; }
 }
 function renderAccount() {
@@ -955,7 +964,7 @@ function renderAccount() {
   $("account-summary").hidden = !account.user;
   $("add-device-form").hidden = !account.user || !account.needs_device;
   if (account.user) {
-    details($("account-details"), [["Аккаунт", account.user.name], ["Координатор", account.address], ["Собственных устройств", account.devices.length], ["Состояние реестра", accountStale ? "Данные устарели" : "Получен с координатора"]]);
+    details($("account-details"), [["Аккаунт", account.user.name], ["Координатор", account.address], ["Устройств в сети", account.devices.length], ["Собственных устройств", account.devices.filter(isOwnDevice).length], ["Состояние реестра", accountStale ? "Данные устарели" : "Получен с координатора"]]);
     $("device-name").value ||= account.device_name;
     $("device-public-key").value = snapshot.interface.public_key;
     $("resume-network").hidden = !!snapshot.network || account.needs_device;
@@ -1170,7 +1179,7 @@ async function prepareBulk(source, rawPorts) {
   try { rule = parseRule(source, rawPorts); }
   catch (error) { showError($("policy-error"), error.message); return; }
   const current = session;
-  const plan = { ...rule, targets: account.devices.filter(device => device.public_key !== rule.key).map(device => ({device, message: "Загружаем текущую ревизию…"})) };
+  const plan = { ...rule, targets: account.devices.filter(device => isOwnDevice(device) && device.public_key !== rule.key).map(device => ({device, message: "Загружаем текущую ревизию…"})) };
   bulkPlan = plan; bulkBusy = true;
   $("confirm-bulk").disabled = true; $("close-bulk").disabled = true;
   $("bulk-rule").textContent = `Источник: ${nameOf(account.devices.map(registryPeer).find(peer => peer.public_key === rule.key) || snapshot.peers.find(peer => peer.public_key === rule.key) || {public_key: rule.key})} → TCP ${ports(rule.tcp)}`;
@@ -1240,6 +1249,68 @@ async function ownerOperation(operation, extra = {}) {
 }
 $("rename-form").addEventListener("submit", event => { event.preventDefault(); ownerOperation("rename", {name:$("rename-name").value.trim()}); });
 $("revoke-device").addEventListener("click", () => ownerOperation("revoke"));
+
+let accessSignature = "";
+const seenAccessRequests = new Set();
+function renderAccessRequests() {
+  const requests = account?.access_requests || [];
+  const signature = JSON.stringify([account?.user?.id, accountStale, requests]);
+  if (signature === accessSignature) return;
+  accessSignature = signature;
+  const incoming = requests.filter(r => r.target.owner_user_id === account?.user?.id && r.status === "pending");
+  $("access-notifications").hidden = !requests.length;
+  $("access-request-heading").textContent = `Запросы доступа · входящих: ${incoming.length}`;
+  $("access-request-list").replaceChildren(...requests.slice(0, 64).map(request => {
+    const row = element("article", "setup-card");
+    const mine = request.target.owner_user_id === account?.user?.id;
+    row.append(element("strong", "", `${request.requester_name}: ${request.source.name} → ${request.target.name}`));
+    row.append(element("p", "scope-note", `TCP ${ports(request.tcp)} · ${new Date(request.created_at * 1000).toLocaleString("ru-RU")}`));
+    const labels = {pending: mine ? "Ожидает вашего решения" : "Ожидает решения владельца", accepted: "Одобрено. Доступ появится после применения разрешения устройством.", declined: "Владелец отклонил запрос", expired: "Срок запроса истёк"};
+    row.append(element("p", "", labels[request.status] || request.status));
+    if (mine && request.status === "pending") {
+      for (const [accept, label] of [[true, "Принять"], [false, "Отклонить"]]) {
+        const button = element("button", "button secondary", label);
+        button.type = "button";
+        button.disabled = accountStale;
+        button.addEventListener("click", async () => {
+          const current = session;
+          for (const item of row.querySelectorAll("button")) item.disabled = true;
+          showError($("access-notification-error"), "");
+          try {
+            await api("account/device", {operation: "decide_access", request_id: request.id, accept});
+            if (current !== session) return;
+            await loadAccount(); await refresh();
+          } catch (error) { if (current === session) showError($("access-notification-error"), error.message); }
+          finally { if (current === session) for (const item of row.querySelectorAll("button")) item.disabled = false; }
+        });
+        row.append(button);
+      }
+    }
+    return row;
+  }));
+  if (incoming.some(request => !seenAccessRequests.has(request.id))) toast("Получен запрос доступа к вашему устройству");
+  for (const request of requests) seenAccessRequests.add(request.id);
+}
+$("request-access-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const peer = selectedPeer();
+  if (peer?.owned !== false || !snapshot?.network?.device_id) return;
+  let tcp;
+  try {
+    tcp = parseRule(snapshot.interface.public_key, $("request-ports").value).tcp;
+    if (!tcp.length) throw new Error("Укажите хотя бы один TCP-порт");
+  } catch (error) { showError($("request-access-error"), error.message); return; }
+  const current = session;
+  $("request-access-submit").disabled = true;
+  showError($("request-access-error"), "");
+  try {
+    await api("account/device", {operation: "request_access", source_device_id: snapshot.network.device_id, target_device_id: peer.device_id, tcp});
+    if (current !== session) return;
+    toast("Запрос отправлен владельцу устройства");
+    await loadAccount();
+  } catch (error) { if (current === session) showError($("request-access-error"), error.message); }
+  finally { if (current === session) $("request-access-submit").disabled = false; }
+});
 
 navigate();
 restoreSession();

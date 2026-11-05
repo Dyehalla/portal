@@ -395,6 +395,15 @@ async fn account_token(
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum AccountDevice {
+    RequestAccess {
+        source_device_id: String,
+        target_device_id: String,
+        tcp: Vec<u16>,
+    },
+    DecideAccess {
+        request_id: String,
+        accept: bool,
+    },
     Policy {
         device_id: String,
     },
@@ -422,6 +431,28 @@ async fn account_device(
         .client()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
     let result = match request {
+        AccountDevice::RequestAccess {
+            source_device_id,
+            target_device_id,
+            tcp,
+        } => client
+            .request_access(&portal_net::model::RequestAccess {
+                source_device_id,
+                target_device_id,
+                tcp,
+            })
+            .await
+            .and_then(|p| {
+                serde_json::to_value(p)
+                    .map_err(|_| portal_net::client::ClientError::InvalidResponse)
+            }),
+        AccountDevice::DecideAccess { request_id, accept } => client
+            .decide_access(&request_id, accept)
+            .await
+            .and_then(|p| {
+                serde_json::to_value(p)
+                    .map_err(|_| portal_net::client::ClientError::InvalidResponse)
+            }),
         AccountDevice::Policy { device_id } => {
             client.owner_policy(&device_id).await.and_then(|p| {
                 serde_json::to_value(p)

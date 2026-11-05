@@ -134,12 +134,12 @@ impl Store {
     }
 
     pub fn devices(&self, credential: Credential) -> Result<Vec<Device>> {
-        let owner = authenticated_user(&self.connection, credential)?;
+        authenticated_user(&self.connection, credential)?;
         let mut query = self.connection.prepare(&format!(
-            "SELECT {DEVICE_COLUMNS} FROM devices WHERE owner_user_id=? AND revoked=0 ORDER BY id"
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE revoked=0 ORDER BY id"
         ))?;
         Ok(query
-            .query_map([owner.id], device)?
+            .query_map([], device)?
             .collect::<rusqlite::Result<_>>()?)
     }
 

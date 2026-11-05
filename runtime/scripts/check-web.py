@@ -87,10 +87,20 @@ class Handler(SimpleHTTPRequestHandler):
                 state['data'] = copy.deepcopy(DATA)
                 state['account']['needs_device'] = False
                 state['account']['devices'] = [
-                    {'id':'local', 'name':'Мой ноутбук', 'public_key':'b'*64, 'ipv4':'10.20.0.1', 'ipv6':'fd00::1'},
-                    {'id':'isolated', 'name':'Без разрешений', 'public_key':'e'*64, 'ipv4':'10.20.0.4', 'ipv6':'fd00::4'}]
+                    {'id':'local', 'owner_user_id':'owner', 'name':'Мой ноутбук', 'public_key':'b'*64, 'ipv4':'10.20.0.1', 'ipv6':'fd00::1'},
+                    {'id':'isolated', 'owner_user_id':'owner', 'name':'Без разрешений', 'public_key':'e'*64, 'ipv4':'10.20.0.4', 'ipv6':'fd00::4'}]
                 return self.reply(200, {'message': 'connected'})
             if self.path == '/api/v1/account/device':
+                if body['operation'] == 'request_access':
+                    assert body['source_device_id'] == 'local' and body['target_device_id'] == 'foreign-isolated'
+                    assert body['tcp'] == [22, 443]
+                    state['requested_access'] = body
+                    return self.reply(200, {'status':'pending'})
+                if body['operation'] == 'decide_access':
+                    state['access_decisions'].append(body)
+                    item = next(r for r in state['account']['access_requests'] if r['id'] == body['request_id'])
+                    item['status'] = 'accepted' if body['accept'] else 'declined'
+                    return self.reply(200, item)
                 if body['operation'] == 'policy':
                     state['policy_reads'] += 1
                 if state['bulk_policies']:
@@ -330,7 +340,7 @@ def run_account(browser, base):
     browser.wait("document.querySelector('.rule-source') !== null", 'saved rule restored for bulk preview')
     browser.wait("document.querySelector('.service-checkbox[value=\"22\"]').checked && document.querySelector('.service-checkbox[value=\"443\"]').checked && document.querySelector('.rule-ports').value === '8080'", 'saved services restore as checkboxes and extra ports remain editable')
     browser.js("document.querySelector('.service-checkbox[value=\"22\"]').click()")
-    state['account']['devices'].append({'id': 'other', 'name': 'Другой сервер', 'public_key': 'f'*64, 'ipv4': '10.20.0.5', 'ipv6': 'fd00::5'})
+    state['account']['devices'].append({'id': 'other', 'owner_user_id': 'owner', 'name': 'Другой сервер', 'public_key': 'f'*64, 'ipv4': '10.20.0.5', 'ipv6': 'fd00::5'})
     browser.js("document.getElementById('refresh').click()")
     browser.wait("document.getElementById('device-list').textContent.includes('Другой сервер')", 'new own target loaded')
     state['bulk_policies'] = {
@@ -353,13 +363,40 @@ def run_account(browser, base):
     state['bulk_policies']['other']['applied_revision'] = 5
     browser.js("document.getElementById('refresh').click()")
     browser.wait("document.getElementById('bulk-results').textContent.includes('Применено')", 'bulk waits for exact device acknowledgement')
-    state['account']['devices'].append({'id': 'late', 'name': 'Добавлен позже', 'public_key': '9'*64, 'ipv4': '10.20.0.6', 'ipv6': 'fd00::6'})
+    state['account']['devices'].append({'id': 'late', 'owner_user_id': 'owner', 'name': 'Добавлен позже', 'public_key': '9'*64, 'ipv4': '10.20.0.6', 'ipv6': 'fd00::6'})
     browser.wait("document.getElementById('device-list').textContent.includes('Добавлен позже') && !document.getElementById('bulk-results').textContent.includes('Добавлен позже')", 'future devices do not inherit bulk permission')
     assert len(state['bulk_writes']) == 2, 'refresh must not repeat bulk mutations'
     browser.wait("!!document.querySelector('#map-list [data-device=\"'+'9'.repeat(64)+'\"]')", 'coordinator registry updates graph without reloading')
     Path('/tmp/portal-bulk-permissions.png').write_bytes(base64.b64decode(browser.call('WebDriver:TakeScreenshot', {'full': True})['value']))
     browser.js("document.getElementById('sign-out').click()")
     browser.wait("!document.getElementById('auth-view').hidden && !document.querySelector('#policy-rules input') && !document.getElementById('bulk-dialog').open && !document.getElementById('bulk-results').textContent", 'logout clears account editor and bulk results')
+
+
+def run_shared_registry(browser):
+    browser.js("document.getElementById('token').value='a'.repeat(64);document.getElementById('auth-form').requestSubmit()")
+    browser.wait("!document.getElementById('app').hidden", 'login for shared registry')
+    browser.js("for(const dialog of document.querySelectorAll('dialog[open]')) dialog.close()")
+    foreign = {'id':'foreign-isolated','owner_user_id':'colleague','name':'Сервер коллеги','public_key':'8'*64,'ipv4':'10.20.0.9','ipv6':'fd00::9'}
+    state['account']['devices'].append(foreign)
+    state['access_decisions'] = []
+    browser.js("document.getElementById('refresh').click()")
+    browser.wait("document.getElementById('device-list').textContent.includes('Сервер коллеги') && document.getElementById('map-list').textContent.replaceAll('\u00a0', ' ').includes('Сервер коллеги')", 'foreign device is visible without traffic permission')
+    browser.js("document.querySelector('#device-list [data-device=\"'+'8'.repeat(64)+'\"]').click()")
+    browser.wait("document.getElementById('details-dialog').open && document.getElementById('owner-actions').hidden && !document.getElementById('request-access-form').hidden && document.getElementById('connect').hidden", 'foreign device offers access request and never owner actions')
+    browser.js("document.getElementById('request-ports').value='22, 443';document.getElementById('request-access-form').requestSubmit()")
+    browser.wait("!document.getElementById('request-access-submit').disabled", 'request submitted')
+    assert state['requested_access']['tcp'] == [22,443]
+    browser.js("document.getElementById('close-details').click()")
+    current = state['account']['devices'][0]
+    state['account']['access_requests'] = [dict(id='req-'+str(i),source=foreign,target=current,requester_name='Коллега',tcp=[22],status='pending',created_at=int(time.time()),expires_at=int(time.time())+86400,policy_revision=None) for i in range(2)]
+    browser.js("document.getElementById('refresh').click()")
+    browser.wait("document.querySelectorAll('#access-request-list button').length === 4 && !document.getElementById('access-notifications').hidden", 'incoming notifications offer accept and decline')
+    browser.js("document.querySelector('#access-request-list article button').click()")
+    browser.wait("document.querySelectorAll('#access-request-list button').length === 2", 'accepted request is updated')
+    browser.js("document.querySelectorAll('#access-request-list button')[1].click()")
+    browser.wait("document.querySelectorAll('#access-request-list button').length === 0 && document.getElementById('access-request-list').textContent.includes('отклонил')", 'declined request is updated')
+    assert [r['accept'] for r in state['access_decisions']] == [True,False]
+    print('PASS: common registry shows foreign devices without access; browser sends access request and receives actionable notifications')
 
 
 def main():
@@ -389,6 +426,7 @@ def main():
                 browser = Browser(sock)
                 run(browser, f'http://127.0.0.1:{server.server_port}')
                 run_account(browser, f'http://127.0.0.1:{server.server_port}')
+                run_shared_registry(browser)
                 browser.call('WebDriver:DeleteSession')
         finally:
             process.terminate()

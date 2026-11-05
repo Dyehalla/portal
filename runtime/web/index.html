@@ -135,6 +135,12 @@
 
       <div class="shell">
         <main id="main">
+          <section id="access-notifications" class="setup-card" aria-labelledby="access-request-heading" hidden>
+            <h2 id="access-request-heading">Запросы доступа</h2>
+            <p class="scope-note">Принятие разрешит только указанные TCP-порты на указанном устройстве. P2P-подключения после выдачи доступа подтверждаются автоматически.</p>
+            <p id="access-notification-error" class="form-error" role="alert" hidden></p>
+            <div id="access-request-list" aria-live="polite"></div>
+          </section>
           <div
             id="connection-error"
             class="notice error"
@@ -168,7 +174,7 @@
                 placeholder="Найти имя, адрес или ключ"
                 aria-label="Поиск устройств"
             /></label>
-            <p class="scope-note">Собственные устройства показаны из реестра аккаунта, включая устройства без разрешений. Чужие узлы видны только из разрешённой карты текущего агента.</p>
+            <p class="scope-note">Общий реестр показывает все устройства сети. Видимость устройства не даёт доступа: отправьте владельцу запрос на нужные TCP-порты.</p>
             <div id="current-device" class="diagnostic-card" tabindex="-1"></div>
             <div id="device-list" class="device-list"></div>
           </section>
@@ -296,6 +302,13 @@
         </article>
         <dl class="detail-list" id="peer-detail-list"></dl>
         <div class="setup-tabs"><button class="text-link plain-button" id="copy-peer-key" type="button">Скопировать публичный ключ</button><button class="text-link plain-button" id="copy-peer-addresses" type="button">Скопировать адреса</button></div>
+        <form id="request-access-form" class="setup-card" hidden>
+          <h3>Запросить доступ у владельца</h3>
+          <p class="scope-note">Запрос отправляется от этого устройства. Владелец сможет принять или отклонить его.</p>
+          <label>TCP-порты на устройстве получателя<input id="request-ports" required placeholder="22, 443, 8080" /></label>
+          <button id="request-access-submit" class="button primary" type="submit">Отправить запрос доступа</button>
+          <p id="request-access-error" class="form-error" role="alert" hidden></p>
+        </form>
         <div id="owner-actions" hidden>
           <button id="edit-permissions" class="button primary" type="button">Кто может подключаться к этому устройству</button>
           <form id="rename-form" class="setup-card"><label>Имя устройства<input id="rename-name" required maxlength="128" /></label><button id="rename-submit" class="button secondary" type="submit">Сохранить имя</button></form>

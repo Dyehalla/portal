@@ -71,6 +71,7 @@ pub(crate) struct View {
     pub address: Option<String>,
     pub user: Option<User>,
     pub devices: Vec<Device>,
+    pub access_requests: Vec<AccessRequest>,
     pub needs_device: bool,
     pub device_name: String,
     pub pending_user_name: Option<String>,
@@ -274,6 +275,7 @@ impl Account {
                 address: None,
                 user: None,
                 devices: vec![],
+                access_requests: vec![],
                 needs_device: false,
                 device_name: String::new(),
                 pending_user_name: None,
@@ -281,13 +283,14 @@ impl Account {
                 activation_error: None,
             });
         };
-        let (devices, error) = if p.user.is_some() {
-            match self.client()?.devices().await {
-                Ok(devices) => (devices, None),
-                Err(error) => (vec![], Some(failure(error))),
+        let (devices, access_requests, error) = if p.user.is_some() {
+            let client = self.client()?;
+            match tokio::try_join!(client.devices(), client.access_requests()) {
+                Ok((devices, requests)) => (devices, requests, None),
+                Err(error) => (vec![], vec![], Some(failure(error))),
             }
         } else {
-            (vec![], None)
+            (vec![], vec![], None)
         };
         Ok(View {
             configured: true,
@@ -295,8 +298,14 @@ impl Account {
             user: p.user.clone(),
             needs_device: error.is_none()
                 && (p.pending_device_token.is_some()
-                    || !devices.iter().any(|d| d.public_key == key)),
+                    || !devices.iter().any(|d| {
+                        d.public_key == key
+                            && p.user
+                                .as_ref()
+                                .is_some_and(|user| user.id == d.owner_user_id)
+                    })),
             devices,
+            access_requests,
             device_name: p.config.device_name.clone(),
             error,
             activation_error: None,

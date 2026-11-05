@@ -261,6 +261,30 @@ impl CoordinatorClient {
         self.request(Method::GET, "/api/v1/me", None::<&()>).await
     }
 
+    pub async fn access_requests(&self) -> Result<Vec<AccessRequest>, ClientError> {
+        self.request(Method::GET, "/api/v1/access-requests", None::<&()>)
+            .await
+    }
+    pub async fn request_access(
+        &self,
+        request: &RequestAccess,
+    ) -> Result<AccessRequest, ClientError> {
+        self.request(Method::POST, "/api/v1/access-requests", Some(request))
+            .await
+    }
+    pub async fn decide_access(
+        &self,
+        id: &str,
+        accept: bool,
+    ) -> Result<AccessRequest, ClientError> {
+        Self::validate_id(id)?;
+        self.request(
+            Method::POST,
+            &format!("/api/v1/access-requests/{id}/response"),
+            Some(&DecideAccess { accept }),
+        )
+        .await
+    }
     pub async fn devices(&self) -> Result<Vec<Device>, ClientError> {
         self.request(Method::GET, "/api/v1/devices", None::<&()>)
             .await

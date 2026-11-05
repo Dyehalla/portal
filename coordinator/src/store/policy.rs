@@ -87,7 +87,7 @@ fn owned_device(db: &Connection, credential: Credential, id: &str) -> Result<Dev
     .optional()?
     .ok_or_else(Error::not_found)
 }
-fn desired(db: &Connection, id: &str) -> Result<Option<DesiredPolicy>> {
+pub(super) fn desired(db: &Connection, id: &str) -> Result<Option<DesiredPolicy>> {
     db.query_row(
         "SELECT revision,permissions,applied_revision FROM desired_policies WHERE device_id=?",
         [id],
@@ -131,51 +131,9 @@ impl Store {
     ) -> Result<DesiredPolicy> {
         let tx = self.connection.transaction()?;
         let target = owned_device(&tx, credential, id)?;
-        let current = match desired(&tx, id)? {
-            Some(p) => p,
-            None => {
-                let p = policy(&tx, id)?;
-                DesiredPolicy {
-                    revision: p.revision,
-                    applied_revision: p.revision,
-                    permissions: p.permissions,
-                }
-            }
-        };
-        if request.base_revision != current.revision {
-            return Err(Error::conflict("policy revision mismatch"));
-        }
-        if request.permissions.len() > 256 {
-            return Err(Error::bad_request("at most 256 peer entries"));
-        }
-        let mut permissions = Permissions::new();
-        for (key, mut allowed) in request.permissions {
-            let key = public_key(&key)?;
-            if key == target.public_key {
-                return Err(Error::bad_request("cannot grant access to itself"));
-            }
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM devices WHERE public_key=? AND revoked=0)",
-                [&key],
-                |r| r.get(0),
-            )?;
-            if !exists {
-                return Err(Error::bad_request("unknown or revoked source device"));
-            }
-            allowed.tcp = validate::tcp_ports(allowed.tcp)?;
-            if !allowed.tcp.is_empty() && permissions.insert(key, allowed).is_some() {
-                return Err(Error::bad_request("duplicate source"));
-            }
-        }
-        let revision = current.revision + 1;
-        tx.execute("INSERT INTO desired_policies(device_id,revision,permissions,applied_revision) VALUES(?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET revision=excluded.revision,permissions=excluded.permissions", params![id,i64::try_from(revision).map_err(|_| Error::internal())?,serde_json::to_string(&permissions).map_err(|_| Error::internal())?,i64::try_from(current.applied_revision).map_err(|_| Error::internal())?])?;
-        bump(&tx)?;
+        let result = write_owner_policy(&tx, &target, request)?;
         tx.commit()?;
-        Ok(DesiredPolicy {
-            revision,
-            permissions,
-            applied_revision: current.applied_revision,
-        })
+        Ok(result)
     }
     pub fn acknowledge_policy(
         &mut self,
@@ -227,4 +185,56 @@ impl Store {
         tx.commit()?;
         Ok(target)
     }
+}
+
+pub(super) fn write_owner_policy(
+    tx: &Connection,
+    target: &Device,
+    request: PublishPolicy,
+) -> Result<DesiredPolicy> {
+    let id = &target.id;
+    let current = match desired(tx, id)? {
+        Some(p) => p,
+        None => {
+            let p = policy(tx, id)?;
+            DesiredPolicy {
+                revision: p.revision,
+                applied_revision: p.revision,
+                permissions: p.permissions,
+            }
+        }
+    };
+    if request.base_revision != current.revision {
+        return Err(Error::conflict("policy revision mismatch"));
+    }
+    if request.permissions.len() > 256 {
+        return Err(Error::bad_request("at most 256 peer entries"));
+    }
+    let mut permissions = Permissions::new();
+    for (key, mut allowed) in request.permissions {
+        let key = public_key(&key)?;
+        if key == target.public_key {
+            return Err(Error::bad_request("cannot grant access to itself"));
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE public_key=? AND revoked=0)",
+            [&key],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::bad_request("unknown or revoked source device"));
+        }
+        allowed.tcp = validate::tcp_ports(allowed.tcp)?;
+        if !allowed.tcp.is_empty() && permissions.insert(key, allowed).is_some() {
+            return Err(Error::bad_request("duplicate source"));
+        }
+    }
+    let revision = current.revision + 1;
+    tx.execute("INSERT INTO desired_policies(device_id,revision,permissions,applied_revision) VALUES(?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET revision=excluded.revision,permissions=excluded.permissions", params![id,i64::try_from(revision).map_err(|_| Error::internal())?,serde_json::to_string(&permissions).map_err(|_| Error::internal())?,i64::try_from(current.applied_revision).map_err(|_| Error::internal())?])?;
+    bump(tx)?;
+    Ok(DesiredPolicy {
+        revision,
+        permissions,
+        applied_revision: current.applied_revision,
+    })
 }

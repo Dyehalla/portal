@@ -98,6 +98,224 @@ async fn user(app: &Router, name: &str) -> Value {
 fn token(value: &Value) -> &str {
     value["access_token"].as_str().unwrap()
 }
+
+#[tokio::test]
+async fn shared_registry_access_requests_require_owner_approval_and_device_ack() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.open().await;
+    let app = coordinator.test_router();
+    let alice = user(&app, "request-alice").await;
+    let bob = user(&app, "request-bob").await;
+    let eve = user(&app, "request-eve").await;
+    let a = device(&app, token(&alice), 51).await;
+    let b = device(&app, token(&bob), 52).await;
+    let other = device(&app, token(&bob), 53).await;
+    let (status, registry) = request(
+        &app,
+        "GET",
+        "/api/v1/devices",
+        Some(token(&alice)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(registry.as_array().unwrap().len(), 3);
+    assert!(!registry.to_string().contains("access_token"));
+    assert!(map(&app, &a).await["peers"].as_array().unwrap().is_empty());
+    let path = "/api/v1/access-requests";
+    let body = json!({"source_device_id":id(&a),"target_device_id":id(&b),"tcp":[443,22,443]});
+    for credential in [None, Some(token(&a))] {
+        assert_eq!(
+            request(&app, "GET", "/api/v1/devices", credential, Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&app, "POST", path, credential, body.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        request(&app, "POST", path, Some(token(&eve)), body.clone())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, pending) = request(&app, "POST", path, Some(token(&alice)), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending["tcp"], json!([22, 443]));
+    assert_eq!(pending["status"], "pending");
+    let duplicate = request(&app, "POST", path, Some(token(&alice)), body)
+        .await
+        .1;
+    assert_eq!(duplicate["id"], pending["id"]);
+    for (credential, count) in [(token(&alice), 1), (token(&bob), 1), (token(&eve), 0)] {
+        let (status, requests) = request(&app, "GET", path, Some(credential), Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(requests.as_array().unwrap().len(), count);
+    }
+    let response = format!("{path}/{}/response", pending["id"].as_str().unwrap());
+    for credential in [token(&alice), token(&eve), fixture.admin_token().as_str()] {
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &response,
+                Some(credential),
+                json!({"accept":true})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (status, accepted) = request(
+        &app,
+        "POST",
+        &response,
+        Some(token(&bob)),
+        json!({"accept":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accepted["status"], "accepted");
+    let repeated = request(
+        &app,
+        "POST",
+        &response,
+        Some(token(&bob)),
+        json!({"accept":true}),
+    )
+    .await
+    .1;
+    assert_eq!(repeated["policy_revision"], accepted["policy_revision"]);
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &response,
+            Some(token(&bob)),
+            json!({"accept":false})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    // Owner approval creates desired policy, not effective access before the agent ACK.
+    assert!(map(&app, &a).await["peers"].as_array().unwrap().is_empty());
+    let desired = request(
+        &app,
+        "GET",
+        "/api/v1/device/desired-policy",
+        Some(token(&b)),
+        Value::Null,
+    )
+    .await
+    .1;
+    assert_eq!(
+        desired["permissions"][a["device"]["public_key"].as_str().unwrap()]["tcp"],
+        json!([22, 443])
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/device/policy-ack",
+            Some(token(&b)),
+            json!({"revision":desired["revision"]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        map(&app, &a).await["peers"][0]["outgoing"]["tcp"],
+        json!([22, 443])
+    );
+    assert!(
+        map(&app, &other).await["peers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Declining a separate request never changes permissions on that destination.
+    let pending = request(
+        &app,
+        "POST",
+        path,
+        Some(token(&alice)),
+        json!({"source_device_id":id(&a),"target_device_id":id(&other),"tcp":[8080]}),
+    )
+    .await
+    .1;
+    let response = format!("{path}/{}/response", pending["id"].as_str().unwrap());
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &response,
+            Some(token(&bob)),
+            json!({"accept":false})
+        )
+        .await
+        .1["status"],
+        "declined"
+    );
+    assert!(
+        request(
+            &app,
+            "GET",
+            "/api/v1/device/desired-policy",
+            Some(token(&other)),
+            Value::Null
+        )
+        .await
+        .1
+        .is_null()
+    );
+    drop(app);
+    drop(coordinator);
+    let coordinator = fixture.open().await;
+    let app = coordinator.test_router();
+    let history = request(&app, "GET", path, Some(token(&bob)), Value::Null)
+        .await
+        .1;
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["status"] == "accepted")
+    );
+    // Revoked devices disappear from the common registry.
+    request(
+        &app,
+        "DELETE",
+        &format!("/api/v1/devices/{}", id(&other)),
+        Some(token(&bob)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/v1/devices",
+            Some(token(&alice)),
+            Value::Null
+        )
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .len(),
+        2
+    );
+}
 fn id(value: &Value) -> &str {
     value["device"]["id"].as_str().unwrap()
 }
@@ -1005,7 +1223,7 @@ async fn migration_preserves_identities_but_archives_user_grants_without_expandi
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            5
+            6
         );
         #[cfg(unix)]
         {

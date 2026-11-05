@@ -125,6 +125,11 @@ impl Coordinator {
             .route("/api/v1/enrollment", post(enroll_retryable))
             .route("/api/v1/me", get(me))
             .route("/api/v1/devices", post(register_device).get(devices))
+            .route(
+                "/api/v1/access-requests",
+                post(request_access).get(access_requests),
+            )
+            .route("/api/v1/access-requests/:id/response", post(decide_access))
             .route("/api/v1/devices/:id", axum::routing::delete(revoke_device))
             .route("/api/v1/devices/:id/token", post(rotate_device_token))
             .route(
@@ -564,4 +569,38 @@ async fn respond_connection(
     } else {
         Ok(StatusCode::NO_CONTENT.into_response())
     }
+}
+
+async fn access_requests(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+) -> Result<Json<Vec<AccessRequest>>> {
+    Ok(Json(
+        state
+            .call(move |store| store.access_requests(credential))
+            .await?,
+    ))
+}
+async fn request_access(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Json(request): Json<RequestAccess>,
+) -> Result<Json<AccessRequest>> {
+    Ok(Json(
+        state
+            .call(move |store| store.request_access(credential, request))
+            .await?,
+    ))
+}
+async fn decide_access(
+    State(state): State<ApiState>,
+    Auth(credential): Auth,
+    Path(id): Path<String>,
+    Json(request): Json<DecideAccess>,
+) -> Result<Json<AccessRequest>> {
+    Ok(Json(
+        state
+            .call(move |store| store.decide_access(credential, &id, request.accept))
+            .await?,
+    ))
 }
