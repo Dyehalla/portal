@@ -38,6 +38,35 @@ pub struct RuntimeConfig {
     pub auto_routes: bool,
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
+    pub terminal: TerminalConfig,
+}
+
+/// SSH terminal service configuration. The service is supervised by Portal and
+/// binds only to the virtual addresses assigned by the coordinator.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    pub enabled: bool,
+    pub listen_port: u16,
+    pub user: String,
+    pub authorized_keys_file: PathBuf,
+    pub host_key_dir: PathBuf,
+    pub max_sessions: u16,
+    pub idle_timeout_seconds: u32,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: 2222,
+            user: "portal".into(),
+            authorized_keys_file: "/etc/portal/authorized_keys".into(),
+            host_key_dir: "/etc/portal/ssh".into(),
+            max_sessions: 8,
+            idle_timeout_seconds: 900,
+        }
+    }
 }
 
 /// Persistent managed-mode configuration. Relative paths resolve beside this file.
@@ -84,6 +113,7 @@ pub struct FileConfig {
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
     pub coordinator: ManagedConfig,
+    pub terminal: TerminalConfig,
 }
 
 impl Default for FileConfig {
@@ -103,6 +133,7 @@ impl Default for FileConfig {
                 .expect("constant socket address"),
             api_token_file: defaults::API_TOKEN_FILE.into(),
             coordinator: ManagedConfig::default(),
+            terminal: TerminalConfig::default(),
         }
     }
 }
@@ -120,6 +151,8 @@ impl FileConfig {
             &mut config.coordinator.credential_file,
             &mut config.coordinator.policy_file,
             &mut config.coordinator.map_file,
+            &mut config.terminal.authorized_keys_file,
+            &mut config.terminal.host_key_dir,
         ] {
             if value.is_relative() {
                 *value = base.join(&*value);
@@ -140,6 +173,15 @@ impl FileConfig {
         if config.handshake_rate_limit == Some(0) {
             return Err("handshake_rate_limit must be greater than zero".into());
         }
+        if config.terminal.listen_port == 0
+            || config.terminal.max_sessions == 0
+            || config.terminal.max_sessions > 256
+            || config.terminal.idle_timeout_seconds == 0
+            || config.terminal.user.trim().is_empty()
+            || config.terminal.user.chars().any(char::is_control)
+        {
+            return Err("invalid terminal configuration".into());
+        }
         if config.coordinator.device_name.trim().is_empty()
             || config.coordinator.device_name.len() > 128
             || config.coordinator.device_name.chars().any(char::is_control)
@@ -155,6 +197,7 @@ impl FileConfig {
             &config.coordinator.credential_file,
             &config.coordinator.policy_file,
             &config.coordinator.map_file,
+            &config.terminal.authorized_keys_file,
             &config.coordinator.credential_file.with_extension("lock"),
             &path.to_path_buf(),
         ] {
@@ -197,6 +240,7 @@ impl FileConfig {
             auto_routes: self.auto_routes,
             api_listen: self.api_listen,
             api_token_file: self.api_token_file,
+            terminal: self.terminal,
         }
     }
 }

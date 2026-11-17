@@ -71,12 +71,22 @@ pub(super) fn initialize(
         "CREATE TABLE IF NOT EXISTS access_requests(
             id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES devices(id),
             target_id TEXT NOT NULL REFERENCES devices(id), tcp TEXT NOT NULL,
+            terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1)),
             status TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
             policy_revision INTEGER);
             CREATE INDEX IF NOT EXISTS access_request_target ON access_requests(target_id,status);
             CREATE INDEX IF NOT EXISTS access_request_source ON access_requests(source_id,status);",
     )
     .map_err(|e| e.to_string())?;
+    {
+        let has_terminal: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('access_requests') WHERE name='terminal')",
+            [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !has_terminal {
+            tx.execute_batch("ALTER TABLE access_requests ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1));")
+                .map_err(|e| e.to_string())?;
+        }
+    }
     tx.pragma_update(None, "user_version", 6)
         .map_err(|e| e.to_string())?;
     let exists: bool = tx

@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +72,9 @@ pub struct IssuedToken {
 pub struct PeerPermissions {
     /// Allowed TCP destination ports on the device publishing this policy.
     pub tcp: Vec<u16>,
+    /// Permit the Portal SSH terminal service on the destination device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal: bool,
 }
 
 pub type Permissions = BTreeMap<String, PeerPermissions>;
@@ -168,8 +175,20 @@ mod tests {
     #[test]
     fn permissions_have_stable_json_order_independent_of_insertion_order() {
         let mut permissions = Permissions::new();
-        permissions.insert("b".into(), PeerPermissions { tcp: vec![443] });
-        permissions.insert("a".into(), PeerPermissions { tcp: vec![80] });
+        permissions.insert(
+            "b".into(),
+            PeerPermissions {
+                tcp: vec![443],
+                terminal: false,
+            },
+        );
+        permissions.insert(
+            "a".into(),
+            PeerPermissions {
+                tcp: vec![80],
+                terminal: false,
+            },
+        );
         assert_eq!(
             serde_json::to_string(&permissions).unwrap(),
             r#"{"a":{"tcp":[80]},"b":{"tcp":[443]}}"#
@@ -184,6 +203,8 @@ pub struct RequestAccess {
     pub source_device_id: String,
     pub target_device_id: String,
     pub tcp: Vec<u16>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +218,8 @@ pub struct AccessRequest {
     pub target: Device,
     pub requester_name: String,
     pub tcp: Vec<u16>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal: bool,
     pub status: String,
     pub created_at: u64,
     pub expires_at: u64,

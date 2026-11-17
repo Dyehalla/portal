@@ -11,6 +11,16 @@ pub(crate) struct Snapshot {
     pub network: Option<Network>,
     pub peers: Vec<Peer>,
     pub stats: Stats,
+    pub terminal: Option<Terminal>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Terminal {
+    pub enabled: bool,
+    pub port: u16,
+    pub user: String,
+    pub status: &'static str,
+    pub last_exit: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +60,7 @@ pub(crate) struct Peer {
     /// None denotes ordinary WireGuard mode, where Portal TCP ACLs do not apply.
     pub incoming_tcp: Option<Vec<u16>>,
     pub outgoing_tcp: Option<Vec<u16>>,
+    pub terminal: Option<bool>,
     pub traffic: Option<Traffic>,
 }
 

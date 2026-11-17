@@ -5,6 +5,15 @@
   "mtu": 1420,
   "api_listen": "127.0.0.1:51821",
   "api_token_file": "../runtime-state/api.token",
+  "terminal": {
+    "enabled": true,
+    "listen_port": 2222,
+    "user": "portal",
+    "authorized_keys_file": "../runtime-state/authorized_keys",
+    "host_key_dir": "../runtime-state/ssh",
+    "max_sessions": 8,
+    "idle_timeout_seconds": 900
+  },
   "coordinator": {
     "url": "https://localhost:8443",
     "device_name": "my-device",

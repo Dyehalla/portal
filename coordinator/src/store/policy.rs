@@ -57,7 +57,7 @@ impl Store {
                 return Err(Error::bad_request("duplicate peer key after normalization"));
             }
         }
-        permissions.retain(|_, allowed| !allowed.tcp.is_empty());
+        permissions.retain(|_, allowed| !allowed.tcp.is_empty() || allowed.terminal);
         let mut result = current;
         if result.permissions != permissions {
             tx.execute(
@@ -225,7 +225,9 @@ pub(super) fn write_owner_policy(
             return Err(Error::bad_request("unknown or revoked source device"));
         }
         allowed.tcp = validate::tcp_ports(allowed.tcp)?;
-        if !allowed.tcp.is_empty() && permissions.insert(key, allowed).is_some() {
+        if (!allowed.tcp.is_empty() || allowed.terminal)
+            && permissions.insert(key, allowed).is_some()
+        {
             return Err(Error::bad_request("duplicate source"));
         }
     }

@@ -561,10 +561,9 @@ impl Agent {
     async fn connect_inner(&self, peer_device_id: String) -> Result<String, String> {
         let (map, _, deadline) = self.snapshot()?;
         if deadline <= Instant::now()
-            || !map
-                .peers
-                .iter()
-                .any(|p| p.device.id == peer_device_id && !p.outgoing.tcp.is_empty())
+            || !map.peers.iter().any(|p| {
+                p.device.id == peer_device_id && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal)
+            })
         {
             return Err("peer is not authorized by the active network map".into());
         }
@@ -600,7 +599,7 @@ impl Agent {
                 if !state.map.peers.iter().any(|p| {
                     p.device.id == signal.peer.id
                         && p.device.public_key == signal.peer.public_key
-                        && !p.outgoing.tcp.is_empty()
+                        && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal)
                 }) {
                     return Err("peer access revoked".into());
                 }
@@ -733,7 +732,13 @@ mod tests {
         assert!(Prepared::load(configs[0].clone(), key_a).await.is_err());
         let b = Prepared::load(configs[1].clone(), key_b).await.unwrap();
         assert!(a.map.peers.is_empty());
-        let grant = Permissions::from([(key_hex(&key_a), PeerPermissions { tcp: vec![443] })]);
+        let grant = Permissions::from([(
+            key_hex(&key_a),
+            PeerPermissions {
+                tcp: vec![443],
+                terminal: false,
+            },
+        )]);
         b.client
             .publish_policy(&PublishPolicy {
                 base_revision: b.map.policy.revision,

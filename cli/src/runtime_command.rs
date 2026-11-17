@@ -168,6 +168,7 @@ pub(crate) fn run_command(args: &[String]) -> Result<(), String> {
         auto_routes: defaults::AUTO_ROUTES && !options.contains_key("no-auto-routes"),
         api_listen,
         api_token_file,
+        terminal: portal_runtime::TerminalConfig::default(),
     })
 }
 

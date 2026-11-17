@@ -32,7 +32,11 @@ impl Store {
                     .get(&own.public_key)
                     .cloned()
                     .unwrap_or_default();
-                if !incoming.tcp.is_empty() || !outgoing.tcp.is_empty() {
+                if !incoming.tcp.is_empty()
+                    || incoming.terminal
+                    || !outgoing.tcp.is_empty()
+                    || outgoing.terminal
+                {
                     peers.push(Peer {
                         device: candidate,
                         policy_revision: candidate_policy.revision,

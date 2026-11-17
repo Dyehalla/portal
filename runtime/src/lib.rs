@@ -11,9 +11,13 @@ mod runtime;
 #[cfg(target_os = "linux")]
 mod snapshot;
 #[cfg(target_os = "linux")]
+mod terminal;
+#[cfg(target_os = "linux")]
 mod web_account;
 
-pub use config::{FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey, defaults};
+pub use config::{
+    FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey, TerminalConfig, defaults,
+};
 
 #[cfg(target_os = "linux")]
 /// Enroll a device over verified HTTPS and persist its private device credentials.

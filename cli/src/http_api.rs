@@ -58,6 +58,47 @@ pub(crate) fn send(
     result
 }
 
+/// Fetch the authenticated runtime snapshot for commands that need peer addresses.
+pub(crate) fn snapshot(address: &str, token_file: &str) -> Result<serde_json::Value, String> {
+    let address = parse_address(address)?;
+    let token = read_token(token_file)?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|e| format!("could not connect to local API {address}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let request = format!(
+        "GET /api/v1/snapshot HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        token.as_str()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    (&mut stream)
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    if response.len() > MAX_RESPONSE_BYTES {
+        return Err("API response is too large".into());
+    }
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("invalid HTTP response from local API")?;
+    let status = std::str::from_utf8(&response[..header_end])
+        .ok()
+        .and_then(|h| h.lines().next())
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u16>().ok())
+        .ok_or("invalid HTTP status from local API")?;
+    let body = &response[header_end + 4..];
+    if !(200..300).contains(&status) {
+        return Err(format!("local API returned HTTP {status}"));
+    }
+    serde_json::from_slice(body).map_err(|e| format!("invalid snapshot JSON: {e}"))
+}
+
 /// Connect to the local API, send a bounded JSON request, and decode its response.
 fn send_inner(address: &str, token_file: &str, command: &str) -> Result<String, String> {
     let address = parse_address(address)?;

@@ -6,6 +6,7 @@ mod cli {
     use std::env;
     use std::fs;
     use std::net::SocketAddr;
+    use std::process::Command;
     use zeroize::{Zeroize, Zeroizing};
 
     pub(super) fn entry() -> Result<(), String> {
@@ -33,6 +34,7 @@ mod cli {
                 };
                 print_operation(send_command(&options, &command)?)
             }
+            "terminal" => terminal_command(&args[1..]),
             "stats" | "status" | "health" | "list" | "peer-stats" | "shutdown" => {
                 control_command(command, &args[1..])
             }
@@ -58,6 +60,7 @@ Commands:
   portal status|health|stats|list|shutdown [--api IP:PORT] [--token-file PATH]
   portal peer-stats [--api IP:PORT] [--token-file PATH] --public-key HEX
   portal connect --device-id ID [--api IP:PORT] [--token-file PATH]
+  portal terminal --device-id ID [--user USER] [--api IP:PORT] [--token-file PATH]
   portal web [--api IP:PORT] [--token-file PATH]  Get a login link; start if needed
 
 portal web starts runtime with defaults if no agent is listening and no options were given.
@@ -66,6 +69,52 @@ Use portal start --help for agent options (including --config PATH).
 Keys are 32 raw bytes or 64 hexadecimal characters.
 The default API is 127.0.0.1:51821 and its token file is /run/portal.token."
         );
+    }
+
+    fn terminal_command(args: &[String]) -> Result<(), String> {
+        let options = parse_options(args, &[])?;
+        validate_options(&options, &["api", "token-file", "device-id", "user"], &[])?;
+        let device_id = required(&options, "device-id")?;
+        let (address, token_file) = api_target(&options);
+        let connect = crate::http_api::ManagementRequest::Connect {
+            peer_device_id: device_id,
+        };
+        let _ = send_command(&options, &connect)?;
+        let snapshot = crate::http_api::snapshot(address, token_file)?;
+        let peer = snapshot
+            .get("peers")
+            .and_then(|peers| peers.as_array())
+            .and_then(|peers| {
+                peers
+                    .iter()
+                    .find(|peer| peer.get("device_id").and_then(|v| v.as_str()) == Some(device_id))
+            })
+            .ok_or("target device is absent from the current network map")?;
+        if peer.get("terminal").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("terminal access is not granted for this device".into());
+        }
+        if peer.get("path").and_then(|v| v.as_str()) == Some("offline") {
+            return Err("target device has no available direct path".into());
+        }
+        let ip = peer
+            .get("allowed_ips")
+            .and_then(|v| v.as_array())
+            .and_then(|ips| {
+                ips.iter()
+                    .filter_map(|v| v.as_str())
+                    .find_map(|v| v.split('/').next()?.parse::<std::net::IpAddr>().ok())
+            })
+            .ok_or("target device has no virtual address")?;
+        let user = options
+            .get("user")
+            .and_then(|v| first(v))
+            .map(String::as_str)
+            .unwrap_or("portal");
+        let status = Command::new("ssh")
+            .args(["-p", "2222", &format!("{user}@{ip}")])
+            .status()
+            .map_err(|e| format!("could not start ssh: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     fn web_command(args: &[String]) -> Result<(), String> {

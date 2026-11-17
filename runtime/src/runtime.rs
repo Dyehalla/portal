@@ -7,6 +7,7 @@ use crate::api::LocalApi;
 use crate::api::ManagementRequest;
 use crate::managed::{Agent, ManagedState, Prepared};
 use crate::platform::{HostPlatform, LinuxPlatform};
+use crate::terminal::TerminalSupervisor;
 use crate::{InterfaceAddress, RuntimeConfig, SecretKey};
 use portal::{AccessControl, AllowedIp, Device, DeviceConfig, PeerConfig, PeerKey};
 use portal_net::{
@@ -38,6 +39,7 @@ pub(crate) struct Runtime {
     routes: HashMap<AllowedIp, bool>,
     pub(crate) shutdown_requested: bool,
     platform: Arc<dyn HostPlatform>,
+    terminal: Option<TerminalSupervisor>,
 }
 
 /// Create the WireGuard device, configure its host interface, serve the local API, and clean up.
@@ -132,6 +134,10 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
         routes: HashMap::new(),
         shutdown_requested: false,
         platform: Arc::clone(&platform),
+        terminal: options
+            .terminal
+            .enabled
+            .then(|| TerminalSupervisor::new(options.terminal.clone())),
     };
     let listen_address = runtime
         .device
@@ -199,7 +205,7 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
             break;
         }
         {
-            let runtime = match runtime.lock() {
+            let mut runtime = match runtime.lock() {
                 Ok(runtime) => runtime,
                 Err(_) => {
                     serve_result = Err("runtime state became unavailable".into());
@@ -214,6 +220,19 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
             }
             if runtime.shutdown_requested {
                 break;
+            }
+            let terminal_addresses = runtime
+                .addresses
+                .iter()
+                .map(|a| a.address.to_string())
+                .collect::<Vec<_>>();
+            if runtime.managed.is_some()
+                && let Some(terminal) = runtime.terminal.as_mut()
+            {
+                if let Err(error) = terminal.reconcile(&terminal_addresses) {
+                    serve_result = Err(error);
+                    break;
+                }
             }
         }
         if api.has_exited() {
@@ -324,7 +343,7 @@ impl Runtime {
                 });
                 let path = device.peer_path(key).ok();
                 snapshot::Peer {
-                    public_key,
+                    public_key: public_key.clone(),
                     device_id: remote.map(|p| p.device.id.clone()),
                     name: remote.map(|p| p.device.name.clone()),
                     owned: remote.and_then(|p| {
@@ -349,6 +368,10 @@ impl Runtime {
                         .managed
                         .as_ref()
                         .map(|_| remote.map(|p| p.outgoing.tcp.clone()).unwrap_or_default()),
+                    terminal: self
+                        .managed
+                        .as_ref()
+                        .map(|_| remote.is_some_and(|p| p.outgoing.terminal)),
                     traffic: device.peer_stats(key).ok().map(|stats| snapshot::Traffic {
                         tx_packets: stats.tx_packets,
                         tx_bytes: stats.tx_bytes,
@@ -401,6 +424,13 @@ impl Runtime {
                 timer_send_errors: stats.timer_send_errors,
                 udp_send_errors: stats.udp_send_errors,
             },
+            terminal: self.terminal.as_ref().map(|terminal| snapshot::Terminal {
+                enabled: true,
+                port: terminal.listen_port(),
+                user: terminal.user().to_owned(),
+                status: terminal.status(),
+                last_exit: terminal.last_exit().map(str::to_owned),
+            }),
         })
     }
 
@@ -420,8 +450,14 @@ impl Runtime {
         {
             return Ok(());
         }
-        let rules = match policy::compile(&map, &local, key, self.managed.as_ref().map(|s| &s.map))
-        {
+        let terminal_port = self.terminal.as_ref().map(|s| s.listen_port());
+        let rules = match policy::compile_with_terminal(
+            &map,
+            &local,
+            key,
+            self.managed.as_ref().map(|s| &s.map),
+            terminal_port,
+        ) {
             Ok(rules) => rules,
             Err(e) => {
                 if let Some(access) = &self.access_control {
@@ -506,6 +542,14 @@ impl Runtime {
             deadline,
             connected: true,
         });
+        if let Some(terminal) = self.terminal.as_mut() {
+            let addresses = self
+                .addresses
+                .iter()
+                .map(|a| a.address.to_string())
+                .collect::<Vec<_>>();
+            terminal.reconcile(&addresses)?;
+        }
         Ok(())
     }
 
@@ -665,13 +709,29 @@ impl Runtime {
             ManagementRequest::Status => {
                 let device = self.device.as_ref().expect("running device");
                 device.health().map_err(|error| error.to_string())?;
+                let terminal = self
+                    .terminal
+                    .as_ref()
+                    .map(|service| {
+                        format!(
+                            "terminal={} port={}{}",
+                            service.status(),
+                            service.listen_port(),
+                            service
+                                .last_exit()
+                                .map(|e| format!(" exit={e}"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_else(|| "terminal=disabled".into());
                 Ok(format!(
-                    "tun={} listen={} public_key={} peers={} {}",
+                    "tun={} listen={} public_key={} peers={} {} {}",
                     self.tun_name,
                     device.listen_addr(),
                     encode_hex(&device.public_key()),
                     self.peers.len(),
-                    self.managed.as_ref().map(|s| format!("mode=managed device={} network={} generation={} revision={} policy_revision={} policy_pending={} coordinator_connected={} lease_active={} lease_remaining_seconds={}", s.map.device.id, s.map.network_id, s.map.generation, s.map.revision, s.map.policy.revision, s.map.policy.permissions != s.local, s.connected, s.deadline > Instant::now(), s.deadline.saturating_duration_since(Instant::now()).as_secs())).unwrap_or_else(|| "mode=manual".into())
+                    self.managed.as_ref().map(|s| format!("mode=managed device={} network={} generation={} revision={} policy_revision={} policy_pending={} coordinator_connected={} lease_active={} lease_remaining_seconds={}", s.map.device.id, s.map.network_id, s.map.generation, s.map.revision, s.map.policy.revision, s.map.policy.permissions != s.local, s.connected, s.deadline > Instant::now(), s.deadline.saturating_duration_since(Instant::now()).as_secs())).unwrap_or_else(|| "mode=manual".into()),
+                    terminal
                 ))
             }
             ManagementRequest::List => {
@@ -927,6 +987,11 @@ impl Runtime {
         let desired = HashSet::new();
         let mut errors = Vec::new();
         errors.extend(self.remove_stale_routes(&desired));
+        if let Some(terminal) = self.terminal.as_mut() {
+            if let Err(error) = terminal.shutdown() {
+                errors.push(error);
+            }
+        }
         if let Err(error) =
             self.platform
                 .cleanup_interface(&self.tun_name, &self.addresses, self.link_up)

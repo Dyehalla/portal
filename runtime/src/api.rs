@@ -399,6 +399,8 @@ enum AccountDevice {
         source_device_id: String,
         target_device_id: String,
         tcp: Vec<u16>,
+        #[serde(default)]
+        terminal: bool,
     },
     DecideAccess {
         request_id: String,
@@ -435,11 +437,13 @@ async fn account_device(
             source_device_id,
             target_device_id,
             tcp,
+            terminal,
         } => client
             .request_access(&portal_net::model::RequestAccess {
                 source_device_id,
                 target_device_id,
                 tcp,
+                terminal,
             })
             .await
             .and_then(|p| {

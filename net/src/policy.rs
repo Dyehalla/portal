@@ -43,7 +43,7 @@ pub fn normalize_permissions(permissions: Permissions) -> Result<Permissions, St
         validate_ports(&ports)?;
         ports.tcp.sort_unstable();
         ports.tcp.dedup();
-        if !ports.tcp.is_empty() {
+        if !ports.tcp.is_empty() || ports.terminal {
             result.insert(key, ports);
         }
     }
@@ -102,11 +102,26 @@ pub fn lease_deadline(map: &NetworkMap, request_started: Instant) -> Result<Inst
 
 /// Validate the entire map before changing host or WireGuard state. Local inbound
 /// grants are intersected with confirmed bindings; ownership never grants traffic.
+pub const DEFAULT_TERMINAL_PORT: u16 = 2222;
+
 pub fn compile(
     map: &NetworkMap,
     local: &Permissions,
     expected_key: PeerKey,
     previous: Option<&NetworkMap>,
+) -> Result<AccessRules, String> {
+    compile_with_terminal(map, local, expected_key, previous, None)
+}
+
+/// Compile network ACLs and optionally map the dedicated terminal permission to
+/// the configured SSH port. Keeping this separate preserves old callers and
+/// makes the terminal permission independent from arbitrary TCP grants.
+pub fn compile_with_terminal(
+    map: &NetworkMap,
+    local: &Permissions,
+    expected_key: PeerKey,
+    previous: Option<&NetworkMap>,
+    terminal_port: Option<u16>,
 ) -> Result<AccessRules, String> {
     if map.protocol_version != PROTOCOL_VERSION
         || map.network_id.is_empty()
@@ -172,17 +187,31 @@ pub fn compile(
             return Err("map incoming grants disagree with device policy".into());
         }
         let local_ports = local.get(&key_hex(&key)).cloned().unwrap_or_default();
-        let incoming_tcp = confirmed
+        let mut incoming_tcp = confirmed
             .tcp
             .into_iter()
             .filter(|p| local_ports.tcp.contains(p))
-            .collect();
+            .collect::<Vec<_>>();
+        if let Some(port) = terminal_port
+            && confirmed.terminal
+            && local_ports.terminal
+            && !incoming_tcp.contains(&port)
+        {
+            incoming_tcp.push(port);
+        }
+        let mut outgoing_tcp = peer.outgoing.tcp.clone();
+        if let Some(port) = terminal_port
+            && peer.outgoing.terminal
+            && !outgoing_tcp.contains(&port)
+        {
+            outgoing_tcp.push(port);
+        }
         rules.peers.insert(
             key,
             PeerAccess {
                 addresses: vec![peer.device.ipv4.into(), peer.device.ipv6.into()],
                 incoming_tcp,
-                outgoing_tcp: peer.outgoing.tcp.clone(),
+                outgoing_tcp,
             },
         );
     }
@@ -247,19 +276,21 @@ pub fn validate_signal_at(
     } else {
         peer.outgoing.clone()
     };
-    if signal.permissions.tcp.is_empty()
+    if signal.permissions.tcp.is_empty() && !signal.permissions.terminal
         || signal
             .permissions
             .tcp
             .iter()
             .any(|p| !allowed.tcp.contains(p))
+        || signal.permissions.terminal && !allowed.terminal
         || incoming
             && (signal.target_policy_revision != map.policy.revision
                 || signal
                     .permissions
                     .tcp
                     .iter()
-                    .any(|p| !peer.incoming.tcp.contains(p)))
+                    .any(|p| !peer.incoming.tcp.contains(p))
+                || signal.permissions.terminal && !peer.incoming.terminal)
         || !incoming && signal.target_policy_revision != peer.policy_revision
     {
         return Err("P2P signal is not authorized by the applied policy".into());
@@ -294,7 +325,10 @@ mod tests {
         remote.public_key = key(8);
         remote.ipv4 = "10.77.0.2".parse().unwrap();
         remote.ipv6 = "fd00::2".parse().unwrap();
-        let ports = PeerPermissions { tcp: vec![443] };
+        let ports = PeerPermissions {
+            tcp: vec![443],
+            terminal: false,
+        };
         NetworkMap {
             protocol_version: PROTOCOL_VERSION,
             network_id: "network".into(),
@@ -352,8 +386,36 @@ mod tests {
         let rules = compile(&map, &map.policy.permissions, own, None).unwrap();
         assert_eq!(rules.peers[&remote].incoming_tcp, [443]);
         assert!(rules.peers[&remote].outgoing_tcp.is_empty());
-        let unknown = Permissions::from([(key(9), PeerPermissions { tcp: vec![443] })]);
+        let unknown = Permissions::from([(
+            key(9),
+            PeerPermissions {
+                tcp: vec![443],
+                terminal: false,
+            },
+        )]);
         assert_eq!(compile(&map, &unknown, own, None).unwrap().peers.len(), 1);
+    }
+
+    #[test]
+    fn terminal_permission_is_compiled_to_the_dedicated_port() {
+        let mut map = map();
+        let own = public_key(&map.device.public_key).unwrap();
+        let remote = public_key(&map.peers[0].device.public_key).unwrap();
+        map.policy
+            .permissions
+            .get_mut(&key_hex(&remote))
+            .unwrap()
+            .terminal = true;
+        map.peers[0].incoming.terminal = true;
+        let local = Permissions::from([(
+            key_hex(&remote),
+            PeerPermissions {
+                tcp: vec![],
+                terminal: true,
+            },
+        )]);
+        let rules = compile_with_terminal(&map, &local, own, None, Some(2222)).unwrap();
+        assert!(rules.peers[&remote].incoming_tcp.contains(&2222));
     }
 
     #[test]
@@ -395,7 +457,10 @@ mod tests {
             generation: map.generation.clone(),
             revision: map.revision,
             peer: map.peers[0].device.clone(),
-            permissions: PeerPermissions { tcp: vec![443] },
+            permissions: PeerPermissions {
+                tcp: vec![443],
+                terminal: false,
+            },
             target_policy_revision: map.policy.revision,
             expires_at: unix_now().unwrap() + 10,
         };
