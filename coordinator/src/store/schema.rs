@@ -9,7 +9,7 @@ pub(super) fn initialize(
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if !matches!(version, 0 | 2 | 3 | 4 | 5 | 6) {
+    if !matches!(version, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8) {
         return Err(
             "unsupported coordinator database schema; explicit migration is required".into(),
         );
@@ -33,6 +33,7 @@ pub(super) fn initialize(
                 public_key TEXT NOT NULL UNIQUE, token_hash BLOB NOT NULL UNIQUE,
                 ipv4 TEXT NOT NULL UNIQUE, ipv6 TEXT NOT NULL UNIQUE, endpoints TEXT NOT NULL,
                 created_at INTEGER NOT NULL CHECK(created_at>=0), revoked INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0 CHECK(last_seen>=0),
                 policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(policy_revision>=0),
                 permissions TEXT NOT NULL DEFAULT '{}');
             CREATE INDEX IF NOT EXISTS device_owner ON devices(owner_user_id);
@@ -72,6 +73,7 @@ pub(super) fn initialize(
             id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES devices(id),
             target_id TEXT NOT NULL REFERENCES devices(id), tcp TEXT NOT NULL,
             terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1)),
+            files INTEGER NOT NULL DEFAULT 0 CHECK(files IN (0,1)),
             status TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
             policy_revision INTEGER);
             CREATE INDEX IF NOT EXISTS access_request_target ON access_requests(target_id,status);
@@ -87,7 +89,29 @@ pub(super) fn initialize(
                 .map_err(|e| e.to_string())?;
         }
     }
-    tx.pragma_update(None, "user_version", 6)
+    {
+        let has_files: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('access_requests') WHERE name='files')",
+            [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !has_files {
+            tx.execute_batch("ALTER TABLE access_requests ADD COLUMN files INTEGER NOT NULL DEFAULT 0 CHECK(files IN (0,1));")
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let has_last_seen: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('devices') WHERE name='last_seen')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !has_last_seen {
+            tx.execute_batch("ALTER TABLE devices ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0 CHECK(last_seen>=0);")
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.pragma_update(None, "user_version", 8)
         .map_err(|e| e.to_string())?;
     let exists: bool = tx
         .query_row("SELECT EXISTS(SELECT 1 FROM network)", [], |r| r.get(0))

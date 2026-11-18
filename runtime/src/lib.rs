@@ -2,6 +2,8 @@
 mod api;
 mod config;
 #[cfg(target_os = "linux")]
+mod file_service;
+#[cfg(target_os = "linux")]
 mod managed;
 mod platform;
 #[cfg(target_os = "linux")]
@@ -16,7 +18,8 @@ mod terminal;
 mod web_account;
 
 pub use config::{
-    FileConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey, TerminalConfig, defaults,
+    FileConfig, FileServiceConfig, InterfaceAddress, ManagedConfig, RuntimeConfig, SecretKey,
+    TerminalConfig, defaults,
 };
 
 #[cfg(target_os = "linux")]

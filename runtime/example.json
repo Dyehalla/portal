@@ -14,6 +14,16 @@
     "max_sessions": 8,
     "idle_timeout_seconds": 900
   },
+  "files": {
+    "enabled": false,
+    "listen_port": 2223,
+    "root_dir": "../runtime-state/files",
+    "user": "portal-files",
+    "read_only": true,
+    "max_connections": 4,
+    "idle_timeout_seconds": 900,
+    "max_file_size": 10737418240
+  },
   "coordinator": {
     "url": "https://localhost:8443",
     "device_name": "my-device",

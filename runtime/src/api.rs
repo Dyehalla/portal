@@ -1,19 +1,27 @@
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::sync::oneshot;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -27,6 +35,30 @@ struct ApiState {
     account: Arc<tokio::sync::Mutex<crate::web_account::Account>>,
     runtime: Arc<Mutex<Runtime>>,
     token: Arc<Zeroizing<String>>,
+    terminal_sessions: Arc<tokio::sync::Mutex<HashMap<String, TerminalTicket>>>,
+    active_terminal_sessions: Arc<AtomicUsize>,
+}
+
+struct TerminalTicket {
+    target: std::net::IpAddr,
+    port: u16,
+    user: String,
+    expires_at: Instant,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSessionRequest {
+    device_id: String,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TerminalSessionResponse {
+    ticket: String,
+    expires_in_seconds: u64,
+    status: &'static str,
 }
 
 /// JSON operations accepted by the local management API.
@@ -136,6 +168,8 @@ impl LocalApi {
             agent,
             runtime,
             token: Arc::new(Zeroizing::new(token)),
+            terminal_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_terminal_sessions: Arc::new(AtomicUsize::new(0)),
         };
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -169,20 +203,32 @@ impl LocalApi {
                 }
             });
             let api = Router::new()
-                .route("/api/v1/command", post(handle_command))
+                .route(
+                    "/api/v1/command",
+                    post(handle_command).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
+                )
                 .route("/api/v1/snapshot", get(handle_snapshot))
                 .route("/api/v1/account", get(account_view).post(account_login))
                 .route("/api/v1/account/activate", post(account_activate))
                 .route("/api/v1/account/token", post(account_token))
                 .route("/api/v1/account/device", post(account_device))
+                .route("/api/v1/terminal/session", post(create_terminal_session))
+                .route(
+                    "/api/v1/files/:device_id/*path",
+                    axum::routing::any(proxy_files),
+                )
                 .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
             let app = Router::new()
                 .route("/", get(index))
                 .route("/app.js", get(javascript))
                 .route("/map.js", get(map_javascript))
+                .route("/xterm.js", get(xterm_javascript))
+                .route("/xterm.css", get(xterm_stylesheet))
                 .route("/style.css", get(stylesheet))
+                // The ticket is authenticated in the first WebSocket frame. It is
+                // deliberately not put in the URL or a browser cookie.
+                .route("/api/v1/terminal/ws", get(terminal_websocket))
                 .merge(api)
-                .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
                 .layer(middleware::from_fn(local_request))
                 .with_state(state);
             let result = axum::serve(
@@ -229,6 +275,146 @@ impl LocalApi {
         let token_result = crate::platform::linux::api_token::remove(&self.token_file);
         task_result.and(token_result)
     }
+}
+
+async fn proxy_files(
+    State(state): State<ApiState>,
+    Path((device_id, path)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let agent = state
+        .account
+        .lock()
+        .await
+        .agent
+        .clone()
+        .or_else(|| state.agent.clone());
+    let Some(agent) = agent else {
+        return api_plain(
+            StatusCode::BAD_REQUEST,
+            "File Explorer доступен только в управляемом режиме",
+        );
+    };
+    if device_id.is_empty() || device_id.len() > 128 {
+        return api_plain(
+            StatusCode::BAD_REQUEST,
+            "некорректный идентификатор устройства",
+        );
+    }
+    if let Err(error) = agent.connect(device_id.clone()).await {
+        return api_plain(StatusCode::BAD_GATEWAY, &error);
+    }
+    let snapshot = match state
+        .runtime
+        .lock()
+        .map_err(|_| ())
+        .and_then(|runtime| runtime.snapshot().map_err(|_| ()))
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return api_plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime state is unavailable",
+            );
+        }
+    };
+    let Some(peer) = snapshot
+        .peers
+        .iter()
+        .find(|peer| peer.device_id.as_deref() == Some(device_id.as_str()))
+    else {
+        return api_plain(
+            StatusCode::FORBIDDEN,
+            "target device is absent from the active network map",
+        );
+    };
+    if peer.files != Some(true) {
+        return api_plain(
+            StatusCode::FORBIDDEN,
+            "file access is not granted for this device",
+        );
+    }
+    if peer.path != "direct" {
+        return api_plain(
+            StatusCode::BAD_GATEWAY,
+            "target device has no available direct path",
+        );
+    }
+    let Some(target) = peer
+        .allowed_ips
+        .iter()
+        .find_map(|value| value.split('/').next()?.parse::<std::net::IpAddr>().ok())
+    else {
+        return api_plain(
+            StatusCode::BAD_GATEWAY,
+            "target device has no virtual address",
+        );
+    };
+    let Some(files) = snapshot.files else {
+        return api_plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "file service is disabled on this agent",
+        );
+    };
+    let host = match target {
+        std::net::IpAddr::V4(value) => value.to_string(),
+        std::net::IpAddr::V6(value) => format!("[{value}]"),
+    };
+    let target_url = format!(
+        "http://{host}:{}{}",
+        files.port,
+        if path.starts_with('/') {
+            path
+        } else {
+            format!("/{path}")
+        }
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(900))
+        .build();
+    let client = match client {
+        Ok(client) => client,
+        Err(_) => return api_plain(StatusCode::BAD_GATEWAY, "file proxy is unavailable"),
+    };
+    let mut outbound = client.request(request.method().clone(), target_url);
+    for (name, value) in request.headers() {
+        if *name != header::HOST
+            && *name != header::AUTHORIZATION
+            && *name != header::CONTENT_LENGTH
+        {
+            outbound = outbound.header(name, value);
+        }
+    }
+    let body = request.into_body().into_data_stream();
+    let response = match outbound.body(reqwest::Body::wrap_stream(body)).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return api_plain(
+                StatusCode::BAD_GATEWAY,
+                &format!("file service unavailable: {error}"),
+            );
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in response.headers() {
+        if *name != header::CONNECTION && *name != header::TRANSFER_ENCODING {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from_stream(response.bytes_stream()))
+        .unwrap_or_else(|_| api_plain(StatusCode::BAD_GATEWAY, "invalid file service response"))
+}
+
+fn api_plain(status: StatusCode, message: &str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(axum::body::Body::from(message.to_owned()))
+        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
 }
 
 /// Authenticate a loopback request, dispatch its command, and return a JSON result.
@@ -401,6 +587,8 @@ enum AccountDevice {
         tcp: Vec<u16>,
         #[serde(default)]
         terminal: bool,
+        #[serde(default)]
+        files: bool,
     },
     DecideAccess {
         request_id: String,
@@ -438,12 +626,14 @@ async fn account_device(
             target_device_id,
             tcp,
             terminal,
+            files,
         } => client
             .request_access(&portal_net::model::RequestAccess {
                 source_device_id,
                 target_device_id,
                 tcp,
                 terminal,
+                files,
             })
             .await
             .and_then(|p| {
@@ -513,6 +703,284 @@ async fn account_device(
     })
 }
 
+async fn create_terminal_session(
+    State(state): State<ApiState>,
+    Json(request): Json<TerminalSessionRequest>,
+) -> Result<Json<TerminalSessionResponse>, (StatusCode, Json<CommandResponse>)> {
+    let agent = state
+        .account
+        .lock()
+        .await
+        .agent
+        .clone()
+        .or_else(|| state.agent.clone())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "терминал доступен только в управляемом режиме",
+            )
+        })?;
+    if request.device_id.is_empty() || request.device_id.len() > 128 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "некорректный идентификатор устройства",
+        ));
+    }
+    let user = request.user.unwrap_or_else(|| "portal".to_owned());
+    if user.is_empty()
+        || user.len() > 32
+        || user
+            .bytes()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "некорректное имя пользователя терминала",
+        ));
+    }
+    if state.active_terminal_sessions.load(Ordering::Acquire)
+        >= crate::terminal::session::MAX_SESSIONS
+    {
+        return Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "достигнут лимит одновременных терминальных сессий",
+        ));
+    }
+    // Establish or verify the direct path before issuing a ticket. The ticket is
+    // short lived and can be consumed exactly once by the WebSocket handshake.
+    agent
+        .connect(request.device_id.clone())
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, &e))?;
+    let snapshot = state
+        .runtime
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime state is unavailable",
+            )
+        })?
+        .snapshot()
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, &e))?;
+    let peer = snapshot
+        .peers
+        .iter()
+        .find(|peer| peer.device_id.as_deref() == Some(request.device_id.as_str()))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "target device is absent from the active network map",
+            )
+        })?;
+    if peer.terminal != Some(true) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "terminal access is not granted for this device",
+        ));
+    }
+    if peer.path != "direct" {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "target device has no available direct path",
+        ));
+    }
+    let target = peer
+        .allowed_ips
+        .iter()
+        .find_map(|value| value.split('/').next()?.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "target device has no virtual address",
+            )
+        })?;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let ticket = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut sessions = state.terminal_sessions.lock().await;
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    if sessions.len() >= crate::terminal::session::MAX_SESSIONS {
+        return Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "слишком много ожидающих терминальных сессий",
+        ));
+    }
+    sessions.insert(
+        ticket.clone(),
+        TerminalTicket {
+            target,
+            port: snapshot
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.port)
+                .unwrap_or(2222),
+            user,
+            expires_at: Instant::now()
+                + Duration::from_secs(crate::terminal::session::SESSION_TTL_SECONDS),
+        },
+    );
+    drop(sessions);
+    Ok(Json(TerminalSessionResponse {
+        ticket,
+        expires_in_seconds: crate::terminal::session::SESSION_TTL_SECONDS,
+        status: "starting",
+    }))
+}
+
+async fn terminal_websocket(
+    State(state): State<ApiState>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    upgrade.on_upgrade(move |socket| terminal_socket(socket, state))
+}
+
+async fn terminal_socket(mut socket: WebSocket, state: ApiState) {
+    let Some(Ok(Message::Text(first))) = socket.recv().await else {
+        return;
+    };
+    let request: serde_json::Value = match serde_json::from_str(&first) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = socket
+                .send(Message::Text(
+                    r#"{"type":"error","message":"invalid session handshake"}"#.into(),
+                ))
+                .await;
+            return;
+        }
+    };
+    if request.get("type").and_then(|value| value.as_str()) != Some("open") {
+        let _ = socket
+            .send(Message::Text(
+                r#"{"type":"error","message":"session handshake required"}"#.into(),
+            ))
+            .await;
+        return;
+    }
+    let Some(ticket) = request.get("ticket").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let session = state.terminal_sessions.lock().await.remove(ticket);
+    let Some(session) = session.filter(|session| session.expires_at > Instant::now()) else {
+        let _ = socket
+            .send(Message::Text(
+                r#"{"type":"error","message":"terminal ticket expired or already used"}"#.into(),
+            ))
+            .await;
+        return;
+    };
+    let host = match session.target {
+        std::net::IpAddr::V4(address) => address.to_string(),
+        std::net::IpAddr::V6(address) => format!("[{address}]"),
+    };
+    let mut child = match Command::new("ssh")
+        .args([
+            "-tt",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=12",
+            "-p",
+            &session.port.to_string(),
+            &format!("{}@{host}", session.user),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let message = serde_json::json!({"type":"error", "message": format!("could not start ssh: {error}")}).to_string();
+            let _ = socket.send(Message::Text(message.into())).await;
+            return;
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return;
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        return;
+    };
+    if state
+        .active_terminal_sessions
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < crate::terminal::session::MAX_SESSIONS).then_some(count + 1)
+        })
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = socket
+            .send(Message::Text(
+                r#"{"type":"error","message":"terminal session limit reached"}"#.into(),
+            ))
+            .await;
+        return;
+    }
+    let active_guard = state.active_terminal_sessions.clone();
+    let _ = socket
+        .send(Message::Text(
+            r#"{"type":"status","status":"connected"}"#.into(),
+        ))
+        .await;
+    let mut stdout_buffer = vec![0u8; crate::terminal::session::MAX_OUTPUT_FRAME];
+    let mut stderr_buffer = vec![0u8; crate::terminal::session::MAX_STDERR_FRAME];
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut idle = Box::pin(tokio::time::sleep(Duration::from_secs(
+        crate::terminal::session::IDLE_TIMEOUT_SECONDS,
+    )));
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Binary(bytes))) => { if bytes.len() > crate::terminal::session::MAX_INPUT_FRAME || stdin.write_all(&bytes).await.is_err() { break; } idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(crate::terminal::session::IDLE_TIMEOUT_SECONDS)); }
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+                        match value.get("type").and_then(|value| value.as_str()) {
+                            Some("input") => if let Some(data) = value.get("data").and_then(|value| value.as_str()) { if stdin.write_all(data.as_bytes()).await.is_err() { break; } idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(crate::terminal::session::IDLE_TIMEOUT_SECONDS)); },
+                            Some("resize") => { /* ssh -tt carries the session; resize is an explicit protocol event. */ }
+                            Some("close") => break,
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            result = stdout.read(&mut stdout_buffer), if stdout_open => {
+                match result { Ok(0) => stdout_open = false, Ok(size) => { if socket.send(Message::Binary(stdout_buffer[..size].to_vec())).await.is_err() { break } idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(crate::terminal::session::IDLE_TIMEOUT_SECONDS)); }, Err(_) => break }
+            }
+            result = stderr.read(&mut stderr_buffer), if stderr_open => {
+                match result { Ok(0) => stderr_open = false, Ok(size) => { let message = serde_json::json!({"type":"stderr", "data": String::from_utf8_lossy(&stderr_buffer[..size])}).to_string(); if socket.send(Message::Text(message.into())).await.is_err() { break; } idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(crate::terminal::session::IDLE_TIMEOUT_SECONDS)); }, Err(_) => break }
+            }
+            result = child.wait() => {
+                let code = result.ok().and_then(|status| status.code()).unwrap_or(1);
+                let message = serde_json::json!({"type":"exit", "status": code}).to_string();
+                let _ = socket.send(Message::Text(message.into())).await;
+                break;
+            }
+            _ = &mut idle => {
+                let message = serde_json::json!({"type":"status", "status":"stale"}).to_string();
+                let _ = socket.send(Message::Text(message.into())).await;
+                break;
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    active_guard.fetch_sub(1, Ordering::AcqRel);
+}
+
 async fn index() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
 }
@@ -528,6 +996,20 @@ async fn map_javascript() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/map.js"),
+    )
+}
+
+async fn xterm_javascript() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/xterm.js"),
+    )
+}
+
+async fn xterm_stylesheet() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/xterm.css"),
     )
 }
 

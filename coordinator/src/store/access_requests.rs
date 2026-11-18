@@ -12,13 +12,23 @@ fn expire(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-type StoredRequest = (String, String, String, String, bool, u64, u64, Option<i64>);
+type StoredRequest = (
+    String,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    u64,
+    u64,
+    Option<i64>,
+);
 
 fn read(db: &Connection, id: &str) -> Result<AccessRequest> {
-    let (source, target, tcp, status, terminal, created_at, expires_at, revision):
+    let (source, target, tcp, status, terminal, files, created_at, expires_at, revision):
         StoredRequest = db.query_row(
-        "SELECT source_id,target_id,tcp,status,terminal,created_at,expires_at,policy_revision FROM access_requests WHERE id=?",
-        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_, i64>(4)? != 0,counter(r,5)?,counter(r,6)?,r.get(7)?)))
+        "SELECT source_id,target_id,tcp,status,terminal,files,created_at,expires_at,policy_revision FROM access_requests WHERE id=?",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_, i64>(4)? != 0,r.get::<_, i64>(5)? != 0,counter(r,6)?,counter(r,7)?,r.get(8)?)))
         .optional()?.ok_or_else(Error::not_found)?;
     let get_device = |id: &str| {
         db.query_row(
@@ -43,6 +53,7 @@ fn read(db: &Connection, id: &str) -> Result<AccessRequest> {
         requester_name,
         tcp: serde_json::from_str(&tcp).map_err(|_| Error::internal())?,
         terminal,
+        files,
         status,
         created_at,
         expires_at,
@@ -89,7 +100,7 @@ impl Store {
             ));
         }
         let ports = validate::tcp_ports(request.tcp)?;
-        if ports.is_empty() && !request.terminal {
+        if ports.is_empty() && !request.terminal && !request.files {
             return Err(Error::bad_request(
                 "request at least one TCP port or terminal access",
             ));
@@ -97,7 +108,7 @@ impl Store {
         let existing: Option<String> = tx.query_row("SELECT id FROM access_requests WHERE source_id=? AND target_id=? AND status='pending'", params![source.id,target.id], |r|r.get(0)).optional()?;
         if let Some(id) = existing {
             let old = read(&tx, &id)?;
-            if old.tcp != ports || old.terminal != request.terminal {
+            if old.tcp != ports || old.terminal != request.terminal || old.files != request.files {
                 return Err(Error::conflict(
                     "a request for this device is already pending",
                 ));
@@ -111,7 +122,7 @@ impl Store {
             return Err(Error::conflict("access request limit reached"));
         }
         let id = format!("a_{}", credentials::random_hex(16));
-        tx.execute("INSERT INTO access_requests(id,source_id,target_id,tcp,terminal,status,created_at,expires_at) VALUES(?,?,?,?,?,'pending',?,?)", params![id,source.id,target.id,serde_json::to_string(&ports).map_err(|_|Error::internal())?,request.terminal,now(),now()+86400])?;
+        tx.execute("INSERT INTO access_requests(id,source_id,target_id,tcp,terminal,files,status,created_at,expires_at) VALUES(?,?,?,?,?,?,'pending',?,?)", params![id,source.id,target.id,serde_json::to_string(&ports).map_err(|_|Error::internal())?,request.terminal,request.files,now(),now()+86400])?;
         let result = read(&tx, &id)?;
         tx.commit()?;
         Ok(result)
@@ -153,6 +164,7 @@ impl Store {
                 .or_default();
             entry.tcp.extend(&request.tcp);
             entry.terminal |= request.terminal;
+            entry.files |= request.files;
             entry.tcp.sort_unstable();
             entry.tcp.dedup();
             Some(

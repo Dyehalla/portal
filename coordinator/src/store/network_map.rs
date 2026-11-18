@@ -1,5 +1,7 @@
 use super::*;
 
+const PRESENCE_TIMEOUT_SECONDS: u64 = 90;
+
 impl Store {
     pub fn network_map(
         &mut self,
@@ -8,6 +10,14 @@ impl Store {
     ) -> Result<NetworkMap> {
         let tx = self.connection.transaction()?;
         let own = authenticated_device(&tx, credential)?;
+        let timestamp = now() as u64;
+        tx.execute(
+            "UPDATE devices SET last_seen=? WHERE id=?",
+            params![
+                i64::try_from(timestamp).map_err(|_| Error::internal())?,
+                &own.id
+            ],
+        )?;
         let owner = tx.query_row(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE id=?"),
             [&own.owner_user_id],
@@ -32,13 +42,23 @@ impl Store {
                     .get(&own.public_key)
                     .cloned()
                     .unwrap_or_default();
+                let last_seen: u64 = tx.query_row(
+                    "SELECT last_seen FROM devices WHERE id=?",
+                    [&candidate.id],
+                    |row| counter(row, 0),
+                )?;
                 if !incoming.tcp.is_empty()
                     || incoming.terminal
+                    || incoming.files
                     || !outgoing.tcp.is_empty()
                     || outgoing.terminal
+                    || outgoing.files
                 {
                     peers.push(Peer {
                         device: candidate,
+                        online: last_seen > 0
+                            && timestamp.saturating_sub(last_seen)
+                                <= PRESENCE_TIMEOUT_SECONDS.min(lease_seconds),
                         policy_revision: candidate_policy.revision,
                         incoming,
                         outgoing,

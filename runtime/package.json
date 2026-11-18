@@ -1,7 +1,14 @@
 {
   "name": "portal-web",
   "private": true,
-  "scripts": {"build": "esbuild web/map-source.js --bundle --minify --format=iife --outfile=web/map.js"},
-  "dependencies": {"@antv/x6": "3.1.8"},
-  "devDependencies": {"esbuild": "0.25.12"}
+  "scripts": {
+    "build": "esbuild web/map-source.js --bundle --minify --format=iife --outfile=web/map.js"
+  },
+  "dependencies": {
+    "@antv/x6": "3.1.8",
+    "xterm": "^5.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
 }

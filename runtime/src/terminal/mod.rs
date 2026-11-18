@@ -216,3 +216,5 @@ fn validate_user(user: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub(crate) mod session;

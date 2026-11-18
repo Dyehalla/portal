@@ -25,7 +25,7 @@ DATA = {
     'interface': {'name': 'portal0', 'listen': '0.0.0.0:51820', 'public_key': 'b' * 64, 'addresses': ['10.20.0.1/32', 'fd00::1/128']},
     'network': {'device_id': 'local', 'device_name': 'Ноутбук', 'network_id': 'network', 'revision': 7, 'user_id': 'owner', 'user_name': 'Анна', 'policy_revision': 3, 'policy_pending': False, 'coordinator_connected': True, 'lease_active': True, 'lease_remaining_seconds': 600},
     'peers': [
-        {'public_key': 'c' * 64, 'device_id': 'server', 'owned': True, 'name': 'Сервер <img src=x onerror=alert(1)>', 'endpoint': '192.0.2.1:51820', 'path': 'offline', 'allowed_ips': ['10.20.0.2/32'], 'keepalive_seconds': 25, 'incoming_tcp': [22], 'outgoing_tcp': [443], 'traffic': {'tx_bytes': 2048, 'rx_bytes': 1024, 'tx_packets': 2, 'rx_packets': 1}},
+        {'public_key': 'c' * 64, 'device_id': 'server', 'owned': True, 'name': 'Сервер <img src=x onerror=alert(1)>', 'endpoint': '192.0.2.1:51820', 'path': 'offline', 'allowed_ips': ['10.20.0.2/32'], 'keepalive_seconds': 25, 'incoming_tcp': [22], 'outgoing_tcp': [443], 'terminal': True, 'traffic': {'tx_bytes': 2048, 'rx_bytes': 1024, 'tx_packets': 2, 'rx_packets': 1}},
         {'public_key': 'd' * 64, 'device_id': 'incoming', 'owned': False, 'name': 'Только входящие', 'endpoint': None, 'path': 'probing', 'allowed_ips': ['10.20.0.3/32'], 'keepalive_seconds': None, 'incoming_tcp': [22], 'outgoing_tcp': [], 'traffic': None},
     ],
     'stats': {'received_udp_packets': 123, 'received_tun_packets': 42, 'dropped_packets': 3, 'udp_send_errors': 2, 'timer_send_errors': 1},
@@ -283,6 +283,9 @@ def run_account(browser, base):
     browser.wait("!document.getElementById('add-device-form').hidden && document.getElementById('device-name').value === 'device-auto' && document.getElementById('device-public-key').readOnly", 'agent supplies editable device name and read-only public key')
     browser.js("document.getElementById('device-name').value='Мой ноутбук';document.getElementById('add-device-form').requestSubmit()")
     browser.wait("!document.getElementById('devices').hidden", 'device added and network applied')
+    browser.js("location.hash='terminal'")
+    browser.wait("document.querySelectorAll('#terminal-device option').length === 2 && document.querySelector('#terminal-device option[value=\\\"server\\\"]')", 'terminal device list shows granted target')
+    browser.js("location.hash='devices'")
     # Reproduce a new account with only its current registered device.
     remote_peers = state['data']['peers']
     own_devices = state['account']['devices']
@@ -311,18 +314,19 @@ def run_account(browser, base):
     browser.js("window.policyButtonObserver.disconnect()")
     browser.js("document.getElementById('add-rule').click()")
     browser.wait("!document.getElementById('policy-form').checkValidity()", 'source must be selected before saving')
+    browser.wait("document.querySelectorAll('.service-checkbox').length === 1 && document.querySelector('.service-checkbox[data-terminal]')", 'policy editor keeps only terminal checkbox')
     browser.wait("document.querySelector('.rule-source').tagName === 'SELECT' && !document.querySelector('.rule-source option[value=\"'+'e'.repeat(64)+'\"]') && document.querySelectorAll('.rule-source option[value=\"'+'b'.repeat(64)+'\"]').length === 1 && document.querySelector('.rule-source').textContent.includes('Мой ноутбук') && document.querySelector('.rule-source').textContent.includes('Только входящие')", 'source picker shows named devices, deduplicates current device and excludes target')
-    browser.js("document.querySelector('.rule-source').value='b'.repeat(64);document.querySelector('.rule-source').dispatchEvent(new Event('change'));document.querySelector('.service-checkbox[value=\"22\"]').click();document.querySelector('.service-checkbox[value=\"443\"]').click();document.querySelector('.rule-ports').value='8080, 8080';document.querySelector('.rule-ports').dispatchEvent(new Event('input'))")
+    browser.js("document.querySelector('.rule-source').value='b'.repeat(64);document.querySelector('.rule-source').dispatchEvent(new Event('change'));document.querySelector('.service-checkbox[data-terminal]').click();document.querySelector('.rule-ports').value='22, 443, 8080, 8080';document.querySelector('.rule-ports').dispatchEvent(new Event('input'))")
     browser.js("document.getElementById('refresh').click()")
-    browser.wait("document.querySelector('.rule-ports').value === '8080, 8080' && document.getElementById('policy-status').textContent.includes('несохранённые')", 'background refresh preserves unsaved editor')
+    browser.wait("document.querySelector('.rule-ports').value === '22, 443, 8080, 8080' && document.getElementById('policy-status').textContent.includes('несохранённые')", 'background refresh preserves unsaved editor')
     state['policy']['revision'] = 1
     browser.js("document.getElementById('policy-form').requestSubmit()")
-    browser.wait("document.getElementById('policy-error').textContent.includes('Конфликт') && document.querySelector('.rule-ports').value === '8080, 8080'", 'revision conflict preserves draft')
+    browser.wait("document.getElementById('policy-error').textContent.includes('Конфликт') && document.querySelector('.rule-ports').value === '22, 443, 8080, 8080'", 'revision conflict preserves draft')
     state['policy']['revision'] = 0
     browser.js("document.getElementById('policy-form').requestSubmit()")
     browser.wait("document.getElementById('policy-status').textContent.includes('ожидает устройства')", 'saved policy is pending until device acknowledgement')
     browser.wait("!!document.querySelector('#map-list .x6-edge path[stroke-dasharray=\"5 4\"]')", 'unacknowledged permission has a dashed arrow')
-    assert state['policy']['permissions'] == {'b'*64: {'tcp': [22, 443, 8080]}}, 'checkboxes and custom ports are merged, sorted and deduplicated'
+    assert state['policy']['permissions'] == {'b'*64: {'tcp': [22, 443, 8080], 'terminal': True}}, 'terminal and custom ports are saved independently'
     state['policy']['applied_revision'] = 1
     browser.js("document.getElementById('refresh').click()")
     browser.wait("document.getElementById('policy-status').textContent.includes('Применено')", 'device acknowledgement confirms exact revision')
@@ -338,8 +342,8 @@ def run_account(browser, base):
     browser.wait("document.getElementById('details-dialog').open && document.getElementById('peer-detail-list').textContent.includes('Применено')", 'map opens device details and known policy state')
     browser.js("document.getElementById('edit-permissions').click()")
     browser.wait("document.querySelector('.rule-source') !== null", 'saved rule restored for bulk preview')
-    browser.wait("document.querySelector('.service-checkbox[value=\"22\"]').checked && document.querySelector('.service-checkbox[value=\"443\"]').checked && document.querySelector('.rule-ports').value === '8080'", 'saved services restore as checkboxes and extra ports remain editable')
-    browser.js("document.querySelector('.service-checkbox[value=\"22\"]').click()")
+    browser.wait("document.querySelector('.service-checkbox[data-terminal]').checked && document.querySelector('.rule-ports').value === '22, 443, 8080'", 'saved terminal permission and extra ports restore')
+    browser.js("document.querySelector('.service-checkbox[data-terminal]').click()")
     state['account']['devices'].append({'id': 'other', 'owner_user_id': 'owner', 'name': 'Другой сервер', 'public_key': 'f'*64, 'ipv4': '10.20.0.5', 'ipv6': 'fd00::5'})
     browser.js("document.getElementById('refresh').click()")
     browser.wait("document.getElementById('device-list').textContent.includes('Другой сервер')", 'new own target loaded')

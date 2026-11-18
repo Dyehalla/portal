@@ -39,6 +39,36 @@ pub struct RuntimeConfig {
     pub api_listen: SocketAddr,
     pub api_token_file: PathBuf,
     pub terminal: TerminalConfig,
+    pub files: FileServiceConfig,
+}
+
+/// WebDAV file service configuration. The service is bound only to Portal virtual addresses.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileServiceConfig {
+    pub enabled: bool,
+    pub listen_port: u16,
+    pub root_dir: PathBuf,
+    pub user: String,
+    pub read_only: bool,
+    pub max_connections: u16,
+    pub idle_timeout_seconds: u32,
+    pub max_file_size: u64,
+}
+
+impl Default for FileServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: 2223,
+            root_dir: "/srv/portal-files".into(),
+            user: "portal-files".into(),
+            read_only: true,
+            max_connections: 4,
+            idle_timeout_seconds: 900,
+            max_file_size: 10 * 1024 * 1024 * 1024,
+        }
+    }
 }
 
 /// SSH terminal service configuration. The service is supervised by Portal and
@@ -114,6 +144,7 @@ pub struct FileConfig {
     pub api_token_file: PathBuf,
     pub coordinator: ManagedConfig,
     pub terminal: TerminalConfig,
+    pub files: FileServiceConfig,
 }
 
 impl Default for FileConfig {
@@ -134,6 +165,7 @@ impl Default for FileConfig {
             api_token_file: defaults::API_TOKEN_FILE.into(),
             coordinator: ManagedConfig::default(),
             terminal: TerminalConfig::default(),
+            files: FileServiceConfig::default(),
         }
     }
 }
@@ -153,6 +185,7 @@ impl FileConfig {
             &mut config.coordinator.map_file,
             &mut config.terminal.authorized_keys_file,
             &mut config.terminal.host_key_dir,
+            &mut config.files.root_dir,
         ] {
             if value.is_relative() {
                 *value = base.join(&*value);
@@ -181,6 +214,22 @@ impl FileConfig {
             || config.terminal.user.chars().any(char::is_control)
         {
             return Err("invalid terminal configuration".into());
+        }
+        if config.files.enabled
+            && (config.files.listen_port == 0
+                || config.files.max_connections == 0
+                || config.files.idle_timeout_seconds == 0
+                || config.files.max_file_size == 0
+                || config.files.root_dir.as_os_str().is_empty()
+                || !config.files.root_dir.is_absolute()
+                || config.files.user.trim().is_empty()
+                || config
+                    .files
+                    .user
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))))
+        {
+            return Err("invalid file service configuration".into());
         }
         if config.coordinator.device_name.trim().is_empty()
             || config.coordinator.device_name.len() > 128
@@ -241,6 +290,7 @@ impl FileConfig {
             api_listen: self.api_listen,
             api_token_file: self.api_token_file,
             terminal: self.terminal,
+            files: self.files,
         }
     }
 }

@@ -43,7 +43,7 @@ pub fn normalize_permissions(permissions: Permissions) -> Result<Permissions, St
         validate_ports(&ports)?;
         ports.tcp.sort_unstable();
         ports.tcp.dedup();
-        if !ports.tcp.is_empty() || ports.terminal {
+        if !ports.tcp.is_empty() || ports.terminal || ports.files {
             result.insert(key, ports);
         }
     }
@@ -103,6 +103,7 @@ pub fn lease_deadline(map: &NetworkMap, request_started: Instant) -> Result<Inst
 /// Validate the entire map before changing host or WireGuard state. Local inbound
 /// grants are intersected with confirmed bindings; ownership never grants traffic.
 pub const DEFAULT_TERMINAL_PORT: u16 = 2222;
+pub const DEFAULT_FILE_PORT: u16 = 2223;
 
 pub fn compile(
     map: &NetworkMap,
@@ -122,6 +123,18 @@ pub fn compile_with_terminal(
     expected_key: PeerKey,
     previous: Option<&NetworkMap>,
     terminal_port: Option<u16>,
+) -> Result<AccessRules, String> {
+    compile_with_services(map, local, expected_key, previous, terminal_port, None)
+}
+
+/// Compile ACLs for the independently gated terminal and file services.
+pub fn compile_with_services(
+    map: &NetworkMap,
+    local: &Permissions,
+    expected_key: PeerKey,
+    previous: Option<&NetworkMap>,
+    terminal_port: Option<u16>,
+    file_port: Option<u16>,
 ) -> Result<AccessRules, String> {
     if map.protocol_version != PROTOCOL_VERSION
         || map.network_id.is_empty()
@@ -199,9 +212,22 @@ pub fn compile_with_terminal(
         {
             incoming_tcp.push(port);
         }
+        if let Some(port) = file_port
+            && confirmed.files
+            && local_ports.files
+            && !incoming_tcp.contains(&port)
+        {
+            incoming_tcp.push(port);
+        }
         let mut outgoing_tcp = peer.outgoing.tcp.clone();
         if let Some(port) = terminal_port
             && peer.outgoing.terminal
+            && !outgoing_tcp.contains(&port)
+        {
+            outgoing_tcp.push(port);
+        }
+        if let Some(port) = file_port
+            && peer.outgoing.files
             && !outgoing_tcp.contains(&port)
         {
             outgoing_tcp.push(port);
@@ -276,13 +302,16 @@ pub fn validate_signal_at(
     } else {
         peer.outgoing.clone()
     };
-    if signal.permissions.tcp.is_empty() && !signal.permissions.terminal
+    if signal.permissions.tcp.is_empty()
+        && !signal.permissions.terminal
+        && !signal.permissions.files
         || signal
             .permissions
             .tcp
             .iter()
             .any(|p| !allowed.tcp.contains(p))
         || signal.permissions.terminal && !allowed.terminal
+        || signal.permissions.files && !allowed.files
         || incoming
             && (signal.target_policy_revision != map.policy.revision
                 || signal
@@ -290,7 +319,8 @@ pub fn validate_signal_at(
                     .tcp
                     .iter()
                     .any(|p| !peer.incoming.tcp.contains(p))
-                || signal.permissions.terminal && !peer.incoming.terminal)
+                || signal.permissions.terminal && !peer.incoming.terminal
+                || signal.permissions.files && !peer.incoming.files)
         || !incoming && signal.target_policy_revision != peer.policy_revision
     {
         return Err("P2P signal is not authorized by the applied policy".into());
@@ -328,6 +358,7 @@ mod tests {
         let ports = PeerPermissions {
             tcp: vec![443],
             terminal: false,
+            files: false,
         };
         NetworkMap {
             protocol_version: PROTOCOL_VERSION,
@@ -350,6 +381,7 @@ mod tests {
             },
             peers: vec![Peer {
                 device: remote,
+                online: true,
                 policy_revision: 3,
                 incoming: ports,
                 outgoing: PeerPermissions::default(),
@@ -391,6 +423,7 @@ mod tests {
             PeerPermissions {
                 tcp: vec![443],
                 terminal: false,
+                files: false,
             },
         )]);
         assert_eq!(compile(&map, &unknown, own, None).unwrap().peers.len(), 1);
@@ -412,10 +445,34 @@ mod tests {
             PeerPermissions {
                 tcp: vec![],
                 terminal: true,
+                files: false,
             },
         )]);
         let rules = compile_with_terminal(&map, &local, own, None, Some(2222)).unwrap();
         assert!(rules.peers[&remote].incoming_tcp.contains(&2222));
+    }
+
+    #[test]
+    fn file_permission_is_compiled_independently_from_terminal_and_tcp() {
+        let mut map = map();
+        let own = public_key(&map.device.public_key).unwrap();
+        let remote = public_key(&map.peers[0].device.public_key).unwrap();
+        map.policy
+            .permissions
+            .get_mut(&key_hex(&remote))
+            .unwrap()
+            .files = true;
+        map.peers[0].incoming.files = true;
+        let local = Permissions::from([(
+            key_hex(&remote),
+            PeerPermissions {
+                tcp: vec![],
+                terminal: false,
+                files: true,
+            },
+        )]);
+        let rules = compile_with_services(&map, &local, own, None, Some(2222), Some(2223)).unwrap();
+        assert_eq!(rules.peers[&remote].incoming_tcp, [2223]);
     }
 
     #[test]
@@ -460,6 +517,7 @@ mod tests {
             permissions: PeerPermissions {
                 tcp: vec![443],
                 terminal: false,
+                files: false,
             },
             target_policy_revision: map.policy.revision,
             expires_at: unix_now().unwrap() + 10,

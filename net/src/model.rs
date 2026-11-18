@@ -75,6 +75,9 @@ pub struct PeerPermissions {
     /// Permit the Portal SSH terminal service on the destination device.
     #[serde(default, skip_serializing_if = "is_false")]
     pub terminal: bool,
+    /// Permit the Portal file service on the destination device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub files: bool,
 }
 
 pub type Permissions = BTreeMap<String, PeerPermissions>;
@@ -103,6 +106,9 @@ pub struct PublishPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
     pub device: Device,
+    /// Presence reported by the coordinator from the peer's latest map request.
+    #[serde(default)]
+    pub online: bool,
     pub policy_revision: u64,
     /// Peer -> this device; destination ports belong to this device.
     pub incoming: PeerPermissions,
@@ -180,6 +186,7 @@ mod tests {
             PeerPermissions {
                 tcp: vec![443],
                 terminal: false,
+                files: false,
             },
         );
         permissions.insert(
@@ -187,12 +194,19 @@ mod tests {
             PeerPermissions {
                 tcp: vec![80],
                 terminal: false,
+                files: false,
             },
         );
         assert_eq!(
             serde_json::to_string(&permissions).unwrap(),
             r#"{"a":{"tcp":[80]},"b":{"tcp":[443]}}"#
         );
+    }
+
+    #[test]
+    fn old_permissions_default_file_access_to_false() {
+        let permissions: PeerPermissions = serde_json::from_str(r#"{"tcp":[443]}"#).unwrap();
+        assert!(!permissions.files);
     }
 }
 
@@ -205,6 +219,8 @@ pub struct RequestAccess {
     pub tcp: Vec<u16>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub terminal: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub files: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +236,8 @@ pub struct AccessRequest {
     pub tcp: Vec<u16>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub terminal: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub files: bool,
     pub status: String,
     pub created_at: u64,
     pub expires_at: u64,

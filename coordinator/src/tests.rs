@@ -1223,7 +1223,7 @@ async fn migration_preserves_identities_but_archives_user_grants_without_expandi
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            6
+            8
         );
         #[cfg(unix)]
         {

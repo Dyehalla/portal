@@ -562,7 +562,8 @@ impl Agent {
         let (map, _, deadline) = self.snapshot()?;
         if deadline <= Instant::now()
             || !map.peers.iter().any(|p| {
-                p.device.id == peer_device_id && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal)
+                p.device.id == peer_device_id
+                    && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal || p.outgoing.files)
             })
         {
             return Err("peer is not authorized by the active network map".into());
@@ -599,7 +600,7 @@ impl Agent {
                 if !state.map.peers.iter().any(|p| {
                     p.device.id == signal.peer.id
                         && p.device.public_key == signal.peer.public_key
-                        && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal)
+                        && (!p.outgoing.tcp.is_empty() || p.outgoing.terminal || p.outgoing.files)
                 }) {
                     return Err("peer access revoked".into());
                 }
@@ -737,6 +738,7 @@ mod tests {
             PeerPermissions {
                 tcp: vec![443],
                 terminal: false,
+                files: false,
             },
         )]);
         b.client

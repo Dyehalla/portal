@@ -19,6 +19,10 @@ let ownerBusy = false;
 let bulkPlan = null;
 let bulkBusy = false;
 let bulkRefreshing = false;
+let terminalSocket = null;
+let terminalInstance = null;
+let filePath = [];
+let fileBusy = false;
 const knownPolicies = new Map();
 const connectErrors = new Map();
 let receivedAt = 0;
@@ -52,7 +56,7 @@ async function api(path, body, credential = token) {
   requests.add(controller);
   const timer = setTimeout(
     () => controller.abort(),
-    body?.operation === "connect" || path.startsWith("account") ? 40000 : 8000,
+    body?.operation === "connect" || path.startsWith("account") || path === "terminal/session" ? 40000 : 8000,
   );
   try {
     const headers = { Authorization: `Bearer ${credential}` };
@@ -150,6 +154,9 @@ function signOut(message = "") {
   clearTimeout(pollTimer);
   for (const request of requests) request.abort();
   connecting.clear();
+  closeTerminal();
+  filePath = [];
+  if ($("files-list")) $("files-list").replaceChildren();
   refreshing = false;
   accountBusy = false;
   $("network-submit").disabled = false;
@@ -166,6 +173,152 @@ function signOut(message = "") {
   $("sign-in").textContent = "Открыть панель →";
   $("toast").hidden = true;
   showError($("auth-error"), message);
+}
+
+function terminalStatus(message, error = false) {
+  $("terminal-status").textContent = message;
+  $("terminal-status").classList.toggle("error", error);
+}
+function renderTerminalDevices() {
+  const select = $("terminal-device");
+  if (!select || !snapshot) return;
+  const current = select.value;
+  select.replaceChildren(new Option("Выберите устройство", ""));
+  for (const peer of networkDevices().filter((peer) => peer.device_id && !peer.local)) {
+    const option = new Option(`${nameOf(peer)} · ${peer.online === true ? "онлайн" : "оффлайн"}${peer.terminal === true ? "" : " · нет разрешения"}`, peer.device_id);
+    option.disabled = peer.terminal !== true;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === current)) select.value = current;
+}
+function renderFileDevices() {
+  const select = $("files-device");
+  if (!select || !snapshot) return;
+  const current = select.value;
+  select.replaceChildren(new Option("Выберите устройство", ""));
+  for (const peer of networkDevices().filter((peer) => peer.device_id && !peer.local)) {
+    const option = new Option(`${nameOf(peer)} · ${peer.online === true ? "онлайн" : "оффлайн"}${peer.files === true ? "" : " · нет разрешения"}`, peer.device_id);
+    option.disabled = peer.files !== true;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === current)) select.value = current;
+}
+function fileStatus(message, error = false) {
+  $("files-status").textContent = message;
+  $("files-status").classList.toggle("error", error);
+}
+function fileUrl(device, path = filePath) {
+  const encoded = path.map((part) => encodeURIComponent(part)).join("/");
+  return `/api/v1/files/${encodeURIComponent(device)}/${encoded}`;
+}
+async function filesRequest(method, path = filePath, body = undefined, headers = {}) {
+  const response = await fetch(fileUrl($("files-device").value, path), {
+    method,
+    headers: { Authorization: `Bearer ${token}`, ...headers },
+    body,
+    cache: "no-store",
+    credentials: "omit",
+  });
+  if (!response.ok && response.status !== 207) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `Ошибка File Explorer: HTTP ${response.status}`);
+  }
+  return response;
+}
+function renderFileBreadcrumbs() {
+  const target = $("files-breadcrumbs");
+  target.replaceChildren();
+  const root = document.createElement("button"); root.className = "text-link plain-button"; root.textContent = "/"; root.onclick = () => { filePath = []; loadFiles(); }; target.append(root);
+  filePath.forEach((part, index) => { target.append(document.createTextNode(" / ")); const button = document.createElement("button"); button.className = "text-link plain-button"; button.textContent = part; button.onclick = () => { filePath = filePath.slice(0, index + 1); loadFiles(); }; target.append(button); });
+}
+async function loadFiles() {
+  const device = $("files-device").value;
+  if (!device || fileBusy) return;
+  fileBusy = true; fileStatus("Получаем каталог…"); renderFileBreadcrumbs();
+  try {
+    const response = await filesRequest("PROPFIND");
+    const xml = new DOMParser().parseFromString(await response.text(), "application/xml");
+    if (xml.querySelector("parsererror")) throw new Error("Некорректный ответ WebDAV");
+    const rows = [...xml.getElementsByTagNameNS("DAV:", "response")].map((item) => {
+      const href = item.getElementsByTagNameNS("DAV:", "href")[0]?.textContent || "";
+      const name = decodeURIComponent(href.replace(/\/$/, "").split("/").pop() || "");
+      const directory = !!item.getElementsByTagNameNS("DAV:", "collection")[0];
+      return { name, directory };
+    }).filter((item, index) => index > 0 && item.name).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name, "ru"));
+    const list = $("files-list"); list.replaceChildren();
+    for (const item of rows) {
+      const row = document.createElement("div"); row.className = "device-row"; row.setAttribute("role", "row");
+      const name = document.createElement("button"); name.className = "text-link plain-button"; name.textContent = `${item.directory ? "📁" : "📄"} ${item.name}`;
+      if (item.directory) name.onclick = () => { filePath.push(item.name); loadFiles(); };
+      else name.onclick = async () => { const download = await filesRequest("GET", [...filePath, item.name]); const blob = await download.blob(); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = item.name; link.click(); URL.revokeObjectURL(link.href); };
+      row.append(name);
+      if (item.directory) { const open = document.createElement("span"); open.className = "muted"; open.textContent = "Каталог"; row.append(open); }
+      const actions = document.createElement("span"); actions.className = "row-actions";
+      const rename = document.createElement("button"); rename.className = "text-link plain-button"; rename.textContent = "Переименовать"; rename.onclick = async () => { const next = window.prompt("Новое имя", item.name); if (!next || next === item.name || /[\\/]/.test(next)) return; try { await filesRequest("MOVE", [...filePath, item.name], undefined, { Destination: `/${[...filePath, next].map(encodeURIComponent).join("/")}` }); loadFiles(); } catch (error) { fileStatus(error.message, true); } };
+      const remove = document.createElement("button"); remove.className = "text-link plain-button"; remove.textContent = "Удалить"; remove.onclick = async () => { if (!window.confirm(`Удалить «${item.name}»?`)) return; try { await filesRequest("DELETE", [...filePath, item.name]); loadFiles(); } catch (error) { fileStatus(error.message, true); } };
+      actions.append(rename, remove); row.append(actions);
+      list.append(row);
+    }
+    fileStatus(`${rows.length} объектов`);
+  } catch (error) { fileStatus(error.message, true); }
+  finally { fileBusy = false; }
+}
+function closeTerminal() {
+  if (terminalSocket) {
+    if (terminalSocket.readyState === WebSocket.OPEN) terminalSocket.send(JSON.stringify({ type: "close" }));
+    terminalSocket.close();
+    terminalSocket = null;
+  }
+  if ($("terminal-close")) $("terminal-close").disabled = true;
+  if ($("terminal-open")) $("terminal-open").disabled = false;
+}
+async function openTerminal(event) {
+  event.preventDefault();
+  if (!snapshot || terminalSocket) return;
+  const deviceId = $("terminal-device").value;
+  const user = $("terminal-user").value.trim() || "portal";
+  if (!deviceId) return;
+  $("terminal-open").disabled = true;
+  terminalStatus("Проверяем разрешение и прямой путь…");
+  if (!terminalInstance) {
+    terminalInstance = new window.Terminal({ convertEol: true, cursorBlink: true });
+    terminalInstance.open($("terminal-screen"));
+    terminalInstance.onResize(({ cols, rows }) => {
+      if (terminalSocket?.readyState === WebSocket.OPEN)
+        terminalSocket.send(JSON.stringify({ type: "resize", cols, rows }));
+    });
+  }
+  terminalInstance.clear();
+  try {
+    const data = await api("terminal/session", { device_id: deviceId, user });
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${location.host}/api/v1/terminal/ws`);
+    terminalSocket = socket;
+    socket.binaryType = "arraybuffer";
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: "open", ticket: data.ticket, cols: terminalInstance.cols, rows: terminalInstance.rows }));
+      terminalStatus("Подключение…");
+      $("terminal-close").disabled = false;
+      terminalInstance.focus();
+    };
+    socket.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "status") terminalStatus(message.status === "connected" ? "Подключено" : message.status);
+          else if (message.type === "stderr") terminalInstance.write(message.data);
+          else if (message.type === "exit") { terminalStatus(`Сессия завершена (код ${message.status})`); closeTerminal(); }
+          else if (message.type === "error") { terminalStatus(message.message, true); closeTerminal(); }
+        } catch { terminalInstance.write(event.data); }
+      } else terminalInstance.write(new Uint8Array(event.data));
+    };
+    socket.onclose = () => { if (terminalSocket === socket) { terminalSocket = null; $("terminal-close").disabled = true; $("terminal-open").disabled = false; terminalStatus("Сессия закрыта"); } };
+    socket.onerror = () => terminalStatus("WebSocket терминала недоступен", true);
+    terminalInstance.onData((data) => { if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data)); });
+  } catch (error) {
+    terminalStatus(error.message, true);
+    $("terminal-open").disabled = false;
+  }
 }
 
 async function signIn(candidate) {
@@ -331,6 +484,7 @@ function currentDevice() {
     name: account?.devices.find(device => device.public_key === snapshot.interface.public_key)?.name || snapshot.network?.device_name || snapshot.interface.name,
     owned: true,
     local: true,
+    online: true,
     allowed_ips: snapshot.interface.addresses,
   };
 }
@@ -365,7 +519,7 @@ function canConnect(peer) {
     peer &&
     snapshot?.mode === "managed" &&
     peer.device_id &&
-    peer.outgoing_tcp?.length &&
+    (peer.outgoing_tcp?.length || peer.files === true) &&
     snapshot.healthy &&
     !expired() &&
     !stale
@@ -388,9 +542,9 @@ function pathLabel(peer) {
 function status(peer) {
   const badge = element(
     "span",
-    `device-availability ${stale || !snapshot.healthy || expired() || peer.path !== "direct" ? "offline" : ""}`,
+    `device-availability ${stale || !snapshot.healthy || expired() || peer.online !== true ? "offline" : ""}`,
   );
-  badge.append(element("i", "dot"), document.createTextNode(pathLabel(peer)));
+  badge.append(element("i", "dot"), document.createTextNode(peer.online === true ? "Онлайн" : "Оффлайн"));
   return badge;
 }
 function details(target, entries) {
@@ -412,13 +566,13 @@ function ports(value) {
 function navigate() {
   const route = location.hash.slice(1);
   if (route === "overview") history.replaceState(null, "", "#devices");
-  const page = ["devices", "map", "network", "diagnostics"].includes(route)
+  const page = ["devices", "map", "network", "diagnostics", "terminal", "files"].includes(route)
     ? route
     : "devices";
-  for (const name of ["devices", "map", "network", "diagnostics"])
+  for (const name of ["devices", "map", "network", "diagnostics", "terminal", "files"])
     $(name).hidden = name !== page;
-  document.querySelectorAll("[data-page]").forEach((link) => {
-    const active = link.dataset.page === page;
+  document.querySelectorAll("[data-page], a[href='#terminal'], a[href='#files']").forEach((link) => {
+    const active = (link.dataset.page || link.getAttribute("href")?.slice(1)) === page;
     link.classList.toggle("active", active);
     if (active) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
@@ -432,7 +586,7 @@ function render(data) {
   receivedAt = performance.now();
   if (!selectedPeer())
     selectedKey =
-      data.peers.find((peer) => peer.device_id && peer.outgoing_tcp?.length)
+      data.peers.find((peer) => peer.device_id && (peer.outgoing_tcp?.length || peer.files === true))
         ?.public_key ||
       data.peers[0]?.public_key ||
       null;
@@ -459,6 +613,8 @@ function render(data) {
     `Обновлено в ${new Date().toLocaleTimeString("ru-RU")}`;
   renderDiagnostics();
   renderPeers();
+  renderTerminalDevices();
+  renderFileDevices();
   updateLease();
 }
 function updateLease() {
@@ -525,7 +681,7 @@ function renderConnection() {
           ? "Согласовываем P2P-путь и ждём проверенного ответа WireGuard."
           : !managed
             ? "Пиры настроены вручную. Соединениями управляет WireGuard."
-            : !peer.outgoing_tcp?.length
+            : !(peer.outgoing_tcp?.length || peer.files === true)
               ? peer.incoming_tcp?.length
                 ? "Разрешены только входящие TCP-соединения."
                 : "Для этого устройства нет разрешённого исходящего TCP-доступа."
@@ -544,9 +700,9 @@ function renderConnection() {
   $("connection-caption").textContent = caption;
   $("connection-card").hidden = !peer || !!peer.local || !!peer.registryOnly;
   $("connect").hidden =
-    !peer || !managed || !peer.device_id || !peer.outgoing_tcp?.length;
+    !peer || !managed || !peer.device_id || !(peer.outgoing_tcp?.length || peer.files === true);
   $("connect").disabled = !canConnect(peer) || !!pending;
-  $("grant-access").hidden = !peer?.owned || !account?.user || !!peer.outgoing_tcp?.length || peer.public_key === snapshot.interface.public_key;
+  $("grant-access").hidden = !peer?.owned || !account?.user || !!peer.outgoing_tcp?.length || peer.files === true || peer.public_key === snapshot.interface.public_key;
   $("connect").replaceChildren(
     icon("power"),
     element(
@@ -700,7 +856,7 @@ function renderPeerDetails() {
   details($("peer-detail-list"), [
     ["Принадлежность", ownershipLabel(peer) + (peer.public_key === snapshot.interface.public_key ? " · Это устройство" : "")],
     ...(knownPolicies.has(peer.device_id) ? [["Разрешения устройства", policyState(knownPolicies.get(peer.device_id))]] : []),
-    ["Присутствие агента", "Неизвестно: отдельные данные присутствия не предоставляются"],
+    ["Присутствие агента", peer.online === true ? "Онлайн по данным координатора" : peer.online === false ? "Оффлайн по данным координатора" : "Нет данных координатора"],
     ["Состояние пути от этого устройства", pathLabel(peer)],
     ["Адреса Portal", peer.allowed_ips.join(", ") || "Не назначены"],
     ["UDP endpoint", peer.endpoint || "Не задан"],
@@ -789,6 +945,25 @@ $("connect").addEventListener("click", async () => {
   }
 });
 
+$("terminal-form").addEventListener("submit", openTerminal);
+$("terminal-close").addEventListener("click", () => {
+  closeTerminal();
+  terminalStatus("Сессия закрыта");
+});
+$("files-device").addEventListener("change", () => { filePath = []; loadFiles(); });
+$("files-refresh").addEventListener("click", () => loadFiles());
+$("files-up").addEventListener("click", () => { if (filePath.length) { filePath.pop(); loadFiles(); } });
+$("files-upload").addEventListener("change", async (event) => {
+  const file = event.target.files?.[0]; if (!file || !$("files-device").value) return;
+  try { fileStatus(`Загрузка ${file.name}…`); await filesRequest("PUT", [...filePath, file.name], file, { "Content-Type": "application/octet-stream" }); fileStatus("Файл загружен"); loadFiles(); }
+  catch (error) { fileStatus(error.message, true); }
+  finally { event.target.value = ""; }
+});
+$("files-mkdir").addEventListener("click", async () => {
+  const name = window.prompt("Имя каталога"); if (!name || /[\\/]/.test(name)) return;
+  try { await filesRequest("MKCOL", [...filePath, name]); loadFiles(); } catch (error) { fileStatus(error.message, true); }
+});
+
 $("copy-key").addEventListener("click", async () => {
   if (!snapshot) return;
   try {
@@ -839,6 +1014,7 @@ function accessLabel(peer) {
   if (peer.outgoing_tcp == null) return "Разрешения Portal не используются";
   const parts = [];
   if (peer.outgoing_tcp.length) parts.push(`Это устройство → ${nameOf(peer)} · TCP ${ports(peer.outgoing_tcp)}`);
+  if (peer.files === true) parts.push(`Это устройство → ${nameOf(peer)} · File Explorer`);
   if (peer.incoming_tcp?.length) parts.push(`${nameOf(peer)} → Это устройство · TCP ${ports(peer.incoming_tcp)}`);
   return parts.join("; ") || "Доступа от текущего устройства нет";
 }
@@ -901,7 +1077,7 @@ function renderMap() {
     devices: devices.map(device => ({id: device.public_key, name: nameOf(device), owned: device.owned,
       local: device.public_key === local, editable: !!device.owned && !!account?.user,
       owner: device.owned ? (account?.user?.name || snapshot.network.user_name) : "Другой владелец",
-      online: !stale && snapshot.healthy && !expired() && (device.public_key === local || device.path === "direct"),
+      online: !stale && snapshot.healthy && !expired() && (device.public_key === local || device.online === true),
     })),
     edges: [...edges.values()],
   });
@@ -945,6 +1121,8 @@ async function loadAccount(current = session) {
     renderAccount();
     renderAccessRequests();
     renderPeers();
+    renderTerminalDevices();
+    renderFileDevices();
     refreshBulkResults(current);
     refreshMapPolicies(current);
   } catch (error) {
@@ -1000,7 +1178,7 @@ $("network-form").addEventListener("submit", async event => {
     if (file?.size > 32768) throw new Error("PEM-файл должен быть не больше 32 КиБ.");
     const data = await api("account", { address: $("coordinator").value, ...(registering ? {user_name: $("user-name").value.trim()} : {token: $("user-token").value.trim()}), ...(file ? {ca_pem: await file.text()} : {}) });
     if (current !== session) return;
-    account = data; accountStale = !!data.error; $("user-token").value = ""; renderAccount(); renderPeers();
+    account = data; accountStale = !!data.error; $("user-token").value = ""; renderAccount(); renderPeers(); renderTerminalDevices(); renderFileDevices();
     if (data.error) throw new Error(data.error);
     if (!data.needs_device) { await api("account/activate", {name: data.device_name}); if (current === session) { await refresh(); location.hash = "devices"; } }
     else $("device-name").focus();
@@ -1044,15 +1222,7 @@ $("copy-peer-key").addEventListener("click", async () => {
 function policyState(policy) {
   return policy.applied_revision === policy.revision ? `Применено · ревизия ${policy.revision}` : `Сохранено, ожидает устройства · ревизия ${policy.revision}. Подтверждена ревизия ${policy.applied_revision}. Старый доступ ограничен сроком ранее выданной карты.`;
 }
-// Add new TCP services here; existing rules are split into presets and extra ports.
-const permissionServices = [
-  {port: 22, name: "Удалённый терминал"},
-  {port: 3389, name: "Удалённый рабочий стол (RDP)"},
-  {port: 5900, name: "Удалённый рабочий стол (VNC)"},
-  {port: 80, name: "Веб-сервер (HTTP)"},
-  {port: 443, name: "Веб-сервер (HTTPS)"},
-  {port: 445, name: "Общие файлы (SMB)"},
-];
+const permissionServices = [{terminal: true, name: "Удалённый терминал"}, {files: true, name: "File Explorer"}];
 function permissionSources() {
   const devices = new Map();
   for (const peer of [...(snapshot?.peers || []), ...(account?.devices || []).map(registryPeer), ...(snapshot ? [currentDevice()] : [])]) {
@@ -1061,10 +1231,10 @@ function permissionSources() {
   return [...devices.values()].sort((a, b) => nameOf(a).localeCompare(nameOf(b), "ru"));
 }
 function rulePorts(row) {
-  return [...row.querySelectorAll('.service-checkbox:checked')].map(input => input.value)
+  return [...row.querySelectorAll('.service-checkbox:checked[data-port]')].map(input => input.dataset.port)
     .concat(row.querySelector('.rule-ports').value.trim()).filter(Boolean).join(", ");
 }
-function addRule(key = "", tcp = []) {
+function addRule(key = "", tcp = [], terminal = false, files = false) {
   const row = element("div", "policy-rule setup-card");
   const sourceLabel = element("label", "rule-field", "Кому разрешить доступ");
   const source = element("select", "rule-source");
@@ -1089,9 +1259,20 @@ function addRule(key = "", tcp = []) {
   for (const service of permissionServices) {
     const label = element("label", "service-option");
     const checkbox = element("input", "service-checkbox");
-    checkbox.type = "checkbox"; checkbox.value = String(service.port); checkbox.checked = tcp.includes(service.port);
+    checkbox.type = "checkbox";
+    if (service.terminal) {
+      checkbox.dataset.terminal = "true";
+      checkbox.checked = terminal;
+    } else if (service.files) {
+      checkbox.dataset.files = "true";
+      checkbox.checked = files;
+    } else {
+      checkbox.dataset.port = String(service.port);
+      checkbox.value = String(service.port);
+      checkbox.checked = tcp.includes(service.port);
+    }
     checkbox.addEventListener("change", markPolicyDirty);
-    label.append(checkbox, element("span", "", `${service.name} (TCP ${service.port})`));
+    label.append(checkbox, element("span", "", service.name));
     services.append(label);
   }
   const extraLabel = element("label", "rule-field", "Другие TCP-порты");
@@ -1099,10 +1280,10 @@ function addRule(key = "", tcp = []) {
   portsInput.value = tcp.filter(port => !permissionServices.some(service => service.port === port)).join(", ");
   portsInput.placeholder = "Например: 3000, 8080";
   extraLabel.append(portsInput);
-  const hint = element("p", "field-hint", "Порты вне списка, через запятую. Без галочек и дополнительных портов доступ закрыт.");
+  const hint = element("p", "field-hint", "Выберите отдельные сервисы и укажите TCP-порты через запятую. Пустое правило не даёт доступа.");
   const actions = element("div", "rule-actions");
   const remove = element("button", "button secondary", "Убрать устройство"); remove.type = "button"; remove.addEventListener("click", () => { row.remove(); markPolicyDirty(); });
-  const spread = element("button", "button secondary", "Применить это разрешение ко всем моим устройствам"); spread.type = "button"; spread.addEventListener("click", () => prepareBulk(source.value, rulePorts(row)));
+  const spread = element("button", "button secondary", "Применить это разрешение ко всем моим устройствам"); spread.type = "button"; spread.addEventListener("click", () => prepareBulk(source.value, rulePorts(row), row.querySelector(".service-checkbox[data-terminal]")?.checked === true, row.querySelector(".service-checkbox[data-files]")?.checked === true));
   actions.append(remove, spread);
   source.addEventListener("change", markPolicyDirty); portsInput.addEventListener("input", markPolicyDirty);
   row.append(sourceLabel, services, extraLabel, hint, actions); $("policy-rules").append(row);
@@ -1121,7 +1302,7 @@ async function loadPolicy(replace) {
     const data = await api("account/device", {operation:"policy", device_id:id});
     if (current !== session || policyTarget?.device_id !== id) return;
     knownPolicies.set(id, data); renderMap();
-    if (replace) { policyLoaded = true; policyRevision = data.revision; policyDirty = false; $("policy-rules").replaceChildren(); for (const [key, value] of Object.entries(data.permissions)) addRule(key, value.tcp); showError($("policy-error"), ""); }
+    if (replace) { policyLoaded = true; policyRevision = data.revision; policyDirty = false; $("policy-rules").replaceChildren(); for (const [key, value] of Object.entries(data.permissions)) addRule(key, value.tcp, value.terminal === true, value.files === true); showError($("policy-error"), ""); }
     updatePolicyStatus(data);
   } catch (error) { if (current === session) showError($("policy-error"), error.message); }
   finally { if (current === session) { policyBusy = false; $("save-policy").disabled = false; $("reload-policy").disabled = false; } }
@@ -1144,9 +1325,11 @@ $("policy-form").addEventListener("submit", async event => {
     const permissions = Object.create(null);
     for (const row of $("policy-rules").children) {
       const {key, tcp} = parseRule(row.querySelector(".rule-source").value, rulePorts(row));
+      const terminal = row.querySelector(".service-checkbox[data-terminal]")?.checked === true;
+      const files = row.querySelector(".service-checkbox[data-files]")?.checked === true;
       if (Object.hasOwn(permissions, key)) throw new Error("Устройство выбрано дважды.");
       if (key === policyTarget.public_key) throw new Error("Выберите другое устройство: доступ самому себе не требуется.");
-      permissions[key] = {tcp};
+      permissions[key] = {tcp, ...(terminal ? {terminal: true} : {}), ...(files ? {files: true} : {})};
     }
     policyBusy = true; $("save-policy").disabled = true; $("policy-status").textContent = "Сохраняем"; showError($("policy-error"), "");
     const data = await api("account/device", {operation:"save_policy", device_id:id, base_revision:policyRevision, permissions});
@@ -1173,16 +1356,17 @@ function renderBulk() {
     return row;
   }));
 }
-async function prepareBulk(source, rawPorts) {
+async function prepareBulk(source, rawPorts, terminal = false, files = false) {
   if (bulkBusy || !account?.user) return;
   let rule;
   try { rule = parseRule(source, rawPorts); }
   catch (error) { showError($("policy-error"), error.message); return; }
   const current = session;
-  const plan = { ...rule, targets: account.devices.filter(device => isOwnDevice(device) && device.public_key !== rule.key).map(device => ({device, message: "Загружаем текущую ревизию…"})) };
+  const plan = { ...rule, terminal, files, targets: account.devices.filter(device => isOwnDevice(device) && device.public_key !== rule.key).map(device => ({device, message: "Загружаем текущую ревизию…"})) };
   bulkPlan = plan; bulkBusy = true;
   $("confirm-bulk").disabled = true; $("close-bulk").disabled = true;
-  $("bulk-rule").textContent = `Источник: ${nameOf(account.devices.map(registryPeer).find(peer => peer.public_key === rule.key) || snapshot.peers.find(peer => peer.public_key === rule.key) || {public_key: rule.key})} → TCP ${ports(rule.tcp)}`;
+  const serviceLabel = `${terminal ? " · terminal" : ""}${files ? " · files" : ""}`;
+  $("bulk-rule").textContent = `Источник: ${nameOf(account.devices.map(registryPeer).find(peer => peer.public_key === rule.key) || snapshot.peers.find(peer => peer.public_key === rule.key) || {public_key: rule.key})} → TCP ${ports(rule.tcp)}${serviceLabel}`;
   showError($("bulk-error"), ""); renderBulk(); $("bulk-dialog").showModal();
   await Promise.all(plan.targets.map(async target => {
     try {
@@ -1205,7 +1389,8 @@ $("confirm-bulk").addEventListener("click", async () => {
   await Promise.all(plan.targets.filter(target => target.policy).map(async target => {
     target.message = "Сохраняем…"; renderBulk();
     try {
-      const data = await api("account/device", {operation: "save_policy", device_id: target.device.id, base_revision: target.policy.revision, permissions: {...target.policy.permissions, [plan.key]: {tcp: plan.tcp}}});
+      const permission = {tcp: plan.tcp, ...(plan.terminal ? {terminal: true} : {}), ...(plan.files ? {files: true} : {})};
+      const data = await api("account/device", {operation: "save_policy", device_id: target.device.id, base_revision: target.policy.revision, permissions: {...target.policy.permissions, [plan.key]: permission}});
       if (current !== session) return;
       target.saved = true; target.savedRevision = data.revision; target.message = policyState(data); knownPolicies.set(target.device.id, data);
     } catch (error) {
@@ -1264,7 +1449,7 @@ function renderAccessRequests() {
     const row = element("article", "setup-card");
     const mine = request.target.owner_user_id === account?.user?.id;
     row.append(element("strong", "", `${request.requester_name}: ${request.source.name} → ${request.target.name}`));
-    row.append(element("p", "scope-note", `TCP ${ports(request.tcp)} · ${new Date(request.created_at * 1000).toLocaleString("ru-RU")}`));
+    row.append(element("p", "scope-note", `TCP ${ports(request.tcp)}${request.files ? " · File Explorer" : ""} · ${new Date(request.created_at * 1000).toLocaleString("ru-RU")}`));
     const labels = {pending: mine ? "Ожидает вашего решения" : "Ожидает решения владельца", accepted: "Одобрено. Доступ появится после применения разрешения устройством.", declined: "Владелец отклонил запрос", expired: "Срок запроса истёк"};
     row.append(element("p", "", labels[request.status] || request.status));
     if (mine && request.status === "pending") {
@@ -1296,15 +1481,16 @@ $("request-access-form").addEventListener("submit", async event => {
   const peer = selectedPeer();
   if (peer?.owned !== false || !snapshot?.network?.device_id) return;
   let tcp;
+  const files = $("request-files").checked;
   try {
     tcp = parseRule(snapshot.interface.public_key, $("request-ports").value).tcp;
-    if (!tcp.length) throw new Error("Укажите хотя бы один TCP-порт");
+    if (!tcp.length && !files) throw new Error("Укажите TCP-порт или включите File Explorer");
   } catch (error) { showError($("request-access-error"), error.message); return; }
   const current = session;
   $("request-access-submit").disabled = true;
   showError($("request-access-error"), "");
   try {
-    await api("account/device", {operation: "request_access", source_device_id: snapshot.network.device_id, target_device_id: peer.device_id, tcp});
+    await api("account/device", {operation: "request_access", source_device_id: snapshot.network.device_id, target_device_id: peer.device_id, tcp, files});
     if (current !== session) return;
     toast("Запрос отправлен владельцу устройства");
     await loadAccount();

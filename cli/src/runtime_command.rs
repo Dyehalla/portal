@@ -169,6 +169,7 @@ pub(crate) fn run_command(args: &[String]) -> Result<(), String> {
         api_listen,
         api_token_file,
         terminal: portal_runtime::TerminalConfig::default(),
+        files: portal_runtime::FileServiceConfig::default(),
     })
 }
 

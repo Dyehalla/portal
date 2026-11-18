@@ -12,6 +12,16 @@ pub(crate) struct Snapshot {
     pub peers: Vec<Peer>,
     pub stats: Stats,
     pub terminal: Option<Terminal>,
+    pub files: Option<FileService>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FileService {
+    pub enabled: bool,
+    pub port: u16,
+    pub read_only: bool,
+    pub status: &'static str,
+    pub last_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -55,12 +65,14 @@ pub(crate) struct Peer {
     pub owned: Option<bool>,
     pub endpoint: Option<SocketAddr>,
     pub path: &'static str,
+    pub online: Option<bool>,
     pub allowed_ips: Vec<String>,
     pub keepalive_seconds: Option<u64>,
     /// None denotes ordinary WireGuard mode, where Portal TCP ACLs do not apply.
     pub incoming_tcp: Option<Vec<u16>>,
     pub outgoing_tcp: Option<Vec<u16>>,
     pub terminal: Option<bool>,
+    pub files: Option<bool>,
     pub traffic: Option<Traffic>,
 }
 

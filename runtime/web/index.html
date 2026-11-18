@@ -7,7 +7,9 @@
     <title>Portal — локальная сеть</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/xterm.css" />
     <script src="/map.js" defer></script>
+    <script src="/xterm.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -116,6 +118,8 @@
           >
           <a href="#network" data-page="network" class="nav-link"><svg class="icon"><use href="#i-server" /></svg>Сеть и аккаунт</a>
           <a href="#map" data-page="map" class="nav-link"><svg class="icon"><use href="#i-lock" /></svg>Карта разрешений</a>
+          <a href="#terminal" class="nav-link"><svg class="icon"><use href="#i-laptop" /></svg>Терминал</a>
+          <a href="#files" class="nav-link"><svg class="icon"><use href="#i-server" /></svg>Файлы</a>
           <a href="#diagnostics" data-page="diagnostics" class="nav-link"
             ><svg class="icon"><use href="#i-pulse" /></svg>Диагностика</a
           >
@@ -228,6 +232,29 @@
               </div>
             </div>
           </section>
+          <section id="terminal" class="page" aria-labelledby="terminal-title" hidden>
+            <div class="page-heading"><div><h1 id="terminal-title">Удалённый терминал</h1><p class="subtitle">Сессия проходит через локальный агент и защищённый туннель Portal.</p></div></div>
+            <div class="diagnostic-card terminal-card">
+              <form id="terminal-form" class="terminal-toolbar">
+                <label>Устройство<select id="terminal-device" required><option value="">Выберите устройство</option></select></label>
+                <label>Пользователь<input id="terminal-user" value="portal" maxlength="32" autocomplete="off" /></label>
+                <button class="button primary" id="terminal-open" type="submit">Открыть сессию</button>
+                <button class="button secondary" id="terminal-close" type="button" disabled>Закрыть</button>
+              </form>
+              <p id="terminal-status" class="scope-note" role="status">Выберите устройство с разрешённым терминальным доступом.</p>
+              <div id="terminal-screen" class="terminal-screen" tabindex="0" aria-label="Удалённый терминал"></div>
+            </div>
+          </section>
+          <section id="files" class="page" aria-labelledby="files-title" hidden>
+            <div class="page-heading"><div><h1 id="files-title">File Explorer</h1><p class="subtitle">Файлы передаются через прямой путь Portal при отдельном разрешении.</p></div></div>
+            <div class="diagnostic-card">
+              <div class="terminal-toolbar"><label>Устройство<select id="files-device" required><option value="">Выберите устройство</option></select></label><button class="button secondary" id="files-up" type="button">Вверх</button><button class="button secondary" id="files-refresh" type="button">Обновить</button></div>
+              <p id="files-status" class="scope-note" role="status">Выберите устройство с разрешённым доступом к файлам.</p>
+              <nav id="files-breadcrumbs" class="scope-note" aria-label="Путь каталога"></nav>
+              <div class="setup-tabs"><label class="button secondary" for="files-upload">Загрузить файл<input id="files-upload" type="file" hidden /></label><button id="files-mkdir" class="button secondary" type="button">Новый каталог</button></div>
+              <div id="files-list" class="device-list" role="table" aria-label="Файлы и каталоги"></div>
+            </div>
+          </section>
           <section
             id="diagnostics"
             class="page"
@@ -305,7 +332,8 @@
         <form id="request-access-form" class="setup-card" hidden>
           <h3>Запросить доступ у владельца</h3>
           <p class="scope-note">Запрос отправляется от этого устройства. Владелец сможет принять или отклонить его.</p>
-          <label>TCP-порты на устройстве получателя<input id="request-ports" required placeholder="22, 443, 8080" /></label>
+          <label>TCP-порты на устройстве получателя<input id="request-ports" placeholder="22, 443, 8080" /></label>
+          <label class="service-option"><input id="request-files" type="checkbox" /> Разрешить File Explorer</label>
           <button id="request-access-submit" class="button primary" type="submit">Отправить запрос доступа</button>
           <p id="request-access-error" class="form-error" role="alert" hidden></p>
         </form>

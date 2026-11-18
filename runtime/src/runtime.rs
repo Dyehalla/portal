@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::LocalApi;
 use crate::api::ManagementRequest;
+use crate::file_service::FileServiceSupervisor;
 use crate::managed::{Agent, ManagedState, Prepared};
 use crate::platform::{HostPlatform, LinuxPlatform};
 use crate::terminal::TerminalSupervisor;
@@ -40,6 +41,7 @@ pub(crate) struct Runtime {
     pub(crate) shutdown_requested: bool,
     platform: Arc<dyn HostPlatform>,
     terminal: Option<TerminalSupervisor>,
+    file_service: Option<FileServiceSupervisor>,
 }
 
 /// Create the WireGuard device, configure its host interface, serve the local API, and clean up.
@@ -138,6 +140,10 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
             .terminal
             .enabled
             .then(|| TerminalSupervisor::new(options.terminal.clone())),
+        file_service: options
+            .files
+            .enabled
+            .then(|| FileServiceSupervisor::new(options.files.clone())),
     };
     let listen_address = runtime
         .device
@@ -233,6 +239,18 @@ async fn run_device_async(mut options: RuntimeConfig) -> Result<(), String> {
                     serve_result = Err(error);
                     break;
                 }
+            }
+            let file_addresses = runtime
+                .addresses
+                .iter()
+                .map(|a| a.address)
+                .collect::<Vec<_>>();
+            if runtime.managed.is_some()
+                && let Some(files) = runtime.file_service.as_mut()
+                && let Err(error) = files.reconcile(&file_addresses)
+            {
+                serve_result = Err(error);
+                break;
             }
         }
         if api.has_exited() {
@@ -352,6 +370,7 @@ impl Runtime {
                             .map(|state| p.device.owner_user_id == state.map.user.id)
                     }),
                     endpoint: path.and_then(|p| p.endpoint).or(peer.endpoint),
+                    online: remote.map(|p| p.online),
                     path: if self
                         .managed
                         .as_ref()
@@ -372,6 +391,10 @@ impl Runtime {
                         .managed
                         .as_ref()
                         .map(|_| remote.is_some_and(|p| p.outgoing.terminal)),
+                    files: self
+                        .managed
+                        .as_ref()
+                        .map(|_| remote.is_some_and(|p| p.outgoing.files)),
                     traffic: device.peer_stats(key).ok().map(|stats| snapshot::Traffic {
                         tx_packets: stats.tx_packets,
                         tx_bytes: stats.tx_bytes,
@@ -431,6 +454,16 @@ impl Runtime {
                 status: terminal.status(),
                 last_exit: terminal.last_exit().map(str::to_owned),
             }),
+            files: self
+                .file_service
+                .as_ref()
+                .map(|files| snapshot::FileService {
+                    enabled: true,
+                    port: files.listen_port(),
+                    read_only: files.read_only(),
+                    status: files.status(),
+                    last_error: files.last_error().map(str::to_owned),
+                }),
         })
     }
 
@@ -451,12 +484,13 @@ impl Runtime {
             return Ok(());
         }
         let terminal_port = self.terminal.as_ref().map(|s| s.listen_port());
-        let rules = match policy::compile_with_terminal(
+        let rules = match policy::compile_with_services(
             &map,
             &local,
             key,
             self.managed.as_ref().map(|s| &s.map),
             terminal_port,
+            self.file_service.as_ref().map(|s| s.listen_port()),
         ) {
             Ok(rules) => rules,
             Err(e) => {
@@ -991,6 +1025,9 @@ impl Runtime {
             if let Err(error) = terminal.shutdown() {
                 errors.push(error);
             }
+        }
+        if let Some(files) = self.file_service.as_mut() {
+            files.stop();
         }
         if let Err(error) =
             self.platform

@@ -61,7 +61,7 @@ fn connection_context(
     let permissions = target_policy
         .permissions
         .get(&requester.public_key)
-        .filter(|p| !p.tcp.is_empty() || p.terminal)
+        .filter(|p| !p.tcp.is_empty() || p.terminal || p.files)
         .cloned()
         .ok_or_else(|| {
             Error::forbidden("destination does not permit connections from this peer")
